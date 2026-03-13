@@ -1,7 +1,6 @@
 pub mod agents;
 pub mod audit;
 pub mod channels;
-pub mod comms;
 pub mod chat;
 pub mod dashboard;
 pub mod extensions;

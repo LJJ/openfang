@@ -29,8 +29,6 @@ pub enum HandError {
     TomlParse(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Config error: {0}")]
-    Config(String),
 }
 
 pub type HandResult<T> = Result<T, HandError>;
@@ -174,10 +172,6 @@ pub struct HandSetting {
     pub default: String,
     #[serde(default)]
     pub options: Vec<HandSettingOption>,
-    /// Env var name to expose when a text-type setting has a value
-    /// (e.g. `ELEVENLABS_API_KEY` for an API key text field).
-    #[serde(default)]
-    pub env_var: Option<String>,
 }
 
 /// Result of resolving user-chosen settings against the schema.
@@ -233,9 +227,6 @@ pub fn resolve_settings(
             HandSettingType::Text => {
                 if !chosen_value.is_empty() {
                     lines.push(format!("- {}: {}", setting.label, chosen_value));
-                    if let Some(ref env) = setting.env_var {
-                        env_vars.push(env.clone());
-                    }
                 }
             }
         }
@@ -559,7 +550,6 @@ metrics = []
                     binary: None,
                 },
             ],
-            env_var: None,
         }];
 
         // User picks groq
@@ -593,7 +583,6 @@ metrics = []
                     binary: None,
                 },
             ],
-            env_var: None,
         }];
 
         // Empty config → uses default "auto"
@@ -615,7 +604,6 @@ metrics = []
                 setting_type: HandSettingType::Toggle,
                 default: "false".to_string(),
                 options: vec![],
-                env_var: None,
             },
             HandSetting {
                 key: "custom_model".to_string(),
@@ -624,7 +612,6 @@ metrics = []
                 setting_type: HandSettingType::Text,
                 default: String::new(),
                 options: vec![],
-                env_var: None,
             },
         ];
 

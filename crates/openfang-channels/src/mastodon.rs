@@ -298,8 +298,17 @@ fn strip_html_tags(html: &str) -> String {
         }
     }
 
-    // Decode HTML entities (handles named, decimal, and hex entities)
-    let decoded = html_escape::decode_html_entities(&result);
+    // Decode HTML entities
+    let decoded = result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&#x27;", "'")
+        .replace("&nbsp;", " ");
+
     decoded.trim().to_string()
 }
 

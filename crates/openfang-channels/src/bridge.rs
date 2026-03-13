@@ -5,13 +5,9 @@
 
 use crate::formatter;
 use crate::router::AgentRouter;
-use crate::types::{
-    default_phase_emoji, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser,
-    LifecycleReaction,
-};
+use crate::types::{ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use openfang_types::message::ContentBlock;
 use futures::StreamExt;
 use openfang_types::agent::AgentId;
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
@@ -28,26 +24,6 @@ use tracing::{debug, error, info, warn};
 pub trait ChannelBridgeHandle: Send + Sync {
     /// Send a message to an agent and get the text response.
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String>;
-
-    /// Send a message with structured content blocks (text + images) to an agent.
-    ///
-    /// Default implementation extracts text from blocks and falls back to `send_message()`.
-    async fn send_message_with_blocks(
-        &self,
-        agent_id: AgentId,
-        blocks: Vec<ContentBlock>,
-    ) -> Result<String, String> {
-        // Default: extract text from blocks and send as plain text
-        let text: String = blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.send_message(agent_id, &text).await
-    }
 
     /// Find an agent by name, returning its ID.
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String>;
@@ -135,9 +111,6 @@ pub trait ChannelBridgeHandle: Send + Sync {
     }
 
     /// Record a delivery result for tracking (optional — default no-op).
-    ///
-    /// `thread_id` preserves Telegram forum-topic context so cron/workflow
-    /// delivery can target the same topic later.
     async fn record_delivery(
         &self,
         _agent_id: AgentId,
@@ -145,7 +118,6 @@ pub trait ChannelBridgeHandle: Send + Sync {
         _recipient: &str,
         _success: bool,
         _error: Option<&str>,
-        _thread_id: Option<&str>,
     ) {
         // Default: no tracking
     }
@@ -292,15 +264,6 @@ impl BridgeManager {
     }
 
     /// Start an adapter: subscribe to its message stream and spawn a dispatch task.
-    ///
-    /// Each incoming message is dispatched as a concurrent task so that slow LLM
-    /// calls (10-30s) don't block subsequent messages. This prevents voice/media
-    /// messages sent in quick succession from appearing "lost" — all messages
-    /// begin processing immediately. Per-agent serialization (to prevent session
-    /// corruption) is handled by the kernel's `agent_msg_locks`.
-    ///
-    /// A semaphore limits concurrent dispatch tasks to prevent unbounded memory
-    /// growth under burst traffic.
     pub async fn start_adapter(
         &mut self,
         adapter: Arc<dyn ChannelAdapter>,
@@ -312,10 +275,6 @@ impl BridgeManager {
         let adapter_clone = adapter.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
-        // Limit concurrent dispatch tasks to prevent unbounded growth.
-        // 32 is generous — most setups have 1-5 concurrent users.
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
-
         let task = tokio::spawn(async move {
             let mut stream = std::pin::pin!(stream);
             loop {
@@ -323,28 +282,13 @@ impl BridgeManager {
                     msg = stream.next() => {
                         match msg {
                             Some(message) => {
-                                // Spawn each dispatch as a concurrent task so the stream
-                                // loop is never blocked by slow LLM calls. The kernel's
-                                // per-agent lock ensures session integrity.
-                                let handle = handle.clone();
-                                let router = router.clone();
-                                let adapter = adapter_clone.clone();
-                                let rate_limiter = rate_limiter.clone();
-                                let sem = semaphore.clone();
-                                tokio::spawn(async move {
-                                    // Acquire semaphore permit (blocks if 32 tasks are in flight).
-                                    let _permit = match sem.acquire().await {
-                                        Ok(p) => p,
-                                        Err(_) => return, // semaphore closed — shutting down
-                                    };
-                                    dispatch_message(
-                                        &message,
-                                        &handle,
-                                        &router,
-                                        adapter.as_ref(),
-                                        &rate_limiter,
-                                    ).await;
-                                });
+                                dispatch_message(
+                                    &message,
+                                    &handle,
+                                    &router,
+                                    adapter_clone.as_ref(),
+                                    &rate_limiter,
+                                ).await;
                             }
                             None => {
                                 info!("Channel adapter {} stream ended", adapter_clone.name());
@@ -415,25 +359,6 @@ async fn send_response(
     }
 }
 
-/// Send a lifecycle reaction (best-effort, non-blocking for supported adapters).
-///
-/// Silently ignores errors — reactions are non-critical UX polish.
-/// For Telegram, the underlying HTTP call is already fire-and-forget (spawned internally),
-/// so this await returns almost immediately.
-async fn send_lifecycle_reaction(
-    adapter: &dyn ChannelAdapter,
-    user: &ChannelUser,
-    message_id: &str,
-    phase: AgentPhase,
-) {
-    let reaction = LifecycleReaction {
-        emoji: default_phase_emoji(&phase).to_string(),
-        phase,
-        remove_previous: true,
-    };
-    let _ = adapter.send_reaction(user, message_id, &reaction).await;
-}
-
 /// Dispatch a single incoming message — handles bot commands or routes to an agent.
 ///
 /// Applies per-channel policies (DM/group filtering, rate limiting, formatting, threading).
@@ -448,15 +373,10 @@ async fn dispatch_message(
 
     // Fetch per-channel overrides (if configured)
     let overrides = handle.channel_overrides(ct_str).await;
-    let channel_default_format = match ct_str {
-        "telegram" => OutputFormat::TelegramHtml,
-        "slack" => OutputFormat::SlackMrkdwn,
-        _ => OutputFormat::Markdown,
-    };
     let output_format = overrides
         .as_ref()
         .and_then(|o| o.output_format)
-        .unwrap_or(channel_default_format);
+        .unwrap_or(OutputFormat::Markdown);
     let threading_enabled = overrides.as_ref().map(|o| o.threading).unwrap_or(false);
     let thread_id = if threading_enabled {
         message.thread_id.as_deref()
@@ -482,15 +402,8 @@ async fn dispatch_message(
                     }
                 }
                 GroupPolicy::MentionOnly => {
-                    // Only allow messages where the bot was @mentioned or commands.
-                    let was_mentioned = message.metadata.get("was_mentioned")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let is_command = matches!(&message.content, ChannelContent::Command { .. });
-                    if !was_mentioned && !is_command {
-                        debug!("Ignoring group message on {ct_str} (group_policy=mention_only, not mentioned)");
-                        return;
-                    }
+                    // Pass through — adapters should only forward mentioned messages.
+                    // This is a hint for adapters, not enforced here.
                 }
                 GroupPolicy::All => {}
             }
@@ -521,52 +434,23 @@ async fn dispatch_message(
         }
     }
 
-    // Handle commands first (early return)
-    if let ChannelContent::Command { ref name, ref args } = message.content {
-        let result = handle_command(name, args, handle, router, &message.sender).await;
-        send_response(adapter, &message.sender, result, thread_id, output_format).await;
-        return;
-    }
-
-    // For images: download, base64 encode, and send as multimodal content blocks
-    if let ChannelContent::Image { ref url, ref caption } = message.content {
-        let blocks = download_image_to_blocks(url, caption.as_deref()).await;
-        if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) {
-            // We have actual image data — send as structured blocks for vision
-            dispatch_with_blocks(
-                blocks,
-                message,
-                handle,
-                router,
+    let text = match &message.content {
+        ChannelContent::Text(t) => t.clone(),
+        ChannelContent::Command { name, args } => {
+            let result = handle_command(name, args, handle, router, &message.sender).await;
+            send_response(adapter, &message.sender, result, thread_id, output_format).await;
+            return;
+        }
+        _ => {
+            send_response(
                 adapter,
-                ct_str,
+                &message.sender,
+                "I can only handle text messages for now.".to_string(),
                 thread_id,
                 output_format,
             )
             .await;
             return;
-        }
-        // Image download failed — fall through to text description below
-    }
-
-    let text = match &message.content {
-        ChannelContent::Text(t) => t.clone(),
-        ChannelContent::Command { .. } => unreachable!(), // handled above
-        ChannelContent::Image { ref url, ref caption } => {
-            // Fallback when image download failed
-            match caption {
-                Some(c) => format!("[User sent a photo: {url}]\nCaption: {c}"),
-                None => format!("[User sent a photo: {url}]"),
-            }
-        }
-        ChannelContent::File { ref url, ref filename } => {
-            format!("[User sent a file ({filename}): {url}]")
-        }
-        ChannelContent::Voice { ref url, duration_seconds } => {
-            format!("[User sent a voice message ({duration_seconds}s): {url}]")
-        }
-        ChannelContent::Location { lat, lon } => {
-            format!("[User shared location: {lat}, {lon}]")
         }
     };
 
@@ -693,33 +577,14 @@ async fn dispatch_message(
     let agent_id = match agent_id {
         Some(id) => id,
         None => {
-            // Fallback: try "assistant" agent, then first available agent
-            let fallback = handle.find_agent_by_name("assistant").await.ok().flatten();
-            let fallback = match fallback {
-                Some(id) => Some(id),
-                None => handle
-                    .list_agents()
-                    .await
-                    .ok()
-                    .and_then(|agents| agents.first().map(|(id, _)| *id)),
-            };
-            match fallback {
-                Some(id) => {
-                    // Auto-set this as the user's default so future messages route directly
-                    router.set_user_default(message.sender.platform_id.clone(), id);
-                    id
-                }
-                None => {
-                    send_response(
-                        adapter,
-                        &message.sender,
-                        "No agents available. Start the dashboard at http://127.0.0.1:4200 to create one.".to_string(),
-                        thread_id,
-                        output_format,
-                    ).await;
-                    return;
-                }
-            }
+            send_response(
+                adapter,
+                &message.sender,
+                "No agent assigned. Use /agents to list available agents, then /agent <name> to select one.".to_string(),
+                thread_id,
+                output_format,
+            ).await;
+            return;
         }
     };
 
@@ -744,7 +609,7 @@ async fn dispatch_message(
     if let Some(reply) = handle.check_auto_reply(agent_id, &text).await {
         send_response(adapter, &message.sender, reply, thread_id, output_format).await;
         handle
-            .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None, thread_id)
+            .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None)
             .await;
         return;
     }
@@ -752,22 +617,15 @@ async fn dispatch_message(
     // Send typing indicator (best-effort)
     let _ = adapter.send_typing(&message.sender).await;
 
-    // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
-    let msg_id = &message.platform_message_id;
-    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
-    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking).await;
-
     // Send to agent and relay response
     match handle.send_message(agent_id, &text).await {
         Ok(response) => {
-            send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
-                .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None, thread_id)
+                .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None)
                 .await;
         }
         Err(e) => {
-            send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
             warn!("Agent error for {agent_id}: {e}");
             let err_msg = format!("Agent error: {e}");
             send_response(
@@ -785,196 +643,6 @@ async fn dispatch_message(
                     &message.sender.platform_id,
                     false,
                     Some(&err_msg),
-                    thread_id,
-                )
-                .await;
-        }
-    }
-}
-
-/// Download an image from a URL and build content blocks for multimodal LLM input.
-///
-/// Returns a `Vec<ContentBlock>` containing an image block (base64-encoded) and
-/// optionally a text block for the caption. If the download fails, returns a
-/// text-only block describing the failure.
-async fn download_image_to_blocks(url: &str, caption: Option<&str>) -> Vec<ContentBlock> {
-    use base64::Engine;
-
-    // 5 MB limit to prevent memory abuse from oversized images
-    const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-
-    let client = reqwest::Client::new();
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to download image from channel: {e}");
-            return vec![ContentBlock::Text {
-                text: format!("[Image download failed: {e}]"),
-            }];
-        }
-    };
-
-    // Detect media type from Content-Type header, fall back to URL extension
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.split(';').next().unwrap_or(ct).trim().to_string());
-
-    let media_type = content_type.unwrap_or_else(|| {
-        if url.contains(".png") {
-            "image/png".to_string()
-        } else if url.contains(".gif") {
-            "image/gif".to_string()
-        } else if url.contains(".webp") {
-            "image/webp".to_string()
-        } else {
-            "image/jpeg".to_string()
-        }
-    });
-
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("Failed to read image bytes: {e}");
-            return vec![ContentBlock::Text {
-                text: format!("[Image read failed: {e}]"),
-            }];
-        }
-    };
-
-    if bytes.len() > MAX_IMAGE_BYTES {
-        warn!(
-            "Image too large ({} bytes), skipping vision — sending as text",
-            bytes.len()
-        );
-        let desc = match caption {
-            Some(c) => format!("[Image too large for vision ({} KB)]\nCaption: {c}", bytes.len() / 1024),
-            None => format!("[Image too large for vision ({} KB)]", bytes.len() / 1024),
-        };
-        return vec![ContentBlock::Text { text: desc }];
-    }
-
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-    let mut blocks = Vec::new();
-
-    // Caption as text block first (gives the LLM context about the image)
-    if let Some(cap) = caption {
-        if !cap.is_empty() {
-            blocks.push(ContentBlock::Text {
-                text: cap.to_string(),
-            });
-        }
-    }
-
-    blocks.push(ContentBlock::Image { media_type, data });
-
-    blocks
-}
-
-/// Dispatch a multimodal message (content blocks) to an agent, handling routing
-/// and RBAC the same way as the text path.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_with_blocks(
-    blocks: Vec<ContentBlock>,
-    message: &ChannelMessage,
-    handle: &Arc<dyn ChannelBridgeHandle>,
-    router: &Arc<AgentRouter>,
-    adapter: &dyn ChannelAdapter,
-    ct_str: &str,
-    thread_id: Option<&str>,
-    output_format: OutputFormat,
-) {
-    // Route to agent (same logic as text path)
-    let agent_id = router.resolve(
-        &message.channel,
-        &message.sender.platform_id,
-        message.sender.openfang_user.as_deref(),
-    );
-
-    let agent_id = match agent_id {
-        Some(id) => id,
-        None => {
-            let fallback = handle.find_agent_by_name("assistant").await.ok().flatten();
-            let fallback = match fallback {
-                Some(id) => Some(id),
-                None => handle
-                    .list_agents()
-                    .await
-                    .ok()
-                    .and_then(|agents| agents.first().map(|(id, _)| *id)),
-            };
-            match fallback {
-                Some(id) => {
-                    router.set_user_default(message.sender.platform_id.clone(), id);
-                    id
-                }
-                None => {
-                    send_response(
-                        adapter,
-                        &message.sender,
-                        "No agents available. Start the dashboard at http://127.0.0.1:4200 to create one.".to_string(),
-                        thread_id,
-                        output_format,
-                    ).await;
-                    return;
-                }
-            }
-        }
-    };
-
-    // RBAC check
-    if let Err(denied) = handle
-        .authorize_channel_user(ct_str, &message.sender.platform_id, "chat")
-        .await
-    {
-        send_response(
-            adapter,
-            &message.sender,
-            format!("Access denied: {denied}"),
-            thread_id,
-            output_format,
-        )
-        .await;
-        return;
-    }
-
-    let _ = adapter.send_typing(&message.sender).await;
-
-    // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
-    let msg_id = &message.platform_message_id;
-    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
-    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking).await;
-
-    match handle.send_message_with_blocks(agent_id, blocks).await {
-        Ok(response) => {
-            send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
-            send_response(adapter, &message.sender, response, thread_id, output_format).await;
-            handle
-                .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None, thread_id)
-                .await;
-        }
-        Err(e) => {
-            send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
-            warn!("Agent error for {agent_id}: {e}");
-            let err_msg = format!("Agent error: {e}");
-            send_response(
-                adapter,
-                &message.sender,
-                err_msg.clone(),
-                thread_id,
-                output_format,
-            )
-            .await;
-            handle
-                .record_delivery(
-                    agent_id,
-                    ct_str,
-                    &message.sender.platform_id,
-                    false,
-                    Some(&err_msg),
-                    thread_id,
                 )
                 .await;
         }
@@ -1419,53 +1087,5 @@ mod tests {
             channel_type_str(&ChannelType::Custom("irc".to_string())),
             "irc"
         );
-    }
-
-    #[tokio::test]
-    async fn test_send_message_with_blocks_default_fallback() {
-        // The default implementation of send_message_with_blocks extracts text
-        // from blocks and calls send_message
-        let agent_id = AgentId::new();
-        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
-            agents: Mutex::new(vec![(agent_id, "vision-agent".to_string())]),
-        });
-
-        let blocks = vec![
-            ContentBlock::Text {
-                text: "What is in this photo?".to_string(),
-            },
-            ContentBlock::Image {
-                media_type: "image/jpeg".to_string(),
-                data: "base64data".to_string(),
-            },
-        ];
-
-        // Default impl should extract text and call send_message
-        let result = handle
-            .send_message_with_blocks(agent_id, blocks)
-            .await
-            .unwrap();
-        assert_eq!(result, "Echo: What is in this photo?");
-    }
-
-    #[tokio::test]
-    async fn test_send_message_with_blocks_image_only() {
-        // When there's no text block, the default should still work
-        let agent_id = AgentId::new();
-        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
-            agents: Mutex::new(vec![(agent_id, "vision-agent".to_string())]),
-        });
-
-        let blocks = vec![ContentBlock::Image {
-            media_type: "image/png".to_string(),
-            data: "base64data".to_string(),
-        }];
-
-        // Default impl sends empty text when no text blocks
-        let result = handle
-            .send_message_with_blocks(agent_id, blocks)
-            .await
-            .unwrap();
-        assert_eq!(result, "Echo: ");
     }
 }

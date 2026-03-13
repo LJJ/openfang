@@ -5,7 +5,8 @@
 //! agent manifest (TOML config) ready to spawn.
 
 use openfang_types::agent::{
-    AgentManifest, ManifestCapabilities, ModelConfig, Priority, ResourceQuota, ScheduleMode,
+    AgentClass, AgentManifest, ManifestCapabilities, ModelConfig, Priority, ResourceQuota,
+    ScheduleMode,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -54,11 +55,10 @@ impl SetupWizard {
     /// model configuration, capabilities, and schedule.
     pub fn build_plan(intent: AgentIntent) -> SetupPlan {
         // Map model tier to provider/model
-        // Use "default" so the kernel applies config.toml's [default_model].
-        // Only "complex" tier gets an explicit Anthropic override.
         let (provider, model) = match intent.model_tier.as_str() {
+            "simple" => ("groq", "llama-3.3-70b-versatile"),
             "complex" => ("anthropic", "claude-sonnet-4-20250514"),
-            _ => ("default", "default"),
+            _ => ("groq", "llama-3.3-70b-versatile"), // medium default
         };
 
         // Build capabilities from intent
@@ -172,6 +172,7 @@ impl SetupWizard {
             mcp_servers: vec![],
             metadata: HashMap::new(),
             tags: vec![],
+            agent_class: AgentClass::default(),
             routing: None,
             autonomous: None,
             pinned_model: None,
@@ -180,8 +181,6 @@ impl SetupWizard {
             profile: None,
             fallback_models: vec![],
             exec_policy: None,
-            tool_allowlist: vec![],
-            tool_blocklist: vec![],
         };
 
         let skills_to_install: Vec<String> = intent
@@ -286,7 +285,7 @@ mod tests {
         let plan = SetupWizard::build_plan(intent);
 
         assert_eq!(plan.manifest.name, "research-bot");
-        assert_eq!(plan.manifest.model.provider, "default");
+        assert_eq!(plan.manifest.model.provider, "groq");
         assert!(plan
             .manifest
             .capabilities

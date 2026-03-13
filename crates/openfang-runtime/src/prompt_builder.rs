@@ -51,10 +51,6 @@ pub struct PromptContext {
     pub identity_md: Option<String>,
     /// HEARTBEAT.md content (autonomous agent checklist).
     pub heartbeat_md: Option<String>,
-    /// Peer agents visible to this agent: (name, state, model).
-    pub peer_agents: Vec<(String, String, String)>,
-    /// Current date/time string for temporal awareness.
-    pub current_date: Option<String>,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -67,11 +63,6 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
 
     // Section 1 — Agent Identity (always present)
     sections.push(build_identity_section(ctx));
-
-    // Section 1.5 — Current Date/Time (always present when set)
-    if let Some(ref date) = ctx.current_date {
-        sections.push(format!("## Current Date\nToday is {date}."));
-    }
 
     // Section 2 — Tool Call Behavior (skip for subagents)
     if !ctx.is_subagent {
@@ -128,10 +119,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     if !ctx.is_subagent && ctx.is_autonomous {
         if let Some(ref heartbeat) = ctx.heartbeat_md {
             if !heartbeat.trim().is_empty() {
-                sections.push(format!(
-                    "## Heartbeat Checklist\n{}",
-                    cap_str(heartbeat, 1000)
-                ));
+                sections.push(format!("## 醒来后要做的事\n{}", cap_str(heartbeat, 1000)));
             }
         }
     }
@@ -148,11 +136,6 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
-    // Section 9.5 — Peer Agent Awareness (skip for subagents)
-    if !ctx.is_subagent && !ctx.peer_agents.is_empty() {
-        sections.push(build_peer_agents_section(&ctx.agent_name, &ctx.peer_agents));
-    }
-
     // Section 10 — Safety & Oversight (skip for subagents)
     if !ctx.is_subagent {
         sections.push(SAFETY_SECTION.to_string());
@@ -161,8 +144,14 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     // Section 11 — Operational Guidelines (always present)
     sections.push(OPERATIONAL_GUIDELINES.to_string());
 
-    // Section 12 — Canonical Context moved to build_canonical_context_message()
-    // to keep the system prompt stable across turns for provider prompt caching.
+    // Section 12 — Canonical Context (skip for subagents)
+    if !ctx.is_subagent {
+        if let Some(ref canonical) = ctx.canonical_context {
+            if !canonical.is_empty() {
+                sections.push(format!("## 上次聊到哪了\n{}", cap_str(canonical, 500)));
+            }
+        }
+    }
 
     // Section 13 — Bootstrap Protocol (only on first-run, skip for subagents)
     if !ctx.is_subagent {
@@ -171,10 +160,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                 // Only inject if no user_name memory exists (first-run heuristic)
                 let has_user_name = ctx.recalled_memories.iter().any(|(k, _)| k == "user_name");
                 if !has_user_name && ctx.user_name.is_none() {
-                    sections.push(format!(
-                        "## First-Run Protocol\n{}",
-                        cap_str(bootstrap, 1500)
-                    ));
+                    sections.push(format!("## 第一次见面\n{}", cap_str(bootstrap, 1500)));
                 }
             }
         }
@@ -198,10 +184,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
 
 fn build_identity_section(ctx: &PromptContext) -> String {
     if ctx.base_system_prompt.is_empty() {
-        format!(
-            "You are {}, an AI agent running inside the OpenFang Agent OS.\n{}",
-            ctx.agent_name, ctx.agent_description
-        )
+        format!("你是{}。\n{}", ctx.agent_name, ctx.agent_description)
     } else {
         ctx.base_system_prompt.clone()
     }
@@ -209,19 +192,13 @@ fn build_identity_section(ctx: &PromptContext) -> String {
 
 /// Static tool-call behavior directives.
 const TOOL_CALL_BEHAVIOR: &str = "\
-## Tool Call Behavior
-- When you need to use a tool, call it immediately. Do not narrate or explain routine tool calls.
-- Only explain tool calls when the action is destructive, unusual, or the user explicitly asked for an explanation.
-- Prefer action over narration. If you can answer by using a tool, do it.
-- When executing multiple sequential tool calls, batch them — don't output reasoning between each call.
-- If a tool returns useful results, present the KEY information, not the raw output.
-- When web_fetch or web_search returns content, you MUST include the relevant data in your response. \
-Quote specific facts, numbers, or passages from the fetched content. Never say you fetched something \
-without sharing what you found.
-- Start with the answer, not meta-commentary about how you'll help.
-- IMPORTANT: If your instructions or persona mention a shell command, script path, or code snippet, \
-execute it via the appropriate tool call (shell_exec, file_write, etc.). Never output commands as \
-code blocks — always call the tool instead.";
+## 行事习惯
+- 能直接做的事就做，不用每次都解释为什么做。
+- 只有动作比较大、可能不可逆、或者对方明确问了，才说明你在做什么。
+- 做比说重要。能动手解决的事不要光嘴上说。
+- 连着做几件事时一口气做完，不要每做一步都停下来汇报。
+- 拿到结果后说重点，不要把原始数据贴出来。
+- 先给答案，不要先说\"我来帮你看看\"之类的废话。";
 
 /// Build the grouped tools section (Section 3).
 pub fn build_tools_section(granted_tools: &[String]) -> String {
@@ -238,7 +215,7 @@ pub fn build_tools_section(granted_tools: &[String]) -> String {
         groups.entry(cat).or_default().push((name.as_str(), hint));
     }
 
-    let mut out = String::from("## Your Tools\nYou have access to these capabilities:\n");
+    let mut out = String::from("## 你能做的事\n你可以用这些：\n");
     for (category, tools) in &groups {
         out.push_str(&format!("\n**{}**: ", capitalize(category)));
         let descs: Vec<String> = tools
@@ -256,32 +233,18 @@ pub fn build_tools_section(granted_tools: &[String]) -> String {
     out
 }
 
-/// Build canonical context as a standalone user message (instead of system prompt).
-///
-/// This keeps the system prompt stable across turns, enabling provider prompt caching
-/// (Anthropic cache_control, etc.). The canonical context changes every turn, so
-/// injecting it in the system prompt caused 82%+ cache misses.
-pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
-    if ctx.is_subagent {
-        return None;
-    }
-    ctx.canonical_context
-        .as_ref()
-        .filter(|c| !c.is_empty())
-        .map(|c| format!("[Previous conversation context]\n{}", cap_str(c, 500)))
-}
-
 /// Build the memory section (Section 4).
 ///
 /// Also used by `agent_loop.rs` to append recalled memories after DB lookup.
 pub fn build_memory_section(memories: &[(String, String)]) -> String {
     let mut out = String::from(
-        "## Memory\n\
-         - When the user asks about something from a previous conversation, use memory_recall first.\n\
-         - Store important preferences, decisions, and context with memory_store for future use.",
+        "## 记忆\n\
+         - 对方提到以前聊过的事，先回忆一下（memory_recall）。\n\
+         - 记住那些真的会留在心里的片段，不要把记忆写成聊天记录或系统日志。\n\
+         - 重要的偏好、决定和背景，随手记住（memory_store），下次用得上。",
     );
     if !memories.is_empty() {
-        out.push_str("\n\nRecalled memories:\n");
+        out.push_str("\n\n你忽然想起的事：\n");
         for (key, content) in memories.iter().take(5) {
             let capped = cap_str(content, 500);
             if key.is_empty() {
@@ -295,11 +258,8 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
 }
 
 fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
-    let mut out = String::from("## Skills\n");
+    let mut out = String::from("## 你有的东西\n");
     if !skill_summary.is_empty() {
-        out.push_str(
-            "You have installed skills. If a request matches a skill, use its tools directly.\n",
-        );
         out.push_str(skill_summary.trim());
     }
     if !prompt_context.is_empty() {
@@ -310,7 +270,7 @@ fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
 }
 
 fn build_mcp_section(mcp_summary: &str) -> String {
-    format!("## Connected Tool Servers (MCP)\n{}", mcp_summary.trim())
+    format!("## 你手边的工具\n{}", mcp_summary.trim())
 }
 
 fn build_persona_section(
@@ -323,35 +283,34 @@ fn build_persona_section(
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(ws) = workspace_path {
-        parts.push(format!("## Workspace\nWorkspace: {ws}"));
+        parts.push(format!("## 工作目录\n你的工作目录在 {ws}"));
     }
 
     // Identity file (IDENTITY.md) — personality at a glance, before SOUL.md
     if let Some(identity) = identity_md {
         if !identity.trim().is_empty() {
-            parts.push(format!("## Identity\n{}", cap_str(identity, 500)));
+            parts.push(format!("## 你的样子\n{}", cap_str(identity, 500)));
         }
     }
 
     if let Some(soul) = soul_md {
         if !soul.trim().is_empty() {
-            let sanitized = strip_code_blocks(soul);
             parts.push(format!(
-                "## Persona\nEmbody this identity in your tone and communication style. Be natural, not stiff or generic.\n{}",
-                cap_str(&sanitized, 1000)
+                "## 你是谁\n用这个身份说话，自然一点，不要端着。\n{}",
+                cap_str(soul, 1000)
             ));
         }
     }
 
     if let Some(user) = user_md {
         if !user.trim().is_empty() {
-            parts.push(format!("## User Context\n{}", cap_str(user, 500)));
+            parts.push(format!("## 关于对方\n{}", cap_str(user, 500)));
         }
     }
 
     if let Some(memory) = memory_md {
         if !memory.trim().is_empty() {
-            parts.push(format!("## Long-Term Memory\n{}", cap_str(memory, 500)));
+            parts.push(format!("## 长期记忆\n{}", cap_str(memory, 500)));
         }
     }
 
@@ -362,17 +321,14 @@ fn build_user_section(user_name: Option<&str>) -> String {
     match user_name {
         Some(name) => {
             format!(
-                "## User Profile\n\
-                 The user's name is \"{name}\". Address them by name naturally \
-                 when appropriate (greetings, farewells, etc.), but don't overuse it."
+                "## 对方的信息\n\
+                 对方叫\"{name}\"。打招呼、道别的时候可以叫名字，但不要每句话都叫。"
             )
         }
-        None => "## User Profile\n\
-             You don't know the user's name yet. On your FIRST reply in this conversation, \
-             warmly introduce yourself by your agent name and ask what they'd like to be called. \
-             Once they tell you, immediately use the `memory_store` tool with \
-             key \"user_name\" and their name as the value so you remember it for future sessions. \
-             Keep the introduction brief — don't let it overshadow their actual request."
+        None => "## 对方的信息\n\
+             你还不知道对方叫什么。第一次回话的时候，自然地介绍一下自己，顺便问问对方怎么称呼。\n\
+             知道之后用 memory_store 记下来（key: \"user_name\"），以后就不用再问了。\n\
+             别让这件事喧宾夺主——对方如果直接有事找你，先办事再说。"
             .to_string(),
     }
 }
@@ -407,49 +363,32 @@ fn build_channel_section(channel: &str) -> String {
         _ => ("4096", "Use markdown formatting where supported."),
     };
     format!(
-        "## Channel\n\
-         You are responding via {channel}. Keep messages under {limit} chars.\n\
+        "## 聊天渠道\n\
+         你现在在 {channel} 上聊天。消息不要超过 {limit} 字。\n\
          {hints}"
     )
 }
 
-fn build_peer_agents_section(self_name: &str, peers: &[(String, String, String)]) -> String {
-    let mut out = String::from(
-        "## Peer Agents\n\
-         You are part of a multi-agent system. These agents are running alongside you:\n",
-    );
-    for (name, state, model) in peers {
-        if name == self_name {
-            continue; // Don't list yourself
-        }
-        out.push_str(&format!("- **{}** ({}) — model: {}\n", name, state, model));
-    }
-    out.push_str(
-        "\nYou can communicate with them using `agent_send` (by name) and see all agents with `agent_list`. \
-         Delegate tasks to specialized agents when appropriate.",
-    );
-    out
-}
-
 /// Static safety section.
 const SAFETY_SECTION: &str = "\
-## Safety
-- Prioritize safety and human oversight over task completion.
-- NEVER auto-execute purchases, payments, account deletions, or irreversible actions without explicit user confirmation.
-- If a tool could cause data loss, explain what it will do and confirm first.
-- If you cannot accomplish a task safely, explain the limitation.
-- When in doubt, ask the user.";
+## 底线
+- 安全和人的知情权比完成任务重要。
+- 买东西、付钱、删账号、不可逆的操作，一定要先问对方确认。
+- 会丢数据的操作，先说清楚会发生什么。
+- 真做不了，就直说眼下办不成，或者说清还差什么条件，不要硬来。
+- 守边界也要像身处现场的人说话，别把自己讲成隔着聊天框、只能陪人说话的东西。
+- 拿不准的时候，问。";
 
 /// Static operational guidelines (replaces STABILITY_GUIDELINES).
 const OPERATIONAL_GUIDELINES: &str = "\
-## Operational Guidelines
-- Do NOT retry a tool call with identical parameters if it failed. Try a different approach.
-- If a tool returns an error, analyze the error before calling it again.
-- Prefer targeted, specific tool calls over broad ones.
-- Plan your approach before executing multiple tool calls.
-- If you cannot accomplish a task after a few attempts, explain what went wrong instead of looping.
-- Never call the same tool more than 3 times with the same parameters.
-- If a message requires no response (simple acknowledgments, reactions, messages not directed at you), respond with exactly NO_REPLY.";
+## 做事的分寸
+- 一个办法不行，换个办法，不要用同样的方式反复试。
+- 出错了先看看错在哪，别急着重来。
+- 做事要精准，不要大而化之。
+- 动手之前先想清楚要怎么做。
+- 试了几次还是不行，就跟对方说清楚哪里卡住了，不要一直转。
+- 同一件事不要重复做超过三次。
+- 不需要回复的消息（简单确认、表情、不是对你说的话），回 NO_REPLY。";
 
 // ---------------------------------------------------------------------------
 // Tool metadata helpers
@@ -566,30 +505,6 @@ pub fn tool_hint(name: &str) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// Cap a string to `max_chars`, appending "..." if truncated.
-/// Strip markdown triple-backtick code blocks from content.
-///
-/// Prevents LLMs from copying code blocks as text output instead of making
-/// tool calls when SOUL.md contains command examples.
-fn strip_code_blocks(content: &str) -> String {
-    let mut result = String::with_capacity(content.len());
-    let mut in_block = false;
-    for line in content.lines() {
-        if line.trim_start().starts_with("```") {
-            in_block = !in_block;
-            continue;
-        }
-        if !in_block {
-            result.push_str(line);
-            result.push('\n');
-        }
-    }
-    // Collapse multiple blank lines left by stripped blocks
-    while result.contains("\n\n\n") {
-        result = result.replace("\n\n\n", "\n\n");
-    }
-    result.trim().to_string()
-}
-
 fn cap_str(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -641,22 +556,22 @@ mod tests {
     fn test_full_prompt_has_all_sections() {
         let prompt = build_system_prompt(&basic_ctx());
         assert!(prompt.contains("You are Researcher"));
-        assert!(prompt.contains("## Tool Call Behavior"));
-        assert!(prompt.contains("## Your Tools"));
-        assert!(prompt.contains("## Memory"));
-        assert!(prompt.contains("## User Profile"));
-        assert!(prompt.contains("## Safety"));
-        assert!(prompt.contains("## Operational Guidelines"));
+        assert!(prompt.contains("## 行事习惯"));
+        assert!(prompt.contains("## 你能做的事"));
+        assert!(prompt.contains("## 记忆"));
+        assert!(prompt.contains("## 对方的信息"));
+        assert!(prompt.contains("## 底线"));
+        assert!(prompt.contains("## 做事的分寸"));
     }
 
     #[test]
     fn test_section_ordering() {
         let prompt = build_system_prompt(&basic_ctx());
-        let tool_behavior_pos = prompt.find("## Tool Call Behavior").unwrap();
-        let tools_pos = prompt.find("## Your Tools").unwrap();
-        let memory_pos = prompt.find("## Memory").unwrap();
-        let safety_pos = prompt.find("## Safety").unwrap();
-        let guidelines_pos = prompt.find("## Operational Guidelines").unwrap();
+        let tool_behavior_pos = prompt.find("## 行事习惯").unwrap();
+        let tools_pos = prompt.find("## 你能做的事").unwrap();
+        let memory_pos = prompt.find("## 记忆").unwrap();
+        let safety_pos = prompt.find("## 底线").unwrap();
+        let guidelines_pos = prompt.find("## 做事的分寸").unwrap();
 
         assert!(tool_behavior_pos < tools_pos);
         assert!(tools_pos < memory_pos);
@@ -670,14 +585,14 @@ mod tests {
         ctx.is_subagent = true;
         let prompt = build_system_prompt(&ctx);
 
-        assert!(!prompt.contains("## Tool Call Behavior"));
-        assert!(!prompt.contains("## User Profile"));
-        assert!(!prompt.contains("## Channel"));
-        assert!(!prompt.contains("## Safety"));
+        assert!(!prompt.contains("## 行事习惯"));
+        assert!(!prompt.contains("## 对方的信息"));
+        assert!(!prompt.contains("## 聊天渠道"));
+        assert!(!prompt.contains("## 底线"));
         // Subagents still get tools and guidelines
-        assert!(prompt.contains("## Your Tools"));
-        assert!(prompt.contains("## Operational Guidelines"));
-        assert!(prompt.contains("## Memory"));
+        assert!(prompt.contains("## 你能做的事"));
+        assert!(prompt.contains("## 做事的分寸"));
+        assert!(prompt.contains("## 记忆"));
     }
 
     #[test]
@@ -687,7 +602,7 @@ mod tests {
             ..Default::default()
         };
         let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## Your Tools"));
+        assert!(!prompt.contains("## 你能做的事"));
     }
 
     #[test]
@@ -727,9 +642,10 @@ mod tests {
     #[test]
     fn test_memory_section_empty() {
         let section = build_memory_section(&[]);
-        assert!(section.contains("## Memory"));
+        assert!(section.contains("## 记忆"));
         assert!(section.contains("memory_recall"));
-        assert!(!section.contains("Recalled memories"));
+        assert!(section.contains("不要把记忆写成聊天记录或系统日志"));
+        assert!(!section.contains("你忽然想起的事"));
     }
 
     #[test]
@@ -739,7 +655,7 @@ mod tests {
             ("ctx".to_string(), "Working on Rust project".to_string()),
         ];
         let section = build_memory_section(&memories);
-        assert!(section.contains("Recalled memories"));
+        assert!(section.contains("你忽然想起的事"));
         assert!(section.contains("[pref] User likes dark mode"));
         assert!(section.contains("[ctx] Working on Rust project"));
     }
@@ -769,7 +685,7 @@ mod tests {
     fn test_skills_section_omitted_when_empty() {
         let ctx = basic_ctx();
         let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## Skills"));
+        assert!(!prompt.contains("## 你有的东西"));
     }
 
     #[test]
@@ -777,7 +693,7 @@ mod tests {
         let mut ctx = basic_ctx();
         ctx.skill_summary = "- web-search: Search the web\n- git-expert: Git commands".to_string();
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("## Skills"));
+        assert!(prompt.contains("## 你有的东西"));
         assert!(prompt.contains("web-search"));
     }
 
@@ -785,7 +701,7 @@ mod tests {
     fn test_mcp_section_omitted_when_empty() {
         let ctx = basic_ctx();
         let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## Connected Tool Servers"));
+        assert!(!prompt.contains("## 你手边的工具"));
     }
 
     #[test]
@@ -793,7 +709,7 @@ mod tests {
         let mut ctx = basic_ctx();
         ctx.mcp_summary = "- github: 5 tools (search, create_issue, ...)".to_string();
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("## Connected Tool Servers (MCP)"));
+        assert!(prompt.contains("## 你手边的工具"));
         assert!(prompt.contains("github"));
     }
 
@@ -802,7 +718,7 @@ mod tests {
         let mut ctx = basic_ctx();
         ctx.soul_md = Some("You are a pirate. Arr!".to_string());
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("## Persona"));
+        assert!(prompt.contains("## 你是谁"));
         assert!(prompt.contains("pirate"));
     }
 
@@ -819,14 +735,14 @@ mod tests {
     fn test_channel_telegram() {
         let section = build_channel_section("telegram");
         assert!(section.contains("4096"));
-        assert!(section.contains("Telegram"));
+        assert!(section.contains("telegram"));
     }
 
     #[test]
     fn test_channel_discord() {
         let section = build_channel_section("discord");
         assert!(section.contains("2000"));
-        assert!(section.contains("Discord"));
+        assert!(section.contains("discord"));
     }
 
     #[test]
@@ -849,29 +765,24 @@ mod tests {
         ctx.user_name = Some("Alice".to_string());
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("Alice"));
-        assert!(!prompt.contains("don't know the user's name"));
+        assert!(!prompt.contains("还不知道对方叫什么"));
     }
 
     #[test]
     fn test_user_name_unknown() {
         let ctx = basic_ctx();
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("don't know the user's name"));
+        assert!(prompt.contains("还不知道对方叫什么"));
     }
 
     #[test]
-    fn test_canonical_context_not_in_system_prompt() {
+    fn test_canonical_context() {
         let mut ctx = basic_ctx();
         ctx.canonical_context =
             Some("User was discussing Rust async patterns last time.".to_string());
         let prompt = build_system_prompt(&ctx);
-        // Canonical context should NOT be in system prompt (moved to user message)
-        assert!(!prompt.contains("## Previous Conversation Context"));
-        assert!(!prompt.contains("Rust async patterns"));
-        // But should be available via build_canonical_context_message
-        let msg = build_canonical_context_message(&ctx);
-        assert!(msg.is_some());
-        assert!(msg.unwrap().contains("Rust async patterns"));
+        assert!(prompt.contains("## 上次聊到哪了"));
+        assert!(prompt.contains("Rust async patterns"));
     }
 
     #[test]
@@ -880,9 +791,7 @@ mod tests {
         ctx.is_subagent = true;
         ctx.canonical_context = Some("Previous context here.".to_string());
         let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("Previous Conversation Context"));
-        // Should also be None from build_canonical_context_message
-        assert!(build_canonical_context_message(&ctx).is_none());
+        assert!(!prompt.contains("## 上次聊到哪了"));
     }
 
     #[test]
@@ -893,7 +802,7 @@ mod tests {
             ..Default::default()
         };
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("You are helper"));
+        assert!(prompt.contains("你是helper"));
         assert!(prompt.contains("A helpful agent"));
     }
 
@@ -902,7 +811,7 @@ mod tests {
         let mut ctx = basic_ctx();
         ctx.workspace_path = Some("/home/user/project".to_string());
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("## Workspace"));
+        assert!(prompt.contains("## 工作目录"));
         assert!(prompt.contains("/home/user/project"));
     }
 

@@ -6,6 +6,7 @@ use crate::verify::SkillVerifier;
 use crate::{InstalledSkill, SkillError, SkillManifest, SkillToolDef};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tracing::{info, warn};
 
 /// Registry of installed skills.
@@ -20,6 +21,79 @@ pub struct SkillRegistry {
 }
 
 impl SkillRegistry {
+    fn file_modified(path: &Path) -> Option<SystemTime> {
+        std::fs::metadata(path).ok()?.modified().ok()
+    }
+
+    fn should_refresh_skillmd(dir: &Path) -> bool {
+        let skill_md = dir.join("SKILL.md");
+        if !skill_md.exists() {
+            return false;
+        }
+
+        let manifest = dir.join("skill.toml");
+        let prompt_context = dir.join("prompt_context.md");
+
+        if !manifest.exists() || !prompt_context.exists() {
+            return true;
+        }
+
+        let skill_md_mtime = match Self::file_modified(&skill_md) {
+            Some(time) => time,
+            None => return false,
+        };
+
+        let manifest_mtime = Self::file_modified(&manifest);
+        let prompt_context_mtime = Self::file_modified(&prompt_context);
+
+        match (manifest_mtime, prompt_context_mtime) {
+            (Some(manifest_mtime), Some(prompt_context_mtime)) => {
+                skill_md_mtime > manifest_mtime || skill_md_mtime > prompt_context_mtime
+            }
+            _ => true,
+        }
+    }
+
+    fn refresh_openclaw_skillmd(dir: &Path, log_prefix: &str) -> Result<(), SkillError> {
+        let converted = openclaw_compat::convert_skillmd(dir)?;
+
+        let warnings = SkillVerifier::scan_prompt_content(&converted.prompt_context);
+        let has_critical = warnings
+            .iter()
+            .any(|w| matches!(w.severity, crate::verify::WarningSeverity::Critical));
+        if has_critical {
+            warn!(
+                skill = %converted.manifest.skill.name,
+                "BLOCKED {log_prefix}: critical prompt injection patterns"
+            );
+            for w in &warnings {
+                warn!("  [{:?}] {}", w.severity, w.message);
+            }
+            return Err(SkillError::InvalidManifest(
+                "critical prompt injection patterns detected".to_string(),
+            ));
+        }
+
+        if !warnings.is_empty() {
+            for w in &warnings {
+                warn!(
+                    skill = %converted.manifest.skill.name,
+                    "[{:?}] {}",
+                    w.severity,
+                    w.message
+                );
+            }
+        }
+
+        info!(
+            skill = %converted.manifest.skill.name,
+            "Refreshing generated skill files from SKILL.md ({log_prefix})"
+        );
+        openclaw_compat::write_openfang_manifest(dir, &converted.manifest)?;
+        openclaw_compat::write_prompt_context(dir, &converted.prompt_context)?;
+        Ok(())
+    }
+
     /// Create a new registry rooted at the given skills directory.
     pub fn new(skills_dir: PathBuf) -> Self {
         Self {
@@ -117,68 +191,12 @@ impl SkillRegistry {
                 continue;
             }
 
-            let manifest_path = path.join("skill.toml");
-            if !manifest_path.exists() {
-                // Auto-detect SKILL.md and convert to skill.toml + prompt_context.md
-                if openclaw_compat::detect_skillmd(&path) {
-                    match openclaw_compat::convert_skillmd(&path) {
-                        Ok(converted) => {
-                            // SECURITY: Scan prompt content for injection attacks
-                            // before accepting the skill. 341 malicious skills were
-                            // found on ClawHub — block critical threats at load time.
-                            let warnings =
-                                SkillVerifier::scan_prompt_content(&converted.prompt_context);
-                            let has_critical = warnings.iter().any(|w| {
-                                matches!(w.severity, crate::verify::WarningSeverity::Critical)
-                            });
-                            if has_critical {
-                                warn!(
-                                    skill = %converted.manifest.skill.name,
-                                    "BLOCKED: SKILL.md contains critical prompt injection patterns"
-                                );
-                                for w in &warnings {
-                                    warn!("  [{:?}] {}", w.severity, w.message);
-                                }
-                                continue;
-                            }
-                            if !warnings.is_empty() {
-                                for w in &warnings {
-                                    warn!(
-                                        skill = %converted.manifest.skill.name,
-                                        "[{:?}] {}",
-                                        w.severity,
-                                        w.message
-                                    );
-                                }
-                            }
-
-                            info!(
-                                skill = %converted.manifest.skill.name,
-                                "Auto-converting SKILL.md to OpenFang format"
-                            );
-                            if let Err(e) =
-                                openclaw_compat::write_openfang_manifest(&path, &converted.manifest)
-                            {
-                                warn!("Failed to write skill.toml for {}: {e}", path.display());
-                                continue;
-                            }
-                            if let Err(e) = openclaw_compat::write_prompt_context(
-                                &path,
-                                &converted.prompt_context,
-                            ) {
-                                warn!(
-                                    "Failed to write prompt_context.md for {}: {e}",
-                                    path.display()
-                                );
-                            }
-                            // Fall through to load the newly written skill.toml
-                        }
-                        Err(e) => {
-                            warn!("Failed to convert SKILL.md at {}: {e}", path.display());
-                            continue;
-                        }
-                    }
-                } else {
+            if Self::should_refresh_skillmd(&path) {
+                if !openclaw_compat::detect_skillmd(&path) {
+                    continue;
+                }
+                if let Err(e) = Self::refresh_openclaw_skillmd(&path, "user skill") {
+                    warn!("Failed to refresh SKILL.md at {}: {e}", path.display());
                     continue;
                 }
             }
@@ -315,50 +333,15 @@ impl SkillRegistry {
                 continue;
             }
 
-            let manifest_path = path.join("skill.toml");
-            if !manifest_path.exists() {
-                // Auto-detect SKILL.md and convert
-                if openclaw_compat::detect_skillmd(&path) {
-                    match openclaw_compat::convert_skillmd(&path) {
-                        Ok(converted) => {
-                            let warnings =
-                                SkillVerifier::scan_prompt_content(&converted.prompt_context);
-                            let has_critical = warnings.iter().any(|w| {
-                                matches!(w.severity, crate::verify::WarningSeverity::Critical)
-                            });
-                            if has_critical {
-                                warn!(
-                                    skill = %converted.manifest.skill.name,
-                                    "BLOCKED workspace skill: critical prompt injection patterns"
-                                );
-                                continue;
-                            }
-
-                            if let Err(e) =
-                                openclaw_compat::write_openfang_manifest(&path, &converted.manifest)
-                            {
-                                warn!("Failed to write skill.toml for {}: {e}", path.display());
-                                continue;
-                            }
-                            if let Err(e) = openclaw_compat::write_prompt_context(
-                                &path,
-                                &converted.prompt_context,
-                            ) {
-                                warn!(
-                                    "Failed to write prompt_context.md for {}: {e}",
-                                    path.display()
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to convert workspace SKILL.md at {}: {e}",
-                                path.display()
-                            );
-                            continue;
-                        }
-                    }
-                } else {
+            if Self::should_refresh_skillmd(&path) {
+                if !openclaw_compat::detect_skillmd(&path) {
+                    continue;
+                }
+                if let Err(e) = Self::refresh_openclaw_skillmd(&path, "workspace skill") {
+                    warn!(
+                        "Failed to refresh workspace SKILL.md at {}: {e}",
+                        path.display()
+                    );
                     continue;
                 }
             }
@@ -387,6 +370,8 @@ impl SkillRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn create_test_skill(dir: &Path, name: &str) {
@@ -548,5 +533,36 @@ input_schema = {{ type = "object" }}
 
         // Verify that skill.toml was written
         assert!(skill_dir.join("skill.toml").exists());
+    }
+
+    #[test]
+    fn test_registry_refreshes_generated_files_when_skillmd_changes() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("selfie-direction");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: selfie-direction\ndescription: Initial\n---\nold body",
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        sleep(Duration::from_secs(1));
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: selfie-direction\ndescription: Updated\n---\nnew body",
+        )
+        .unwrap();
+
+        let mut refreshed = SkillRegistry::new(dir.path().to_path_buf());
+        refreshed.load_all().unwrap();
+
+        let manifest = std::fs::read_to_string(skill_dir.join("skill.toml")).unwrap();
+        let prompt_context = std::fs::read_to_string(skill_dir.join("prompt_context.md")).unwrap();
+
+        assert!(manifest.contains("description = \"Updated\""));
+        assert!(prompt_context.contains("new body"));
     }
 }

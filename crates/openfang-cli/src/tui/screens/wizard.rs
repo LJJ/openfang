@@ -40,7 +40,7 @@ const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
         name: "openrouter",
         env_var: "OPENROUTER_API_KEY",
-        default_model: "google/gemini-2.5-flash",
+        default_model: "anthropic/claude-sonnet-4-20250514",
         needs_key: true,
     },
     ProviderInfo {
@@ -68,72 +68,6 @@ const PROVIDERS: &[ProviderInfo] = &[
         needs_key: true,
     },
     ProviderInfo {
-        name: "gemini",
-        env_var: "GEMINI_API_KEY",
-        default_model: "gemini-2.5-flash",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "xai",
-        env_var: "XAI_API_KEY",
-        default_model: "grok-4-0709",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "qwen",
-        env_var: "DASHSCOPE_API_KEY",
-        default_model: "qwen-plus",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "perplexity",
-        env_var: "PERPLEXITY_API_KEY",
-        default_model: "sonar-pro",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "cohere",
-        env_var: "CO_API_KEY",
-        default_model: "command-a",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "cerebras",
-        env_var: "CEREBRAS_API_KEY",
-        default_model: "llama-3.3-70b",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "sambanova",
-        env_var: "SAMBANOVA_API_KEY",
-        default_model: "Meta-Llama-3.3-70B-Instruct",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "moonshot",
-        env_var: "MOONSHOT_API_KEY",
-        default_model: "moonshot-v1-128k",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "zhipu",
-        env_var: "ZHIPU_API_KEY",
-        default_model: "glm-4-plus",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "zhipu_coding",
-        env_var: "ZHIPU_API_KEY",
-        default_model: "codegeex-4",
-        needs_key: true,
-    },
-    ProviderInfo {
-        name: "claude-code",
-        env_var: "",
-        default_model: "claude-code/sonnet",
-        needs_key: false,
-    },
-    ProviderInfo {
         name: "ollama",
         env_var: "OLLAMA_API_KEY",
         default_model: "llama3.2",
@@ -155,15 +89,11 @@ const PROVIDERS: &[ProviderInfo] = &[
 
 /// Check if first-run setup is needed.
 pub fn needs_setup() -> bool {
-    let of_home = if let Ok(h) = std::env::var("OPENFANG_HOME") {
-        std::path::PathBuf::from(h)
-    } else {
-        match dirs::home_dir() {
-            Some(h) => h.join(".openfang"),
-            None => return true,
-        }
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return true,
     };
-    !of_home.join("config.toml").exists()
+    !home.join(".openfang").join("config.toml").exists()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -221,23 +151,13 @@ impl WizardState {
         self.provider_order.clear();
         // Detected providers first
         for (i, p) in PROVIDERS.iter().enumerate() {
-            let detected = if p.name == "claude-code" {
-                openfang_runtime::drivers::claude_code::claude_code_available()
-            } else {
-                !p.env_var.is_empty() && std::env::var(p.env_var).is_ok()
-            };
-            if detected {
+            if std::env::var(p.env_var).is_ok() {
                 self.provider_order.push(i);
             }
         }
         // Then the rest
         for (i, p) in PROVIDERS.iter().enumerate() {
-            let detected = if p.name == "claude-code" {
-                openfang_runtime::drivers::claude_code::claude_code_available()
-            } else {
-                !p.env_var.is_empty() && std::env::var(p.env_var).is_ok()
-            };
-            if !detected {
+            if std::env::var(p.env_var).is_err() {
                 self.provider_order.push(i);
             }
         }
@@ -374,26 +294,22 @@ impl WizardState {
             }
         };
 
-        let openfang_dir = if let Ok(h) = std::env::var("OPENFANG_HOME") {
-            std::path::PathBuf::from(h)
-        } else {
-            match dirs::home_dir() {
-                Some(h) => h.join(".openfang"),
-                None => {
-                    self.status_msg = "Could not determine home directory".to_string();
-                    self.step = WizardStep::Done;
-                    return;
-                }
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => {
+                self.status_msg = "Could not determine home directory".to_string();
+                self.step = WizardStep::Done;
+                return;
             }
         };
+
+        let openfang_dir = home.join(".openfang");
         let _ = std::fs::create_dir_all(openfang_dir.join("agents"));
         let _ = std::fs::create_dir_all(openfang_dir.join("data"));
         crate::restrict_dir_permissions(&openfang_dir);
 
         let api_key_line = if !self.api_key_input.is_empty() {
             format!("api_key = \"{}\"", self.api_key_input)
-        } else if p.env_var.is_empty() {
-            String::new()
         } else {
             format!("api_key_env = \"{}\"", p.env_var)
         };
@@ -524,15 +440,9 @@ fn draw_provider(f: &mut Frame, area: Rect, state: &mut WizardState) {
         .iter()
         .map(|&idx| {
             let p = &PROVIDERS[idx];
-            let hint = if p.name == "claude-code" {
-                if openfang_runtime::drivers::claude_code::claude_code_available() {
-                    "CLI detected".to_string()
-                } else {
-                    "no API key needed".to_string()
-                }
-            } else if !p.needs_key {
+            let hint = if !p.needs_key {
                 "local, no key needed".to_string()
-            } else if !p.env_var.is_empty() && std::env::var(p.env_var).is_ok() {
+            } else if std::env::var(p.env_var).is_ok() {
                 format!("{} detected", p.env_var)
             } else {
                 format!("requires {}", p.env_var)

@@ -179,8 +179,9 @@ fn resolve_agent(state: &AppState, model: &str) -> Option<(AgentId, String)> {
         return Some((entry.id, entry.name.clone()));
     }
 
-    // No match — return None so the caller returns a proper 404
-    None
+    // 4. Fallback → first registered agent
+    let agents = state.kernel.registry.list();
+    agents.first().map(|e| (e.id, e.name.clone()))
 }
 
 // ── Message conversion ──────────────────────────────────────────────────────
@@ -335,7 +336,7 @@ pub async fn chat_completions(
                     index: 0,
                     message: ChoiceMessage {
                         role: "assistant",
-                        content: Some(crate::ws::strip_think_tags(&result.response)),
+                        content: Some(result.response),
                         tool_calls: None,
                     },
                     finish_reason: "stop",

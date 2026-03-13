@@ -40,11 +40,6 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/browser/HAND.toml"),
             include_str!("../bundled/browser/SKILL.md"),
         ),
-        (
-            "trader",
-            include_str!("../bundled/trader/HAND.toml"),
-            include_str!("../bundled/trader/SKILL.md"),
-        ),
     ]
 }
 
@@ -76,7 +71,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 8);
+        assert_eq!(hands.len(), 7);
     }
 
     #[test]
@@ -192,7 +187,7 @@ mod tests {
         assert_eq!(def.name, "Browser Hand");
         assert_eq!(def.category, crate::HandCategory::Productivity);
         assert!(def.skill_content.is_some());
-        assert!(!def.requires.is_empty()); // requires python3 + chromium
+        assert!(!def.requires.is_empty()); // requires python3, playwright
         assert_eq!(def.requires.len(), 2);
         assert!(def.tools.contains(&"browser_navigate".to_string()));
         assert!(def.tools.contains(&"browser_click".to_string()));
@@ -204,26 +199,6 @@ mod tests {
         assert!(!def.dashboard.metrics.is_empty());
         assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
         assert_eq!(def.agent.max_iterations, Some(60));
-    }
-
-    #[test]
-    fn parse_trader_hand() {
-        let (id, toml_content, skill_content) = bundled_hands()
-            .into_iter()
-            .find(|(id, _, _)| *id == "trader")
-            .unwrap();
-        let def = parse_bundled(id, toml_content, skill_content).unwrap();
-        assert_eq!(def.id, "trader");
-        assert_eq!(def.name, "Trading Hand");
-        assert_eq!(def.category, crate::HandCategory::Data);
-        assert!(def.skill_content.is_some());
-        assert!(def.requires.is_empty()); // no hard requirements
-        assert!(!def.tools.is_empty());
-        assert!(def.tools.contains(&"event_publish".to_string()));
-        assert!(!def.settings.is_empty());
-        assert!(!def.dashboard.metrics.is_empty());
-        assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
-        assert_eq!(def.agent.max_iterations, Some(80));
     }
 
     #[test]
@@ -241,7 +216,7 @@ mod tests {
 
     #[test]
     fn all_einstein_hands_have_schedules() {
-        let einstein_ids = ["lead", "collector", "predictor", "researcher", "twitter", "trader"];
+        let einstein_ids = ["lead", "collector", "predictor", "researcher", "twitter"];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
                 let def = parse_bundled(id, toml_content, skill_content).unwrap();
@@ -266,7 +241,7 @@ mod tests {
 
     #[test]
     fn all_einstein_hands_have_memory() {
-        let einstein_ids = ["lead", "collector", "predictor", "researcher", "twitter", "trader"];
+        let einstein_ids = ["lead", "collector", "predictor", "researcher", "twitter"];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
                 let def = parse_bundled(id, toml_content, skill_content).unwrap();
@@ -286,7 +261,7 @@ mod tests {
 
     #[test]
     fn all_einstein_hands_have_knowledge_graph() {
-        let einstein_ids = ["lead", "collector", "predictor", "researcher", "twitter", "trader"];
+        let einstein_ids = ["lead", "collector", "predictor", "researcher", "twitter"];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
                 let def = parse_bundled(id, toml_content, skill_content).unwrap();

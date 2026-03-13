@@ -2,10 +2,9 @@
 //!
 //! Contains drivers for Anthropic Claude, Google Gemini, OpenAI-compatible APIs, and more.
 //! Supports: Anthropic, Gemini, OpenAI, Groq, OpenRouter, DeepSeek, Together,
-//! Mistral, Fireworks, Ollama, vLLM, Chutes.ai, and any OpenAI-compatible endpoint.
+//! Mistral, Fireworks, Ollama, vLLM, and any OpenAI-compatible endpoint.
 
 pub mod anthropic;
-pub mod claude_code;
 pub mod copilot;
 pub mod fallback;
 pub mod gemini;
@@ -13,14 +12,12 @@ pub mod openai;
 
 use crate::llm_driver::{DriverConfig, LlmDriver, LlmError};
 use openfang_types::model_catalog::{
-    AI21_BASE_URL, ANTHROPIC_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL,
-    DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL,
-    KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, MINIMAX_BASE_URL,
-    MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
-    OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
-    VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
-    ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
+    AI21_BASE_URL, ANTHROPIC_BASE_URL, CEREBRAS_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL,
+    FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, LMSTUDIO_BASE_URL,
+    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
+    OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL, REPLICATE_BASE_URL,
+    SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL, XAI_BASE_URL, ZHIPU_BASE_URL,
+    ZHIPU_CODING_BASE_URL,
 };
 use std::sync::Arc;
 
@@ -90,11 +87,6 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "LMSTUDIO_API_KEY",
             key_required: false,
         }),
-        "lemonade" => Some(ProviderDefaults {
-            base_url: LEMONADE_BASE_URL,
-            api_key_env: "LEMONADE_API_KEY",
-            key_required: false,
-        }),
         "perplexity" => Some(ProviderDefaults {
             base_url: PERPLEXITY_BASE_URL,
             api_key_env: "PERPLEXITY_API_KEY",
@@ -140,27 +132,12 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "GITHUB_TOKEN",
             key_required: true,
         }),
-        "codex" | "openai-codex" => Some(ProviderDefaults {
-            base_url: OPENAI_BASE_URL,
-            api_key_env: "OPENAI_API_KEY",
-            key_required: true,
-        }),
-        "claude-code" => Some(ProviderDefaults {
-            base_url: "",
-            api_key_env: "",
-            key_required: false,
-        }),
-        "moonshot" | "kimi" | "kimi2" => Some(ProviderDefaults {
+        "moonshot" | "kimi" => Some(ProviderDefaults {
             base_url: MOONSHOT_BASE_URL,
             api_key_env: "MOONSHOT_API_KEY",
             key_required: true,
         }),
-        "kimi_coding" => Some(ProviderDefaults {
-            base_url: KIMI_CODING_BASE_URL,
-            api_key_env: "KIMI_API_KEY",
-            key_required: true,
-        }),
-        "qwen" | "dashscope" | "model_studio" => Some(ProviderDefaults {
+        "qwen" | "dashscope" => Some(ProviderDefaults {
             base_url: QWEN_BASE_URL,
             api_key_env: "DASHSCOPE_API_KEY",
             key_required: true,
@@ -180,39 +157,9 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "ZHIPU_API_KEY",
             key_required: true,
         }),
-        "zai" | "z.ai" => Some(ProviderDefaults {
-            base_url: ZAI_BASE_URL,
-            api_key_env: "ZHIPU_API_KEY",
-            key_required: true,
-        }),
-        "zai_coding" => Some(ProviderDefaults {
-            base_url: ZAI_CODING_BASE_URL,
-            api_key_env: "ZHIPU_API_KEY",
-            key_required: true,
-        }),
         "qianfan" | "baidu" => Some(ProviderDefaults {
             base_url: QIANFAN_BASE_URL,
             api_key_env: "QIANFAN_API_KEY",
-            key_required: true,
-        }),
-        "volcengine" | "doubao" => Some(ProviderDefaults {
-            base_url: VOLCENGINE_BASE_URL,
-            api_key_env: "VOLCENGINE_API_KEY",
-            key_required: true,
-        }),
-        "volcengine_coding" => Some(ProviderDefaults {
-            base_url: VOLCENGINE_CODING_BASE_URL,
-            api_key_env: "VOLCENGINE_API_KEY",
-            key_required: true,
-        }),
-        "chutes" => Some(ProviderDefaults {
-            base_url: CHUTES_BASE_URL,
-            api_key_env: "CHUTES_API_KEY",
-            key_required: true,
-        }),
-        "venice" => Some(ProviderDefaults {
-            base_url: VENICE_BASE_URL,
-            api_key_env: "VENICE_API_KEY",
             key_required: true,
         }),
         _ => None,
@@ -241,7 +188,6 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
 /// - `huggingface` — Hugging Face Inference API
 /// - `xai` — xAI (Grok)
 /// - `replicate` — Replicate
-/// - `chutes` — Chutes.ai (serverless open-source model inference)
 /// - Any custom provider with `base_url` set uses OpenAI-compatible format
 pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmError> {
     let provider = config.provider.as_str();
@@ -281,31 +227,6 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(gemini::GeminiDriver::new(api_key, base_url)));
     }
 
-    // Codex — reuses OpenAI driver with credential sync from Codex CLI
-    if provider == "codex" || provider == "openai-codex" {
-        let api_key = config
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-            .or_else(crate::model_catalog::read_codex_credential)
-            .ok_or_else(|| {
-                LlmError::MissingApiKey(
-                    "Set OPENAI_API_KEY or install Codex CLI".to_string(),
-                )
-            })?;
-        let base_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| OPENAI_BASE_URL.to_string());
-        return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
-    }
-
-    // Claude Code CLI — subprocess-based, no API key needed
-    if provider == "claude-code" {
-        let cli_path = config.base_url.clone();
-        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(cli_path)));
-    }
-
     // GitHub Copilot — wraps OpenAI-compatible driver with automatic token exchange.
     // The CopilotDriver exchanges the GitHub PAT for a Copilot API token on demand,
     // caches it, and refreshes when expired.
@@ -327,22 +248,6 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             github_token,
             base_url,
         )));
-    }
-
-    // Kimi for Code — Anthropic-compatible endpoint
-    if provider == "kimi_coding" {
-        let api_key = config
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("KIMI_API_KEY").ok())
-            .ok_or_else(|| {
-                LlmError::MissingApiKey("Set KIMI_API_KEY environment variable".to_string())
-            })?;
-        let base_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| KIMI_CODING_BASE_URL.to_string());
-        return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
     // All other providers use OpenAI-compatible format
@@ -368,38 +273,13 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
     }
 
-    // Unknown provider — if base_url is set, treat as custom OpenAI-compatible.
-    // For custom providers, try the convention {PROVIDER_UPPER}_API_KEY as env var
-    // when no explicit api_key was passed. This lets users just set e.g. NVIDIA_API_KEY
-    // in their environment and use provider = "nvidia" without extra config.
+    // Unknown provider — if base_url is set, treat as custom OpenAI-compatible
     if let Some(ref base_url) = config.base_url {
-        let api_key = config.api_key.clone().unwrap_or_else(|| {
-            let env_var = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
-            std::env::var(&env_var).unwrap_or_default()
-        });
+        let api_key = config.api_key.clone().unwrap_or_default();
         return Ok(Arc::new(openai::OpenAIDriver::new(
             api_key,
             base_url.clone(),
         )));
-    }
-
-    // No base_url either — last resort: check if the user set an API key env var
-    // using the convention {PROVIDER_UPPER}_API_KEY. If found, use OpenAI-compatible
-    // driver with a default base URL derived from common patterns.
-    {
-        let env_var = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
-        if let Ok(api_key) = std::env::var(&env_var) {
-            if !api_key.is_empty() {
-                return Err(LlmError::Api {
-                    status: 0,
-                    message: format!(
-                        "Provider '{}' has API key ({} is set) but no base_url configured. \
-                         Add base_url to your [default_model] config or set it in [provider_urls].",
-                        provider, env_var
-                    ),
-                });
-            }
-        }
     }
 
     Err(LlmError::Api {
@@ -407,43 +287,11 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         message: format!(
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
-             cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
-             chutes, venice, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
+             cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot. \
+             Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
-}
-
-/// Detect the first available provider by scanning environment variables.
-///
-/// Returns `(provider, model, api_key_env)` for the first provider that has a
-/// configured API key, checked in a user-friendly priority order.
-pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'static str)> {
-    // Priority: popular cloud providers first, then niche, then local
-    const PROBE_ORDER: &[(&str, &str, &str)] = &[
-        ("openai", "gpt-4o", "OPENAI_API_KEY"),
-        ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
-        ("gemini", "gemini-2.5-flash", "GEMINI_API_KEY"),
-        ("groq", "llama-3.3-70b-versatile", "GROQ_API_KEY"),
-        ("deepseek", "deepseek-chat", "DEEPSEEK_API_KEY"),
-        ("openrouter", "openrouter/google/gemini-2.5-flash", "OPENROUTER_API_KEY"),
-        ("mistral", "mistral-large-latest", "MISTRAL_API_KEY"),
-        ("together", "meta-llama/Llama-3-70b-chat-hf", "TOGETHER_API_KEY"),
-        ("fireworks", "accounts/fireworks/models/llama-v3p1-70b-instruct", "FIREWORKS_API_KEY"),
-        ("xai", "grok-2", "XAI_API_KEY"),
-        ("perplexity", "llama-3.1-sonar-large-128k-online", "PERPLEXITY_API_KEY"),
-        ("cohere", "command-r-plus", "COHERE_API_KEY"),
-    ];
-    for &(provider, model, env_var) in PROBE_ORDER {
-        if std::env::var(env_var).ok().filter(|v| !v.is_empty()).is_some() {
-            return Some((provider, model, env_var));
-        }
-    }
-    // Also check GOOGLE_API_KEY as alias for Gemini
-    if std::env::var("GOOGLE_API_KEY").ok().filter(|v| !v.is_empty()).is_some() {
-        return Some(("gemini", "gemini-2.5-flash", "GOOGLE_API_KEY"));
-    }
-    None
 }
 
 /// List all known provider names.
@@ -475,14 +323,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "minimax",
         "zhipu",
         "zhipu_coding",
-        "zai",
-        "kimi_coding",
         "qianfan",
-        "volcengine",
-        "chutes",
-        "venice",
-        "codex",
-        "claude-code",
     ]
 }
 
@@ -575,14 +416,8 @@ mod tests {
         assert!(providers.contains(&"minimax"));
         assert!(providers.contains(&"zhipu"));
         assert!(providers.contains(&"zhipu_coding"));
-        assert!(providers.contains(&"zai"));
-        assert!(providers.contains(&"kimi_coding"));
         assert!(providers.contains(&"qianfan"));
-        assert!(providers.contains(&"volcengine"));
-        assert!(providers.contains(&"chutes"));
-        assert!(providers.contains(&"codex"));
-        assert!(providers.contains(&"claude-code"));
-        assert_eq!(providers.len(), 34);
+        assert_eq!(providers.len(), 27);
     }
 
     #[test]
@@ -621,70 +456,5 @@ mod tests {
         assert_eq!(d.base_url, "https://api-inference.huggingface.co/v1");
         assert_eq!(d.api_key_env, "HF_API_KEY");
         assert!(d.key_required);
-    }
-
-    #[test]
-    fn test_custom_provider_convention_env_var() {
-        // Set NVIDIA_API_KEY env var, then create a custom "nvidia" provider with base_url.
-        // The driver should pick up the key automatically via convention.
-        let unique_key = "test-nvidia-key-12345";
-        std::env::set_var("NVIDIA_API_KEY", unique_key);
-        let config = DriverConfig {
-            provider: "nvidia".to_string(),
-            api_key: None, // not explicitly passed
-            base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
-        };
-        let driver = create_driver(&config);
-        assert!(driver.is_ok(), "Custom provider with env var convention should succeed");
-        std::env::remove_var("NVIDIA_API_KEY");
-    }
-
-    #[test]
-    fn test_custom_provider_no_key_no_url_errors() {
-        // Custom provider with neither API key nor base_url should error.
-        let config = DriverConfig {
-            provider: "nvidia".to_string(),
-            api_key: None,
-            base_url: None,
-        };
-        let driver = create_driver(&config);
-        assert!(driver.is_err());
-    }
-
-    #[test]
-    fn test_custom_provider_key_no_url_helpful_error() {
-        // Custom provider with key set (via env) but no base_url should give helpful error.
-        let unique_key = "test-nvidia-key-67890";
-        std::env::set_var("NVIDIA_API_KEY", unique_key);
-        let config = DriverConfig {
-            provider: "nvidia".to_string(),
-            api_key: None,
-            base_url: None,
-        };
-        let result = create_driver(&config);
-        assert!(result.is_err());
-        let err = result.err().unwrap().to_string();
-        assert!(err.contains("base_url"), "Error should mention base_url: {}", err);
-        std::env::remove_var("NVIDIA_API_KEY");
-    }
-
-    #[test]
-    fn test_provider_defaults_kimi_coding() {
-        let d = provider_defaults("kimi_coding").unwrap();
-        assert_eq!(d.base_url, "https://api.kimi.com/coding");
-        assert_eq!(d.api_key_env, "KIMI_API_KEY");
-        assert!(d.key_required);
-    }
-
-    #[test]
-    fn test_custom_provider_explicit_key_with_url() {
-        // When api_key is explicitly passed, it should be used regardless of env var.
-        let config = DriverConfig {
-            provider: "my-custom-provider".to_string(),
-            api_key: Some("explicit-key".to_string()),
-            base_url: Some("https://api.example.com/v1".to_string()),
-        };
-        let driver = create_driver(&config);
-        assert!(driver.is_ok());
     }
 }

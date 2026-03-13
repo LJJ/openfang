@@ -60,20 +60,12 @@ pub enum ContentBlock {
         name: String,
         /// The tool input parameters.
         input: serde_json::Value,
-        /// Provider-specific metadata (e.g. Gemini `thoughtSignature`).
-        /// Opaque to the core — drivers read/write this to round-trip
-        /// fields the provider requires on subsequent requests.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider_metadata: Option<serde_json::Value>,
     },
     /// A tool result from executing a tool.
     #[serde(rename = "tool_result")]
     ToolResult {
         /// The tool_use ID this result corresponds to.
         tool_use_id: String,
-        /// The tool name (for Gemini FunctionResponse). Empty for legacy sessions.
-        #[serde(default)]
-        tool_name: String,
         /// The result content.
         content: String,
         /// Whether the tool execution errored.
@@ -175,14 +167,6 @@ impl Message {
         Self {
             role: Role::User,
             content: MessageContent::Text(content.into()),
-        }
-    }
-
-    /// Create a user message with structured content blocks (e.g. text + images).
-    pub fn user_with_blocks(blocks: Vec<ContentBlock>) -> Self {
-        Self {
-            role: Role::User,
-            content: MessageContent::Blocks(blocks),
         }
     }
 
@@ -303,28 +287,5 @@ mod tests {
         let json = serde_json::json!({"type": "future_block_type"});
         let block: ContentBlock = serde_json::from_value(json).unwrap();
         assert!(matches!(block, ContentBlock::Unknown));
-    }
-
-    #[test]
-    fn test_user_with_blocks() {
-        let blocks = vec![
-            ContentBlock::Text {
-                text: "What is in this image?".to_string(),
-            },
-            ContentBlock::Image {
-                media_type: "image/jpeg".to_string(),
-                data: "base64data".to_string(),
-            },
-        ];
-        let msg = Message::user_with_blocks(blocks);
-        assert_eq!(msg.role, Role::User);
-        match msg.content {
-            MessageContent::Blocks(ref b) => {
-                assert_eq!(b.len(), 2);
-                assert!(matches!(&b[0], ContentBlock::Text { text } if text == "What is in this image?"));
-                assert!(matches!(&b[1], ContentBlock::Image { media_type, .. } if media_type == "image/jpeg"));
-            }
-            _ => panic!("Expected blocks content"),
-        }
     }
 }

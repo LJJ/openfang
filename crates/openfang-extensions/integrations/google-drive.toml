@@ -8,7 +8,7 @@ tags = ["files", "storage", "google", "documents", "cloud-storage"]
 [transport]
 type = "stdio"
 command = "npx"
-args = ["-y", "@modelcontextprotocol/server-gdrive"]
+args = ["@anthropic/server-google-drive"]
 
 [oauth]
 provider = "google"

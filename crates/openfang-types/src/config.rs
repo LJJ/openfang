@@ -4,26 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Deserialize a `Vec<String>` that tolerates both string and integer elements.
-///
-/// When channel configs are saved from the web dashboard, numeric IDs (e.g. Discord
-/// guild snowflakes, Telegram user IDs) are stored as TOML integers. This helper
-/// transparently converts integers back to strings so deserialization never fails.
-fn deserialize_string_or_int_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let values: Vec<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
-    Ok(values
-        .into_iter()
-        .map(|v| match v {
-            serde_json::Value::String(s) => s,
-            serde_json::Value::Number(n) => n.to_string(),
-            other => other.to_string(),
-        })
-        .collect())
-}
-
 /// DM (direct message) policy for a channel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -301,8 +281,8 @@ pub struct BrowserConfig {
     pub idle_timeout_secs: u64,
     /// Maximum concurrent browser sessions.
     pub max_sessions: usize,
-    /// Path to Chromium/Chrome binary. Auto-detected if None.
-    pub chromium_path: Option<String>,
+    /// Python executable path (e.g., "python3" on Unix, "python" on Windows).
+    pub python_path: String,
 }
 
 impl Default for BrowserConfig {
@@ -314,7 +294,11 @@ impl Default for BrowserConfig {
             timeout_secs: 30,
             idle_timeout_secs: 300,
             max_sessions: 5,
-            chromium_path: None,
+            python_path: if cfg!(windows) {
+                "python".to_string()
+            } else {
+                "python3".to_string()
+            },
         }
     }
 }
@@ -766,14 +750,11 @@ impl Default for CanvasConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ExecSecurityMode {
     /// Block all shell execution.
-    #[serde(alias = "none", alias = "disabled")]
     Deny,
     /// Only allow commands in safe_bins or allowed_commands.
     #[default]
-    #[serde(alias = "restricted")]
     Allowlist,
     /// Allow all commands (unsafe, dev only).
-    #[serde(alias = "allow", alias = "all", alias = "unrestricted")]
     Full,
 }
 
@@ -1015,7 +996,7 @@ pub struct KernelConfig {
     #[serde(default)]
     pub webhook_triggers: Option<WebhookTriggerConfig>,
     /// Execution approval policy.
-    #[serde(default, alias = "approval_policy")]
+    #[serde(default)]
     pub approval: crate::approval::ApprovalPolicy,
     /// Cron scheduler max total jobs across all agents. Default: 500.
     #[serde(default = "default_max_cron_jobs")]
@@ -1062,12 +1043,6 @@ pub struct KernelConfig {
     /// e.g. `ollama = "http://192.168.1.100:11434/v1"`
     #[serde(default)]
     pub provider_urls: HashMap<String, String>,
-    /// Provider API key env var overrides (provider ID → env var name).
-    /// For custom/unknown providers, maps the provider name to the environment
-    /// variable holding the API key. e.g. `nvidia = "NVIDIA_API_KEY"`.
-    /// If not set, the convention `{PROVIDER_UPPER}_API_KEY` is used automatically.
-    #[serde(default)]
-    pub provider_api_keys: HashMap<String, String>,
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
@@ -1108,10 +1083,6 @@ pub struct BudgetConfig {
     pub max_monthly_usd: f64,
     /// Alert threshold as a fraction (0.0 - 1.0). Trigger warnings at this % of any limit.
     pub alert_threshold: f64,
-    /// Default per-agent hourly token limit override. When set (> 0), all agents
-    /// will be overridden to this value. Set to 0 to keep each agent's own limit.
-    /// Use this to globally raise or lower the token budget for all agents.
-    pub default_max_llm_tokens_per_hour: u64,
 }
 
 impl Default for BudgetConfig {
@@ -1121,7 +1092,6 @@ impl Default for BudgetConfig {
             max_daily_usd: 0.0,
             max_monthly_usd: 0.0,
             alert_threshold: 0.8,
-            default_max_llm_tokens_per_hour: 0,
         }
     }
 }
@@ -1197,13 +1167,9 @@ fn default_language() -> String {
     "en".to_string()
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl Default for KernelConfig {
     fn default() -> Self {
-        let home_dir = openfang_home_dir();
+        let home_dir = dirs_next_home().join(".openfang");
         Self {
             data_dir: home_dir.join("data"),
             home_dir,
@@ -1246,7 +1212,6 @@ impl Default for KernelConfig {
             thinking: None,
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
-            provider_api_keys: HashMap::new(),
             oauth: OAuthConfig::default(),
         }
     }
@@ -1258,27 +1223,6 @@ impl KernelConfig {
         self.workspaces_dir
             .clone()
             .unwrap_or_else(|| self.home_dir.join("workspaces"))
-    }
-
-    /// Resolve the API key env var name for a provider.
-    ///
-    /// Checks: 1) explicit `provider_api_keys` mapping, 2) `auth_profiles` first entry,
-    /// 3) convention `{PROVIDER_UPPER}_API_KEY`.
-    pub fn resolve_api_key_env(&self, provider: &str) -> String {
-        // 1. Explicit mapping in [provider_api_keys]
-        if let Some(env_var) = self.provider_api_keys.get(provider) {
-            return env_var.clone();
-        }
-        // 2. Auth profiles (first profile by priority)
-        if let Some(profiles) = self.auth_profiles.get(provider) {
-            let mut sorted: Vec<_> = profiles.iter().collect();
-            sorted.sort_by_key(|p| p.priority);
-            if let Some(best) = sorted.first() {
-                return best.api_key_env.clone();
-            }
-        }
-        // 3. Convention: NVIDIA → NVIDIA_API_KEY
-        format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
     }
 }
 
@@ -1361,24 +1305,13 @@ impl std::fmt::Debug for KernelConfig {
                 &format!("{} provider(s)", self.auth_profiles.len()),
             )
             .field("thinking", &self.thinking.is_some())
-            .field(
-                "provider_api_keys",
-                &format!("{} mapping(s)", self.provider_api_keys.len()),
-            )
             .finish()
     }
 }
 
-/// Resolve the OpenFang home directory.
-///
-/// Priority: `OPENFANG_HOME` env var > `~/.openfang`.
-fn openfang_home_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("OPENFANG_HOME") {
-        return PathBuf::from(home);
-    }
-    dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".openfang")
+/// Fallback home directory resolution.
+fn dirs_next_home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
 /// Default LLM model configuration.
@@ -1591,17 +1524,11 @@ pub struct TelegramConfig {
     /// Env var name holding the bot token (NOT the token itself).
     pub bot_token_env: String,
     /// Telegram user IDs allowed to interact (empty = allow all).
-    /// Accepts strings for consistency; numeric TOML integers are coerced to strings.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
-    pub allowed_users: Vec<String>,
+    pub allowed_users: Vec<i64>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
     /// Polling interval in seconds.
     pub poll_interval_secs: u64,
-    /// Custom Telegram Bot API base URL for proxies or mirrors.
-    /// Defaults to `https://api.telegram.org` when not set.
-    #[serde(default)]
-    pub api_url: Option<String>,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1614,7 +1541,6 @@ impl Default for TelegramConfig {
             allowed_users: vec![],
             default_agent: None,
             poll_interval_secs: 1,
-            api_url: None,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -1627,20 +1553,11 @@ pub struct DiscordConfig {
     /// Env var name holding the bot token (NOT the token itself).
     pub bot_token_env: String,
     /// Guild (server) IDs allowed to interact (empty = allow all).
-    /// Accepts strings for consistency with other channel configs.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
-    pub allowed_guilds: Vec<String>,
-    /// User IDs allowed to interact (empty = allow all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
-    pub allowed_users: Vec<String>,
+    pub allowed_guilds: Vec<u64>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
-    /// Gateway intents bitmask (default: 37376 = GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
+    /// Gateway intents bitmask (default: 33280 = GUILD_MESSAGES | MESSAGE_CONTENT).
     pub intents: u64,
-    /// Ignore messages from other bots (default: true).
-    /// Set to false to allow bot-to-bot interactions in multi-agent setups.
-    #[serde(default = "default_true")]
-    pub ignore_bots: bool,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1651,10 +1568,8 @@ impl Default for DiscordConfig {
         Self {
             bot_token_env: "DISCORD_BOT_TOKEN".to_string(),
             allowed_guilds: vec![],
-            allowed_users: vec![],
             default_agent: None,
-            intents: 37376,
-            ignore_bots: true,
+            intents: 33280,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -1669,7 +1584,6 @@ pub struct SlackConfig {
     /// Env var name holding the bot token (xoxb-) for REST API.
     pub bot_token_env: String,
     /// Channel IDs allowed to interact (empty = allow all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_channels: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -1706,7 +1620,6 @@ pub struct WhatsAppConfig {
     /// When set, outgoing messages are routed through the gateway instead of Cloud API.
     pub gateway_url_env: String,
     /// Allowed phone numbers (empty = allow all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_users: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -1739,7 +1652,6 @@ pub struct SignalConfig {
     /// Registered phone number.
     pub phone_number: String,
     /// Allowed phone numbers (empty = allow all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_users: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -1771,7 +1683,6 @@ pub struct MatrixConfig {
     /// Env var name holding the access token.
     pub access_token_env: String,
     /// Room IDs to listen in (empty = all joined rooms).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_rooms: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -1812,10 +1723,8 @@ pub struct EmailConfig {
     /// Poll interval in seconds.
     pub poll_interval_secs: u64,
     /// IMAP folders to monitor.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub folders: Vec<String>,
     /// Only process emails from these senders (empty = all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_senders: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -1853,7 +1762,6 @@ pub struct TeamsConfig {
     /// Port for the incoming webhook.
     pub webhook_port: u16,
     /// Allowed tenant IDs (empty = allow all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_tenants: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -1884,7 +1792,6 @@ pub struct MattermostConfig {
     /// Env var name holding the bot token.
     pub token_env: String,
     /// Allowed channel IDs (empty = all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_channels: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -1918,7 +1825,6 @@ pub struct IrcConfig {
     /// Env var name holding the server password (optional).
     pub password_env: Option<String>,
     /// Channels to join (e.g., `["#openfang", "#general"]`).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub channels: Vec<String>,
     /// Use TLS (requires tokio-native-tls).
     pub use_tls: bool,
@@ -1951,7 +1857,6 @@ pub struct GoogleChatConfig {
     /// Env var name holding the service account JSON key.
     pub service_account_env: String,
     /// Space IDs to listen in.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub space_ids: Vec<String>,
     /// Port for the incoming webhook.
     pub webhook_port: u16,
@@ -1981,7 +1886,6 @@ pub struct TwitchConfig {
     /// Env var name holding the OAuth token.
     pub oauth_token_env: String,
     /// Twitch channels to join (without #).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub channels: Vec<String>,
     /// Bot nickname.
     pub nick: String,
@@ -2015,7 +1919,6 @@ pub struct RocketChatConfig {
     /// User ID for the bot.
     pub user_id: String,
     /// Allowed channel IDs (empty = all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_channels: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2048,7 +1951,6 @@ pub struct ZulipConfig {
     /// Env var name holding the API key.
     pub api_key_env: String,
     /// Streams to listen in.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub streams: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2083,7 +1985,6 @@ pub struct XmppConfig {
     /// XMPP server port.
     pub port: u16,
     /// MUC rooms to join.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub rooms: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2208,7 +2109,6 @@ pub struct RedditConfig {
     /// Env var name holding the bot password.
     pub password_env: String,
     /// Subreddits to monitor.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub subreddits: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2352,7 +2252,6 @@ pub struct NextcloudConfig {
     /// Env var name holding the auth token.
     pub token_env: String,
     /// Room tokens to listen in (empty = all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_rooms: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2380,7 +2279,6 @@ pub struct GuildedConfig {
     /// Env var name holding the bot token.
     pub bot_token_env: String,
     /// Server IDs to listen in (empty = all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub server_ids: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2409,7 +2307,6 @@ pub struct KeybaseConfig {
     /// Env var name holding the paper key.
     pub paperkey_env: String,
     /// Team names to listen in (empty = all DMs).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_teams: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2466,7 +2363,6 @@ pub struct NostrConfig {
     /// Env var name holding the private key (nsec or hex).
     pub private_key_env: String,
     /// Relay URLs to connect to.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub relays: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2493,7 +2389,6 @@ pub struct WebexConfig {
     /// Env var name holding the bot token.
     pub bot_token_env: String,
     /// Room IDs to listen in (empty = all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_rooms: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2574,7 +2469,6 @@ pub struct TwistConfig {
     /// Workspace ID.
     pub workspace_id: String,
     /// Channel IDs to listen in (empty = all).
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_channels: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -2672,7 +2566,6 @@ pub struct DiscourseConfig {
     /// API username.
     pub api_username: String,
     /// Category slugs to monitor.
-    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub categories: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
@@ -3333,25 +3226,7 @@ mod tests {
         let dc = DiscordConfig::default();
         assert_eq!(dc.bot_token_env, "DISCORD_BOT_TOKEN");
         assert!(dc.allowed_guilds.is_empty());
-        assert_eq!(dc.intents, 37376);
-        assert!(dc.ignore_bots);
-    }
-
-    #[test]
-    fn test_discord_config_ignore_bots_deserialization() {
-        let toml_str = r#"
-            bot_token_env = "DISCORD_BOT_TOKEN"
-            ignore_bots = false
-        "#;
-        let dc: DiscordConfig = toml::from_str(toml_str).unwrap();
-        assert!(!dc.ignore_bots);
-
-        // Default (field omitted) should be true
-        let toml_str2 = r#"
-            bot_token_env = "DISCORD_BOT_TOKEN"
-        "#;
-        let dc2: DiscordConfig = toml::from_str(toml_str2).unwrap();
-        assert!(dc2.ignore_bots);
+        assert_eq!(dc.intents, 33280);
     }
 
     #[test]
@@ -3700,78 +3575,5 @@ mod tests {
         assert_eq!(config.browser.max_sessions, browser_sessions);
         assert_eq!(config.web.fetch.max_response_bytes, fetch_bytes);
         assert_eq!(config.web.fetch.timeout_secs, fetch_timeout);
-    }
-
-    #[test]
-    fn test_resolve_api_key_env_convention() {
-        let config = KernelConfig::default();
-        // Unknown provider falls back to convention
-        assert_eq!(config.resolve_api_key_env("nvidia"), "NVIDIA_API_KEY");
-        assert_eq!(config.resolve_api_key_env("my-custom"), "MY_CUSTOM_API_KEY");
-    }
-
-    #[test]
-    fn test_resolve_api_key_env_explicit_mapping() {
-        let mut config = KernelConfig::default();
-        config
-            .provider_api_keys
-            .insert("nvidia".to_string(), "NIM_KEY".to_string());
-        // Explicit mapping takes precedence over convention
-        assert_eq!(config.resolve_api_key_env("nvidia"), "NIM_KEY");
-    }
-
-    #[test]
-    fn test_resolve_api_key_env_auth_profiles() {
-        let mut config = KernelConfig::default();
-        config.auth_profiles.insert(
-            "nvidia".to_string(),
-            vec![AuthProfile {
-                name: "primary".to_string(),
-                api_key_env: "NVIDIA_PRIMARY_KEY".to_string(),
-                priority: 0,
-            }],
-        );
-        // Auth profiles take precedence over convention (but not explicit mapping)
-        assert_eq!(
-            config.resolve_api_key_env("nvidia"),
-            "NVIDIA_PRIMARY_KEY"
-        );
-    }
-
-    #[test]
-    fn test_resolve_api_key_env_explicit_over_auth_profile() {
-        let mut config = KernelConfig::default();
-        config
-            .provider_api_keys
-            .insert("nvidia".to_string(), "NIM_KEY".to_string());
-        config.auth_profiles.insert(
-            "nvidia".to_string(),
-            vec![AuthProfile {
-                name: "primary".to_string(),
-                api_key_env: "NVIDIA_PRIMARY_KEY".to_string(),
-                priority: 0,
-            }],
-        );
-        // Explicit mapping wins over auth profiles
-        assert_eq!(config.resolve_api_key_env("nvidia"), "NIM_KEY");
-    }
-
-    #[test]
-    fn test_provider_api_keys_toml_roundtrip() {
-        let toml_str = r#"
-            [provider_api_keys]
-            nvidia = "NVIDIA_NIM_KEY"
-            azure = "AZURE_OPENAI_KEY"
-        "#;
-        let config: KernelConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.provider_api_keys.len(), 2);
-        assert_eq!(
-            config.provider_api_keys.get("nvidia").unwrap(),
-            "NVIDIA_NIM_KEY"
-        );
-        assert_eq!(
-            config.provider_api_keys.get("azure").unwrap(),
-            "AZURE_OPENAI_KEY"
-        );
     }
 }

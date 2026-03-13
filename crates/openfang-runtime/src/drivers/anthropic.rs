@@ -27,10 +27,7 @@ impl AnthropicDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: reqwest::Client::builder()
-                .user_agent(crate::USER_AGENT)
-                .build()
-                .unwrap_or_default(),
+            client: reqwest::Client::new(),
         }
     }
 }
@@ -368,10 +365,10 @@ impl LlmDriver for AnthropicDriver {
                     let mut event_type = String::new();
                     let mut data = String::new();
                     for line in event_text.lines() {
-                        if let Some(et) = line.strip_prefix("event:") {
-                            event_type = et.trim_start().to_string();
-                        } else if let Some(d) = line.strip_prefix("data:") {
-                            data = d.trim_start().to_string();
+                        if let Some(et) = line.strip_prefix("event: ") {
+                            event_type = et.to_string();
+                        } else if let Some(d) = line.strip_prefix("data: ") {
+                            data = d.to_string();
                         }
                     }
 
@@ -418,13 +415,12 @@ impl LlmDriver for AnthropicDriver {
                             }
                         }
                         "content_block_delta" => {
-                            let block_idx = json["index"].as_u64().unwrap_or(0) as usize;
                             let delta = &json["delta"];
                             match delta["type"].as_str().unwrap_or("") {
                                 "text_delta" => {
                                     if let Some(text) = delta["text"].as_str() {
                                         if let Some(ContentBlockAccum::Text(ref mut t)) =
-                                            blocks.get_mut(block_idx)
+                                            blocks.last_mut()
                                         {
                                             t.push_str(text);
                                         }
@@ -440,7 +436,7 @@ impl LlmDriver for AnthropicDriver {
                                         if let Some(ContentBlockAccum::ToolUse {
                                             ref mut input_json,
                                             ..
-                                        }) = blocks.get_mut(block_idx)
+                                        }) = blocks.last_mut()
                                         {
                                             input_json.push_str(partial);
                                         }
@@ -454,7 +450,7 @@ impl LlmDriver for AnthropicDriver {
                                 "thinking_delta" => {
                                     if let Some(thinking) = delta["thinking"].as_str() {
                                         if let Some(ContentBlockAccum::Thinking(ref mut t)) =
-                                            blocks.get_mut(block_idx)
+                                            blocks.last_mut()
                                         {
                                             t.push_str(thinking);
                                         }
@@ -464,12 +460,11 @@ impl LlmDriver for AnthropicDriver {
                             }
                         }
                         "content_block_stop" => {
-                            let block_idx = json["index"].as_u64().unwrap_or(0) as usize;
                             if let Some(ContentBlockAccum::ToolUse {
                                 id,
                                 name,
                                 input_json,
-                            }) = blocks.get(block_idx)
+                            }) = blocks.last()
                             {
                                 let input: serde_json::Value =
                                     serde_json::from_str(input_json).unwrap_or_default();
@@ -523,7 +518,6 @@ impl LlmDriver for AnthropicDriver {
                             id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
-                            provider_metadata: None,
                         });
                         tool_calls.push(ToolCall { id, name, input });
                     }
@@ -573,7 +567,7 @@ fn convert_message(msg: &Message) -> ApiMessage {
                             data: data.clone(),
                         },
                     }),
-                    ContentBlock::ToolUse { id, name, input, .. } => Some(ApiContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input } => Some(ApiContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: input.clone(),
@@ -582,7 +576,6 @@ fn convert_message(msg: &Message) -> ApiMessage {
                         tool_use_id,
                         content,
                         is_error,
-                        ..
                     } => Some(ApiContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: content.clone(),
@@ -617,7 +610,6 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
-                    provider_metadata: None,
                 });
                 tool_calls.push(ToolCall { id, name, input });
             }

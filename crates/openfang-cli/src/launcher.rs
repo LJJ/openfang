@@ -39,15 +39,11 @@ fn detect_provider() -> Option<(&'static str, &'static str)> {
 }
 
 fn is_first_run() -> bool {
-    let of_home = if let Ok(h) = std::env::var("OPENFANG_HOME") {
-        std::path::PathBuf::from(h)
-    } else {
-        match dirs::home_dir() {
-            Some(h) => h.join(".openfang"),
-            None => return true,
-        }
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return true,
     };
-    !of_home.join("config.toml").exists()
+    !home.join(".openfang").join("config.toml").exists()
 }
 
 fn has_openclaw() -> bool {

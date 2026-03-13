@@ -14,23 +14,11 @@ function settingsPage() {
     modelSearch: '',
     modelProviderFilter: '',
     modelTierFilter: '',
-    showCustomModelForm: false,
-    customModelId: '',
-    customModelProvider: 'openrouter',
-    customModelContext: 128000,
-    customModelMaxOutput: 8192,
-    customModelStatus: '',
     providerKeyInputs: {},
     providerUrlInputs: {},
     providerUrlSaving: {},
     providerTesting: {},
     providerTestResults: {},
-    copilotOAuth: { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 },
-    customProviderName: '',
-    customProviderUrl: '',
-    customProviderKey: '',
-    customProviderStatus: '',
-    addingCustomProvider: false,
     loading: true,
     loadError: '',
 
@@ -224,13 +212,8 @@ function settingsPage() {
         this.providers = data.providers || [];
         for (var i = 0; i < this.providers.length; i++) {
           var p = this.providers[i];
-          if (p.is_local) {
-            if (!this.providerUrlInputs[p.id]) {
-              this.providerUrlInputs[p.id] = p.base_url || '';
-            }
-            if (this.providerUrlSaving[p.id] === undefined) {
-              this.providerUrlSaving[p.id] = false;
-            }
+          if (p.is_local && p.base_url && !this.providerUrlInputs[p.id]) {
+            this.providerUrlInputs[p.id] = p.base_url;
           }
         }
       } catch(e) { this.providers = []; }
@@ -241,37 +224,6 @@ function settingsPage() {
         var data = await OpenFangAPI.get('/api/models');
         this.models = data.models || [];
       } catch(e) { this.models = []; }
-    },
-
-    async addCustomModel() {
-      var id = this.customModelId.trim();
-      if (!id) return;
-      this.customModelStatus = 'Adding...';
-      try {
-        await OpenFangAPI.post('/api/models/custom', {
-          id: id,
-          provider: this.customModelProvider || 'openrouter',
-          context_window: this.customModelContext || 128000,
-          max_output_tokens: this.customModelMaxOutput || 8192,
-        });
-        this.customModelStatus = 'Added!';
-        this.customModelId = '';
-        this.showCustomModelForm = false;
-        await this.loadModels();
-      } catch(e) {
-        this.customModelStatus = 'Error: ' + (e.message || 'Failed');
-      }
-    },
-
-    async deleteCustomModel(modelId) {
-      if (!confirm('Delete custom model "' + modelId + '"?')) return;
-      try {
-        await OpenFangAPI.del('/api/models/custom/' + encodeURIComponent(modelId));
-        OpenFangToast.success('Model deleted');
-        await this.loadModels();
-      } catch(e) {
-        OpenFangToast.error('Failed to delete: ' + (e.message || 'Unknown error'));
-      }
     },
 
     async loadConfigSchema() {
@@ -295,14 +247,11 @@ function settingsPage() {
 
     async saveConfigField(section, field, value) {
       var key = section + '.' + field;
-      // Root-level fields (api_key, api_listen, log_level) use just the field name
-      var sectionMeta = this.configSchema && this.configSchema[section];
-      var path = (sectionMeta && sectionMeta.root_level) ? field : key;
       this.configSaving[key] = true;
       try {
-        await OpenFangAPI.post('/api/config/set', { path: path, value: value });
+        await OpenFangAPI.post('/api/config/set', { path: key, value: value });
         this.configDirty[key] = false;
-        OpenFangToast.success('Saved ' + field);
+        OpenFangToast.success('Saved ' + key);
       } catch(e) {
         OpenFangToast.error('Failed to save: ' + e.message);
       }
@@ -352,10 +301,7 @@ function settingsPage() {
 
     providerAuthText(p) {
       if (p.auth_status === 'configured') return 'Configured';
-      if (p.auth_status === 'not_set' || p.auth_status === 'missing') {
-        if (p.id === 'claude-code') return 'Not Installed';
-        return 'Not Set';
-      }
+      if (p.auth_status === 'not_set' || p.auth_status === 'missing') return 'Not Set';
       return 'No Key Needed';
     },
 
@@ -422,54 +368,6 @@ function settingsPage() {
       }
     },
 
-    async startCopilotOAuth() {
-      this.copilotOAuth.polling = true;
-      this.copilotOAuth.userCode = '';
-      try {
-        var resp = await OpenFangAPI.post('/api/providers/github-copilot/oauth/start', {});
-        this.copilotOAuth.userCode = resp.user_code;
-        this.copilotOAuth.verificationUri = resp.verification_uri;
-        this.copilotOAuth.pollId = resp.poll_id;
-        this.copilotOAuth.interval = resp.interval || 5;
-        window.open(resp.verification_uri, '_blank');
-        this.pollCopilotOAuth();
-      } catch(e) {
-        OpenFangToast.error('Failed to start Copilot login: ' + e.message);
-        this.copilotOAuth.polling = false;
-      }
-    },
-
-    pollCopilotOAuth() {
-      var self = this;
-      setTimeout(async function() {
-        if (!self.copilotOAuth.pollId) return;
-        try {
-          var resp = await OpenFangAPI.get('/api/providers/github-copilot/oauth/poll/' + self.copilotOAuth.pollId);
-          if (resp.status === 'complete') {
-            OpenFangToast.success('GitHub Copilot authenticated successfully!');
-            self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
-            await self.loadProviders();
-            await self.loadModels();
-          } else if (resp.status === 'pending') {
-            if (resp.interval) self.copilotOAuth.interval = resp.interval;
-            self.pollCopilotOAuth();
-          } else if (resp.status === 'expired') {
-            OpenFangToast.error('Device code expired. Please try again.');
-            self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
-          } else if (resp.status === 'denied') {
-            OpenFangToast.error('Access denied by user.');
-            self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
-          } else {
-            OpenFangToast.error('OAuth error: ' + (resp.error || resp.status));
-            self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
-          }
-        } catch(e) {
-          OpenFangToast.error('Poll error: ' + e.message);
-          self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
-        }
-      }, self.copilotOAuth.interval * 1000);
-    },
-
     async testProvider(provider) {
       this.providerTesting[provider.id] = true;
       this.providerTestResults[provider.id] = null;
@@ -508,34 +406,6 @@ function settingsPage() {
         OpenFangToast.error('Failed to save URL: ' + e.message);
       }
       this.providerUrlSaving[provider.id] = false;
-    },
-
-    async addCustomProvider() {
-      var name = this.customProviderName.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
-      if (!name) { OpenFangToast.error('Please enter a provider name'); return; }
-      var url = this.customProviderUrl.trim();
-      if (!url) { OpenFangToast.error('Please enter a base URL'); return; }
-      if (url.indexOf('http://') !== 0 && url.indexOf('https://') !== 0) {
-        OpenFangToast.error('URL must start with http:// or https://'); return;
-      }
-      this.addingCustomProvider = true;
-      this.customProviderStatus = '';
-      try {
-        var result = await OpenFangAPI.put('/api/providers/' + encodeURIComponent(name) + '/url', { base_url: url });
-        if (this.customProviderKey.trim()) {
-          await OpenFangAPI.post('/api/providers/' + encodeURIComponent(name) + '/key', { key: this.customProviderKey.trim() });
-        }
-        this.customProviderName = '';
-        this.customProviderUrl = '';
-        this.customProviderKey = '';
-        this.customProviderStatus = '';
-        OpenFangToast.success('Provider "' + name + '" added' + (result.reachable ? ' (reachable)' : ' (not reachable yet)'));
-        await this.loadProviders();
-      } catch(e) {
-        this.customProviderStatus = 'Error: ' + (e.message || 'Failed');
-        OpenFangToast.error('Failed to add provider: ' + e.message);
-      }
-      this.addingCustomProvider = false;
     },
 
     // -- Security methods --

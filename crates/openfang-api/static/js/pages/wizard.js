@@ -1,16 +1,6 @@
 // OpenFang Setup Wizard — First-run guided setup (Provider + Agent + Channel)
 'use strict';
 
-/** Escape a string for use inside TOML triple-quoted strings ("""\n...\n"""). */
-function wizardTomlMultilineEscape(s) {
-  return s.replace(/\\/g, '\\\\').replace(/"""/g, '""\\"');
-}
-
-/** Escape a string for use inside a TOML basic (single-line) string ("..."). */
-function wizardTomlBasicEscape(s) {
-  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
-}
-
 function wizardPage() {
   return {
     step: 1,
@@ -293,12 +283,10 @@ function wizardPage() {
     },
 
     get canGoNext() {
-      if (this.step === 2) return this.keySaved || this.hasConfiguredProvider || this.claudeCodeDetected;
+      if (this.step === 2) return this.keySaved || this.hasConfiguredProvider;
       if (this.step === 3) return this.agentName.trim().length > 0;
       return true;
     },
-
-    claudeCodeDetected: false,
 
     get hasConfiguredProvider() {
       var self = this;
@@ -332,7 +320,7 @@ function wizardPage() {
     },
 
     get popularProviders() {
-      var popular = ['anthropic', 'openai', 'gemini', 'groq', 'deepseek', 'openrouter', 'claude-code'];
+      var popular = ['anthropic', 'openai', 'gemini', 'groq', 'deepseek', 'openrouter'];
       return this.providers.filter(function(p) {
         return popular.indexOf(p.id) >= 0;
       }).sort(function(a, b) {
@@ -341,7 +329,7 @@ function wizardPage() {
     },
 
     get otherProviders() {
-      var popular = ['anthropic', 'openai', 'gemini', 'groq', 'deepseek', 'openrouter', 'claude-code'];
+      var popular = ['anthropic', 'openai', 'gemini', 'groq', 'deepseek', 'openrouter'];
       return this.providers.filter(function(p) {
         return popular.indexOf(p.id) < 0;
       });
@@ -367,8 +355,7 @@ function wizardPage() {
         fireworks: { url: 'https://fireworks.ai/account/api-keys', text: 'Get your key from Fireworks AI' },
         perplexity: { url: 'https://www.perplexity.ai/settings/api', text: 'Get your key from Perplexity Settings' },
         cohere: { url: 'https://dashboard.cohere.com/api-keys', text: 'Get your key from the Cohere Dashboard' },
-        xai: { url: 'https://console.x.ai/', text: 'Get your key from the xAI Console' },
-        'claude-code': { url: 'https://docs.anthropic.com/en/docs/claude-code', text: 'Install: npm install -g @anthropic-ai/claude-code && claude auth (no API key needed)' }
+        xai: { url: 'https://console.x.ai/', text: 'Get your key from the xAI Console' }
       };
       return help[id] || null;
     },
@@ -421,28 +408,6 @@ function wizardPage() {
       this.testingProvider = false;
     },
 
-    async detectClaudeCode() {
-      this.testingProvider = true;
-      this.testResult = null;
-      try {
-        var result = await OpenFangAPI.post('/api/providers/claude-code/test', {});
-        this.testResult = result;
-        if (result.status === 'ok') {
-          this.claudeCodeDetected = true;
-          this.keySaved = true;
-          this.setupSummary.provider = 'Claude Code';
-          OpenFangToast.success('Claude Code detected (' + (result.latency_ms || '?') + 'ms)');
-        } else {
-          this.testResult = { status: 'error', error: 'Claude Code CLI not detected' };
-          OpenFangToast.error('Claude Code CLI not detected. Make sure you\'ve run: npm install -g @anthropic-ai/claude-code && claude auth');
-        }
-      } catch(e) {
-        this.testResult = { status: 'error', error: e.message };
-        OpenFangToast.error('Claude Code CLI not detected. Make sure you\'ve run: npm install -g @anthropic-ai/claude-code && claude auth');
-      }
-      this.testingProvider = false;
-    },
-
     // ── Step 3: Agent creation ──
 
     selectTemplate(index) {
@@ -472,12 +437,12 @@ function wizardPage() {
       }
 
       var toml = '[agent]\n';
-      toml += 'name = "' + wizardTomlBasicEscape(name) + '"\n';
-      toml += 'description = "' + wizardTomlBasicEscape(tpl.description) + '"\n';
+      toml += 'name = "' + name.replace(/"/g, '\\"') + '"\n';
+      toml += 'description = "' + tpl.description.replace(/"/g, '\\"') + '"\n';
       toml += 'profile = "' + tpl.profile + '"\n\n';
       toml += '[model]\nprovider = "' + provider + '"\n';
-      toml += 'model = "' + model + '"\n';
-      toml += 'system_prompt = """\n' + wizardTomlMultilineEscape(tpl.system_prompt) + '\n"""\n';
+      toml += 'name = "' + model + '"\n\n';
+      toml += '[prompt]\nsystem = """\n' + tpl.system_prompt + '\n"""\n';
 
       this.creatingAgent = true;
       try {
@@ -503,14 +468,13 @@ function wizardPage() {
         gemini: 'gemini-2.5-flash',
         groq: 'llama-3.3-70b-versatile',
         deepseek: 'deepseek-chat',
-        openrouter: 'openrouter/google/gemini-2.5-flash',
+        openrouter: 'openrouter/auto',
         mistral: 'mistral-large-latest',
         together: 'meta-llama/Llama-3-70b-chat-hf',
         fireworks: 'accounts/fireworks/models/llama-v3p1-70b-instruct',
         perplexity: 'llama-3.1-sonar-large-128k-online',
         cohere: 'command-r-plus',
-        xai: 'grok-2',
-        'claude-code': 'claude-code/sonnet'
+        xai: 'grok-2'
       };
       return defaults[providerId] || '';
     },

@@ -20,6 +20,28 @@ pub struct AgentInfo {
     pub tools: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AsyncMediaArchiveRequest {
+    pub media_type: String,
+    pub prompt: String,
+    pub scene: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AsyncMediaRequest {
+    pub caller_agent_id: String,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub receive_id: String,
+    pub receive_id_type: String,
+    pub result_path_key: String,
+    pub send_tool_name: String,
+    pub send_path_key: String,
+    pub file_name: Option<String>,
+    pub failure_notice: String,
+    pub archive: Option<AsyncMediaArchiveRequest>,
+}
+
 /// Handle to kernel operations, passed into the agent loop so agents
 /// can interact with each other via tools.
 #[async_trait]
@@ -139,16 +161,6 @@ pub trait KernelHandle: Send + Sync {
         Err("Hands system not available".to_string())
     }
 
-    /// Install a Hand from TOML content.
-    async fn hand_install(
-        &self,
-        toml_content: &str,
-        skill_content: &str,
-    ) -> Result<serde_json::Value, String> {
-        let _ = (toml_content, skill_content);
-        Err("Hands system not available".to_string())
-    }
-
     /// Activate a Hand — spawns a specialized autonomous agent.
     async fn hand_activate(
         &self,
@@ -194,19 +206,10 @@ pub trait KernelHandle: Send + Sync {
         Err("Channel send not available".to_string())
     }
 
-    /// Send media content (image/file) to a user on a named channel adapter.
-    /// `media_type` is "image" or "file", `media_url` is the URL, `caption` is optional text.
-    async fn send_channel_media(
-        &self,
-        channel: &str,
-        recipient: &str,
-        media_type: &str,
-        media_url: &str,
-        caption: Option<&str>,
-        filename: Option<&str>,
-    ) -> Result<String, String> {
-        let _ = (channel, recipient, media_type, media_url, caption, filename);
-        Err("Channel media send not available".to_string())
+    /// Queue a media task for background generation and delivery.
+    async fn enqueue_async_media(&self, request: AsyncMediaRequest) -> Result<String, String> {
+        let _ = request;
+        Err("Async media queue not available".to_string())
     }
 
     /// Spawn an agent with capability inheritance enforcement.

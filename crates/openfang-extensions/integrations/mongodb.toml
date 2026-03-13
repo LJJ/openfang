@@ -8,7 +8,7 @@ tags = ["database", "nosql", "document", "mongo", "queries"]
 [transport]
 type = "stdio"
 command = "npx"
-args = ["-y", "@mongodb-js/mongodb-mcp-server"]
+args = ["@modelcontextprotocol/server-mongodb"]
 
 [[required_env]]
 name = "MONGODB_URI"

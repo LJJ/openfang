@@ -343,7 +343,11 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                     if oversized {
                         let limit = config.max_chunk_chars / 4;
                         let truncated = if s.len() > limit {
-                            format!("{}...[truncated from {} chars]", safe_truncate_str(s, limit), s.len())
+                            format!(
+                                "{}...[truncated from {} chars]",
+                                safe_truncate_str(s, limit),
+                                s.len()
+                            )
                         } else {
                             s.clone()
                         };
@@ -426,14 +430,8 @@ async fn summarize_messages(
     let effective_max = (config.max_chunk_chars as f64 / config.safety_margin) as usize;
     if conversation_text.len() > effective_max {
         // Keep the tail (most recent) which is usually more important
-        let start = conversation_text.len() - effective_max;
-        // Find valid char boundary at or after start
-        let safe_start = if conversation_text.is_char_boundary(start) {
-            start
-        } else {
-            conversation_text[start..].char_indices().next().map(|(i, _)| start + i).unwrap_or(conversation_text.len())
-        };
-        conversation_text = conversation_text[safe_start..].to_string();
+        conversation_text =
+            conversation_text[conversation_text.len() - effective_max..].to_string();
     }
 
     let summarize_prompt = format!(
@@ -850,14 +848,12 @@ mod tests {
                 id: "tu-1".to_string(),
                 name: "web_search".to_string(),
                 input: serde_json::json!({"query": "test"}),
-                provider_metadata: None,
             }]),
         };
         messages[2] = Message {
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "tu-1".to_string(),
-                tool_name: String::new(),
                 content: "Search results here".to_string(),
                 is_error: false,
             }]),
@@ -1185,7 +1181,6 @@ mod tests {
                         id: "tu-1".to_string(),
                         name: "web_search".to_string(),
                         input: serde_json::json!({"query": "rust"}),
-                        provider_metadata: None,
                     },
                 ]),
             },
@@ -1193,7 +1188,6 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-1".to_string(),
-                    tool_name: String::new(),
                     content: "Results found".to_string(),
                     is_error: false,
                 }]),
@@ -1229,7 +1223,7 @@ mod tests {
         assert!(
             text.contains("truncated from"),
             "Oversized message should be truncated, got: {}",
-            crate::str_utils::safe_truncate_str(&text, 200)
+            &text[..text.len().min(200)]
         );
     }
 
@@ -1334,7 +1328,6 @@ mod tests {
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "t1".to_string(),
-                tool_name: String::new(),
                 content: tool_content,
                 is_error: false,
             }]),
@@ -1354,7 +1347,6 @@ mod tests {
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "t2".to_string(),
-                tool_name: String::new(),
                 content: large_result,
                 is_error: false,
             }]),
@@ -1378,7 +1370,6 @@ mod tests {
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "t3".to_string(),
-                tool_name: String::new(),
                 content: short_result.to_string(),
                 is_error: false,
             }]),

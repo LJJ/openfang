@@ -29,19 +29,6 @@ function chatPage() {
     _audioChunks: [],
     recordingTime: 0,
     _recordingTimer: null,
-    // Model autocomplete state
-    showModelPicker: false,
-    modelPickerList: [],
-    modelPickerFilter: '',
-    modelPickerIdx: 0,
-    // Model switcher dropdown
-    showModelSwitcher: false,
-    modelSwitcherFilter: '',
-    modelSwitcherProviderFilter: '',
-    modelSwitcherIdx: 0,
-    modelSwitching: false,
-    _modelCache: null,
-    _modelCacheTime: 0,
     slashCommands: [
       { cmd: '/help', desc: 'Show available commands' },
       { cmd: '/agents', desc: 'Switch to Agents page' },
@@ -93,47 +80,6 @@ function chatPage() {
       }
     },
 
-    get modelDisplayName() {
-      if (!this.currentAgent) return '';
-      var name = this.currentAgent.model_name || '';
-      var short = name.replace(/-\d{8}$/, '');
-      return short.length > 24 ? short.substring(0, 22) + '\u2026' : short;
-    },
-
-    get switcherProviders() {
-      var seen = {};
-      (this._modelCache || []).forEach(function(m) { seen[m.provider] = true; });
-      return Object.keys(seen).sort();
-    },
-
-    get filteredSwitcherModels() {
-      var models = this._modelCache || [];
-      var provFilter = this.modelSwitcherProviderFilter;
-      var textFilter = this.modelSwitcherFilter ? this.modelSwitcherFilter.toLowerCase() : '';
-      if (!provFilter && !textFilter) return models;
-      return models.filter(function(m) {
-        if (provFilter && m.provider !== provFilter) return false;
-        if (textFilter) {
-          return m.id.toLowerCase().indexOf(textFilter) !== -1 ||
-                 (m.display_name || '').toLowerCase().indexOf(textFilter) !== -1 ||
-                 m.provider.toLowerCase().indexOf(textFilter) !== -1;
-        }
-        return true;
-      });
-    },
-
-    get groupedSwitcherModels() {
-      var filtered = this.filteredSwitcherModels;
-      var groups = {}, order = [];
-      filtered.forEach(function(m) {
-        if (!groups[m.provider]) { groups[m.provider] = []; order.push(m.provider); }
-        groups[m.provider].push(m);
-      });
-      return order.map(function(p) {
-        return { provider: p.charAt(0).toUpperCase() + p.slice(1), models: groups[p] };
-      });
-    },
-
     init() {
       var self = this;
 
@@ -149,11 +95,6 @@ function chatPage() {
           e.preventDefault();
           var input = document.getElementById('msg-input');
           if (input) { input.focus(); self.inputText = '/'; }
-        }
-        // Ctrl+M for model switcher
-        if ((e.ctrlKey || e.metaKey) && e.key === 'm' && self.currentAgent) {
-          e.preventDefault();
-          self.toggleModelSwitcher();
         }
         // Ctrl+F for chat search
         if ((e.ctrlKey || e.metaKey) && e.key === 'f' && self.currentAgent) {
@@ -185,95 +126,15 @@ function chatPage() {
         }
       });
 
-      // Watch for slash commands + model autocomplete
+      // Watch for slash commands
       this.$watch('inputText', function(val) {
-        var modelMatch = val.match(/^\/model\s+(.*)$/i);
-        if (modelMatch) {
-          self.showSlashMenu = false;
-          self.modelPickerFilter = modelMatch[1].toLowerCase();
-          if (!self.modelPickerList.length) {
-            OpenFangAPI.get('/api/models').then(function(data) {
-              self.modelPickerList = (data.models || []).filter(function(m) { return m.available; });
-              self.showModelPicker = true;
-              self.modelPickerIdx = 0;
-            }).catch(function() {});
-          } else {
-            self.showModelPicker = true;
-          }
-        } else if (val.startsWith('/')) {
-          self.showModelPicker = false;
+        if (val.startsWith('/')) {
           self.slashFilter = val.slice(1).toLowerCase();
           self.showSlashMenu = true;
           self.slashIdx = 0;
         } else {
           self.showSlashMenu = false;
-          self.showModelPicker = false;
         }
-      });
-    },
-
-    get filteredModelPicker() {
-      if (!this.modelPickerFilter) return this.modelPickerList.slice(0, 15);
-      var f = this.modelPickerFilter;
-      return this.modelPickerList.filter(function(m) {
-        return m.id.toLowerCase().indexOf(f) !== -1 || (m.display_name || '').toLowerCase().indexOf(f) !== -1 || m.provider.toLowerCase().indexOf(f) !== -1;
-      }).slice(0, 15);
-    },
-
-    pickModel(modelId) {
-      this.showModelPicker = false;
-      this.inputText = '/model ' + modelId;
-      this.sendMessage();
-    },
-
-    toggleModelSwitcher() {
-      if (this.showModelSwitcher) { this.showModelSwitcher = false; return; }
-      var self = this;
-      var now = Date.now();
-      if (this._modelCache && (now - this._modelCacheTime) < 300000) {
-        this.modelSwitcherFilter = '';
-        this.modelSwitcherProviderFilter = '';
-        this.modelSwitcherIdx = 0;
-        this.showModelSwitcher = true;
-        this.$nextTick(function() {
-          var el = document.getElementById('model-switcher-search');
-          if (el) el.focus();
-        });
-        return;
-      }
-      OpenFangAPI.get('/api/models').then(function(data) {
-        var models = (data.models || []).filter(function(m) { return m.available; });
-        self._modelCache = models;
-        self._modelCacheTime = Date.now();
-        self.modelPickerList = models;
-        self.modelSwitcherFilter = '';
-        self.modelSwitcherProviderFilter = '';
-        self.modelSwitcherIdx = 0;
-        self.showModelSwitcher = true;
-        self.$nextTick(function() {
-          var el = document.getElementById('model-switcher-search');
-          if (el) el.focus();
-        });
-      }).catch(function(e) {
-        OpenFangToast.error('Failed to load models: ' + e.message);
-      });
-    },
-
-    switchModel(model) {
-      if (!this.currentAgent) return;
-      if (model.id === this.currentAgent.model_name) { this.showModelSwitcher = false; return; }
-      var self = this;
-      this.modelSwitching = true;
-      OpenFangAPI.put('/api/agents/' + this.currentAgent.id + '/model', { model: model.id }).then(function(resp) {
-        // Use server-resolved model/provider to stay in sync (fixes #387/#466)
-        self.currentAgent.model_name = (resp && resp.model) || model.id;
-        self.currentAgent.model_provider = (resp && resp.provider) || model.provider;
-        OpenFangToast.success('Switched to ' + (model.display_name || model.id));
-        self.showModelSwitcher = false;
-        self.modelSwitching = false;
-      }).catch(function(e) {
-        OpenFangToast.error('Switch failed: ' + e.message);
-        self.modelSwitching = false;
       });
     },
 
@@ -421,13 +282,9 @@ function chatPage() {
         case '/model':
           if (self.currentAgent) {
             if (cmdArgs) {
-              OpenFangAPI.put('/api/agents/' + self.currentAgent.id + '/model', { model: cmdArgs }).then(function(resp) {
-                // Use server-resolved model/provider (fixes #387/#466)
-                var resolvedModel = (resp && resp.model) || cmdArgs;
-                var resolvedProvider = (resp && resp.provider) || '';
-                self.currentAgent.model_name = resolvedModel;
-                if (resolvedProvider) { self.currentAgent.model_provider = resolvedProvider; }
-                self.messages.push({ id: ++msgId, role: 'system', text: 'Model switched to: `' + resolvedModel + '`' + (resolvedProvider ? ' (provider: `' + resolvedProvider + '`)' : ''), meta: '', tools: [] });
+              OpenFangAPI.put('/api/agents/' + self.currentAgent.id + '/model', { model: cmdArgs }).then(function() {
+                self.currentAgent.model_name = cmdArgs;
+                self.messages.push({ id: ++msgId, role: 'system', text: 'Model switched to: `' + cmdArgs + '`', meta: '', tools: [] });
                 self.scrollToBottom();
               }).catch(function(e) { OpenFangToast.error('Model switch failed: ' + e.message); });
             } else {
@@ -536,10 +393,7 @@ function chatPage() {
                 is_error: !!t.is_error
               };
             });
-            var images = (m.images || []).map(function(img) {
-              return { file_id: img.file_id, filename: img.filename || 'image' };
-            });
-            return { id: ++msgId, role: role, text: text, meta: '', tools: tools, images: images };
+            return { id: ++msgId, role: role, text: text, meta: '', tools: tools };
           });
           self.$nextTick(function() { self.scrollToBottom(); });
         }
@@ -1149,8 +1003,8 @@ function chatPage() {
       this._audioChunks = [];
       if (blob.size < 100) return; // too small
 
-      // Show a temporary "Transcribing..." message
-      this.messages.push({ id: ++msgId, role: 'system', text: 'Transcribing audio...', thinking: true, ts: Date.now(), tools: [] });
+      // Show a temporary upload status while the audio attachment is sent.
+      this.messages.push({ id: ++msgId, role: 'system', text: 'Uploading audio...', thinking: true, ts: Date.now(), tools: [] });
       this.scrollToBottom();
 
       try {
@@ -1162,10 +1016,7 @@ function chatPage() {
         // Remove the "Transcribing..." message
         this.messages = this.messages.filter(function(m) { return !m.thinking || m.role !== 'system'; });
 
-        // Use server-side transcription if available, otherwise fall back to placeholder
-        var text = (upload.transcription && upload.transcription.trim())
-          ? upload.transcription.trim()
-          : '[Voice message - audio: ' + upload.filename + ']';
+        var text = '[Voice message - audio: ' + upload.filename + ']';
         this._sendPayload(text, [upload], []);
       } catch(e) {
         this.messages = this.messages.filter(function(m) { return !m.thinking || m.role !== 'system'; });

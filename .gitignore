@@ -1,5 +1,8 @@
 # Build
 /target
+/.cargo-target
+/target-codex
+/target-codex-tests
 **/*.rs.bk
 *.pdb
 

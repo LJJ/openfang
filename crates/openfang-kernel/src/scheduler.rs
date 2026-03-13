@@ -88,8 +88,7 @@ impl AgentScheduler {
         // Reset the window if an hour has passed
         tracker.reset_if_expired();
 
-        if quota.max_llm_tokens_per_hour > 0
-            && tracker.total_tokens > quota.max_llm_tokens_per_hour
+        if quota.max_llm_tokens_per_hour > 0 && tracker.total_tokens > quota.max_llm_tokens_per_hour
         {
             return Err(OpenFangError::QuotaExceeded(format!(
                 "Token limit exceeded: {} / {}",
@@ -98,15 +97,6 @@ impl AgentScheduler {
         }
 
         Ok(())
-    }
-
-    /// Reset usage tracking for an agent (e.g. on session reset).
-    pub fn reset_usage(&self, agent_id: AgentId) {
-        if let Some(mut tracker) = self.usage.get_mut(&agent_id) {
-            tracker.total_tokens = 0;
-            tracker.tool_calls = 0;
-            tracker.window_start = Instant::now();
-        }
     }
 
     /// Abort an agent's active task.

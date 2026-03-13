@@ -8,7 +8,7 @@
 
 use openfang_types::tool::ToolDefinition;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info};
@@ -33,8 +33,19 @@ pub struct McpServerConfig {
 }
 
 fn default_timeout() -> u64 {
-    60
+    30
 }
+
+const MCP_DEFAULT_ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+];
 
 /// Transport type for MCP server connections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,10 +71,6 @@ pub struct McpConnection {
     config: McpServerConfig,
     /// Tools discovered from the server via tools/list.
     tools: Vec<ToolDefinition>,
-    /// Map from namespaced tool name → original tool name from the server.
-    /// Needed because `normalize_name` replaces hyphens with underscores,
-    /// but the server expects the original name (e.g. "list-connections").
-    original_names: HashMap<String, String>,
     /// Transport handle for sending requests.
     transport: McpTransportHandle,
     /// Next JSON-RPC request ID.
@@ -139,7 +146,6 @@ impl McpConnection {
         let mut conn = Self {
             config,
             tools: Vec::new(),
-            original_names: HashMap::new(),
             transport,
             next_id: 1,
         };
@@ -200,27 +206,10 @@ impl McpConnection {
                     let input_schema = tool
                         .get("inputSchema")
                         .cloned()
-                        .and_then(|v| {
-                            // Ensure input_schema is a JSON object. MCP servers may
-                            // return it as a string, null, or omit it entirely.
-                            match &v {
-                                serde_json::Value::Object(_) => Some(v),
-                                serde_json::Value::String(s) => {
-                                    serde_json::from_str::<serde_json::Value>(s)
-                                        .ok()
-                                        .filter(|p| p.is_object())
-                                }
-                                _ => None,
-                            }
-                        })
                         .unwrap_or(serde_json::json!({"type": "object"}));
 
                     // Namespace: mcp_{server}_{tool}
                     let namespaced = format_mcp_tool_name(server_name, raw_name);
-
-                    // Store original name so we can send it back to the server
-                    self.original_names
-                        .insert(namespaced.clone(), raw_name.to_string());
 
                     self.tools.push(ToolDefinition {
                         name: namespaced,
@@ -242,13 +231,8 @@ impl McpConnection {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String, String> {
-        // Look up the original tool name from the server (preserves hyphens etc.)
-        let raw_name = self
-            .original_names
-            .get(name)
-            .map(|s| s.as_str())
-            .or_else(|| strip_mcp_prefix(&self.config.name, name))
-            .unwrap_or(name);
+        // Strip the namespace prefix to get the original tool name
+        let raw_name = strip_mcp_prefix(&self.config.name, name).unwrap_or(name);
 
         let params = serde_json::json!({
             "name": raw_name,
@@ -421,31 +405,7 @@ impl McpConnection {
             return Err("MCP command path contains '..': rejected".to_string());
         }
 
-        // On Windows, npm/npx install as .cmd batch wrappers. Detect and adapt.
-        let resolved_command: String = if cfg!(windows) {
-            // If the user already specified .cmd/.bat, use as-is
-            if command.ends_with(".cmd") || command.ends_with(".bat") {
-                command.to_string()
-            } else {
-                // Check if the .cmd variant exists on PATH
-                let cmd_variant = format!("{command}.cmd");
-                let has_cmd = std::env::var("PATH")
-                    .unwrap_or_default()
-                    .split(';')
-                    .any(|dir| {
-                        std::path::Path::new(dir).join(&cmd_variant).exists()
-                    });
-                if has_cmd {
-                    cmd_variant
-                } else {
-                    command.to_string()
-                }
-            }
-        } else {
-            command.to_string()
-        };
-
-        let mut cmd = tokio::process::Command::new(&resolved_command);
+        let mut cmd = tokio::process::Command::new(command);
         cmd.args(args);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -453,50 +413,13 @@ impl McpConnection {
 
         // Sandbox: clear environment, only pass whitelisted vars
         cmd.env_clear();
-        for var_name in env_whitelist {
-            if let Ok(val) = std::env::var(var_name) {
-                cmd.env(var_name, val);
-            }
-        }
-        // Always pass PATH for binary resolution
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
-        }
-        // On Windows, npm/node need APPDATA, USERPROFILE, LOCALAPPDATA, and SystemRoot
-        if cfg!(windows) {
-            for var in &[
-                "APPDATA",
-                "LOCALAPPDATA",
-                "USERPROFILE",
-                "SystemRoot",
-                "TEMP",
-                "TMP",
-                "HOME",
-                "HOMEDRIVE",
-                "HOMEPATH",
-            ] {
-                if let Ok(val) = std::env::var(var) {
-                    cmd.env(var, val);
-                }
-            }
+        for (var_name, value) in collect_stdio_env(env_whitelist) {
+            cmd.env(var_name, value);
         }
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("Failed to spawn MCP server '{resolved_command}': {e}"))?;
-
-        // Log stderr in background for debugging MCP server issues
-        if let Some(stderr) = child.stderr.take() {
-            let cmd_name = resolved_command.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncBufReadExt;
-                let reader = tokio::io::BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(mcp_server = %cmd_name, "stderr: {line}");
-                }
-            });
-        }
+            .map_err(|e| format!("Failed to spawn MCP server '{command}': {e}"))?;
 
         let stdin = child
             .stdin
@@ -531,6 +454,24 @@ impl McpConnection {
             url: url.to_string(),
         })
     }
+}
+
+fn collect_stdio_env(env_whitelist: &[String]) -> Vec<(String, String)> {
+    let mut env_names = BTreeSet::new();
+    for var_name in env_whitelist {
+        env_names.insert(var_name.clone());
+    }
+    for var_name in MCP_DEFAULT_ENV_PASSTHROUGH {
+        env_names.insert((*var_name).to_string());
+    }
+
+    let mut env_pairs = Vec::new();
+    for var_name in env_names {
+        if let Ok(val) = std::env::var(&var_name) {
+            env_pairs.push((var_name, val));
+        }
+    }
+    env_pairs
 }
 
 impl Drop for McpConnection {
@@ -597,25 +538,6 @@ mod tests {
         assert!(is_mcp_tool("mcp_github_create_issue"));
         assert!(!is_mcp_tool("file_read"));
         assert!(!is_mcp_tool(""));
-    }
-
-    #[test]
-    fn test_hyphenated_tool_name_preserved() {
-        // Tool names with hyphens get normalized to underscores for namespacing,
-        // but original_names map preserves the original for call_tool dispatch.
-        let namespaced = format_mcp_tool_name("sqlcl", "list-connections");
-        assert_eq!(namespaced, "mcp_sqlcl_list_connections");
-
-        // Simulate what discover_tools does
-        let mut original_names = HashMap::new();
-        original_names.insert(namespaced.clone(), "list-connections".to_string());
-
-        // call_tool should resolve to original hyphenated name
-        let raw = original_names
-            .get(&namespaced)
-            .map(|s| s.as_str())
-            .unwrap_or("list_connections");
-        assert_eq!(raw, "list-connections");
     }
 
     #[test]
@@ -725,5 +647,35 @@ mod tests {
             McpTransport::Sse { url } => assert_eq!(url, "https://example.com/mcp"),
             _ => panic!("Expected SSE transport"),
         }
+    }
+
+    #[test]
+    fn test_collect_stdio_env_includes_runtime_basics() {
+        std::env::set_var("HOME", "/tmp/openfang-home");
+        std::env::set_var("PATH", "/usr/bin");
+        std::env::set_var("OPENFANG_TEST_ENV", "1");
+
+        let envs = collect_stdio_env(&["OPENFANG_TEST_ENV".to_string()]);
+        let env_map: std::collections::BTreeMap<_, _> = envs.into_iter().collect();
+
+        assert_eq!(
+            env_map.get("OPENFANG_TEST_ENV").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env_map.get("HOME").map(String::as_str),
+            Some("/tmp/openfang-home")
+        );
+        assert_eq!(env_map.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+
+    #[test]
+    fn test_collect_stdio_env_deduplicates_names() {
+        std::env::set_var("HOME", "/tmp/openfang-home");
+
+        let envs = collect_stdio_env(&["HOME".to_string(), "HOME".to_string()]);
+        let home_count = envs.iter().filter(|(name, _)| name == "HOME").count();
+
+        assert_eq!(home_count, 1);
     }
 }

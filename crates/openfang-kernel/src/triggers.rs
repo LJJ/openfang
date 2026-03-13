@@ -278,7 +278,7 @@ fn describe_event(event: &Event) -> String {
                 tr.tool_id,
                 if tr.success { "succeeded" } else { "failed" },
                 tr.execution_time_ms,
-                openfang_types::truncate_str(&tr.content, 200)
+                &tr.content[..tr.content.len().min(200)]
             )
         }
         EventPayload::MemoryUpdate(delta) => {

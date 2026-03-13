@@ -146,30 +146,19 @@ pub async fn agent_ws(
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
     // SECURITY: Authenticate WebSocket upgrades (bypasses middleware).
-    // Trim whitespace so empty/whitespace-only api_key disables auth.
-    let api_key_raw = &state.kernel.config.api_key;
-    let api_key = api_key_raw.trim();
+    let api_key = &state.kernel.config.api_key;
     if !api_key.is_empty() {
-        // SECURITY: Use constant-time comparison to prevent timing attacks on API key
-        let ct_eq = |token: &str, key: &str| -> bool {
-            use subtle::ConstantTimeEq;
-            if token.len() != key.len() {
-                return false;
-            }
-            token.as_bytes().ct_eq(key.as_bytes()).into()
-        };
-
         let header_auth = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|token| ct_eq(token, api_key))
+            .map(|token| token == api_key)
             .unwrap_or(false);
 
         let query_auth = uri
             .query()
             .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
-            .map(|token| ct_eq(token, api_key))
+            .map(|token| token == api_key)
             .unwrap_or(false);
 
         if !header_auth && !query_auth {
@@ -437,55 +426,26 @@ async fn handle_text_message(
                 return;
             }
 
-            // Resolve file attachments into image content blocks
-            let mut has_images = false;
+            let mut content = content;
+            let mut media_blocks: Vec<openfang_types::message::ContentBlock> = vec![];
             if let Some(attachments) = parsed["attachments"].as_array() {
                 let refs: Vec<crate::types::AttachmentRef> = attachments
                     .iter()
                     .filter_map(|a| serde_json::from_value(a.clone()).ok())
                     .collect();
                 if !refs.is_empty() {
-                    let image_blocks = crate::routes::resolve_attachments(&refs);
-                    if !image_blocks.is_empty() {
-                        has_images = true;
-                        crate::routes::inject_attachments_into_session(
-                            &state.kernel,
-                            agent_id,
-                            image_blocks,
-                        );
-                    }
-                }
-            }
-
-            // Warn if the model doesn't support vision but images were attached
-            if has_images {
-                let model_name = state
-                    .kernel
-                    .registry
-                    .get(agent_id)
-                    .map(|e| e.manifest.model.model.clone())
-                    .unwrap_or_default();
-                let supports_vision = state
-                    .kernel
-                    .model_catalog
-                    .read()
-                    .ok()
-                    .and_then(|cat| cat.find_model(&model_name).map(|m| m.supports_vision))
-                    .unwrap_or(false);
-                if !supports_vision {
-                    let _ = send_json(
-                        sender,
-                        &serde_json::json!({
-                            "type": "command_result",
-                            "message": format!(
-                                "**Vision not supported** — the current model `{}` cannot analyze images. \
-                                 Switch to a vision-capable model (e.g. `gemini-2.5-flash`, `claude-sonnet-4-20250514`, `gpt-4o`) \
-                                 with `/model <name>` for image analysis.",
-                                model_name
-                            ),
-                        }),
+                    let (blocks, ref_only) = crate::routes::resolve_media_blocks(
+                        &refs,
+                        Some(&state.kernel.media_engine),
                     )
                     .await;
+                    media_blocks = blocks;
+                    content = crate::routes::build_attachment_text_context(
+                        &content,
+                        &ref_only,
+                        refs.len(),
+                        !media_blocks.is_empty(),
+                    );
                 }
             }
 
@@ -499,12 +459,12 @@ async fn handle_text_message(
             )
             .await;
 
-            // Send message to agent with streaming
+            // Send message to agent with streaming (with inline media if present)
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
             match state
                 .kernel
-                .send_message_streaming(agent_id, &content, Some(kernel_handle))
+                .send_message_streaming_with_media(agent_id, &content, Some(kernel_handle), media_blocks)
             {
                 Ok((mut rx, handle)) => {
                     // Forward stream events to WebSocket with debouncing
@@ -632,12 +592,8 @@ async fn handle_text_message(
                                 return;
                             }
 
-                            // Strip <think>...</think> blocks from model output
-                            // (e.g. MiniMax, DeepSeek reasoning tokens)
-                            let cleaned_response = strip_think_tags(&result.response);
-
                             // Guard: ensure we never send an empty response
-                            let content = if cleaned_response.trim().is_empty() {
+                            let content = if result.response.trim().is_empty() {
                                 format!(
                                     "[The agent completed processing but returned no text response. ({} in / {} out | {} iter)]",
                                     result.total_usage.input_tokens,
@@ -645,7 +601,7 @@ async fn handle_text_message(
                                     result.iterations,
                                 )
                             } else {
-                                cleaned_response
+                                result.response
                             };
 
                             // Estimate context pressure from last call
@@ -811,19 +767,7 @@ async fn handle_command(
             } else {
                 match state.kernel.set_agent_model(agent_id, args) {
                     Ok(()) => {
-                        if let Some(entry) = state.kernel.registry.get(agent_id) {
-                            let model = &entry.manifest.model.model;
-                            let provider = &entry.manifest.model.provider;
-                            serde_json::json!({
-                                "type": "command_result",
-                                "command": cmd,
-                                "message": format!("Model switched to: {model} (provider: {provider})"),
-                                "model": model,
-                                "provider": provider
-                            })
-                        } else {
-                            serde_json::json!({"type": "command_result", "command": cmd, "message": format!("Model switched to: {args}")})
-                        }
+                        serde_json::json!({"type": "command_result", "command": cmd, "message": format!("Model switched to: {args}")})
                     }
                     Err(e) => {
                         serde_json::json!({"type": "error", "content": format!("Model switch failed: {e}")})
@@ -1119,9 +1063,6 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
     let status = extract_status_code(&inner);
     let classified = llm_errors::classify_error(&inner, status);
 
-    // Build a user-facing message. The classified.sanitized_message now
-    // includes a redacted excerpt of the raw error (issue #493 fix), so we
-    // use it as the base and only override for cases that need extra context.
     match classified.category {
         llm_errors::LlmErrorCategory::ContextOverflow => {
             "Context is full. Try /compact or /new.".to_string()
@@ -1129,33 +1070,21 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
         llm_errors::LlmErrorCategory::RateLimit => {
             if let Some(delay_ms) = classified.suggested_delay_ms {
                 let secs = (delay_ms / 1000).max(1);
-                format!("Rate limited. Wait ~{secs}s and try again.")
+                format!("Provider rate limited. Wait ~{secs}s and try again.")
             } else {
-                "Rate limited. Wait a moment and try again.".to_string()
+                "Provider rate limited. Wait a moment and try again.".to_string()
             }
         }
         llm_errors::LlmErrorCategory::Billing => {
-            format!("Billing issue. {}", classified.sanitized_message)
+            "Check provider account status (billing issue detected).".to_string()
         }
-        llm_errors::LlmErrorCategory::Auth => {
-            // Show the actual error detail so users can diagnose (issue #493).
-            // The sanitized_message already redacts secrets.
-            classified.sanitized_message.clone()
-        }
+        llm_errors::LlmErrorCategory::Auth => "Verify your API key in config.".to_string(),
         llm_errors::LlmErrorCategory::ModelNotFound => {
-            if inner.contains("localhost:11434") || inner.contains("ollama") {
-                "Model not found on Ollama. Run `ollama pull <model>` first. Use /model to see options.".to_string()
-            } else {
-                format!("{}. Use /model to see options.", classified.sanitized_message)
-            }
+            "Model unavailable. Use /model to see options.".to_string()
         }
         llm_errors::LlmErrorCategory::Format => {
-            // Claude Code CLI errors have actionable messages — pass them through
-            if inner.contains("Claude Code CLI") || inner.contains("claude auth") {
-                classified.raw_message.clone()
-            } else {
-                classified.sanitized_message.clone()
-            }
+            "LLM request failed. Check your API key and model configuration in Settings."
+                .to_string()
         }
         _ => classified.sanitized_message,
     }
@@ -1163,14 +1092,6 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
 
 /// Try to extract an HTTP status code from an error string.
 fn extract_status_code(s: &str) -> Option<u16> {
-    // "API error (NNN):" — the format produced by LlmError::Api Display impl
-    if let Some(idx) = s.find("API error (") {
-        let after = &s[idx + 11..];
-        let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(code) = num.parse::<u16>() {
-            return Some(code);
-        }
-    }
     // "status: NNN"
     if let Some(idx) = s.find("status: ") {
         let after = &s[idx + 8..];
@@ -1196,27 +1117,6 @@ fn extract_status_code(s: &str) -> Option<u16> {
         }
     }
     None
-}
-
-/// Strip `<think>...</think>` blocks from model output.
-///
-/// Some models (MiniMax, DeepSeek, etc.) wrap their reasoning in `<think>` tags.
-/// These are internal chain-of-thought and shouldn't be shown to the user.
-pub fn strip_think_tags(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut remaining = text;
-    while let Some(start) = remaining.find("<think>") {
-        result.push_str(&remaining[..start]);
-        if let Some(end) = remaining[start..].find("</think>") {
-            remaining = &remaining[(start + end + 8)..]; // 8 = "</think>".len()
-        } else {
-            // Unclosed <think> tag — strip to end
-            remaining = "";
-            break;
-        }
-    }
-    result.push_str(remaining);
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,33 +1189,10 @@ mod tests {
         );
         assert_eq!(extract_status_code("StatusCode(401)"), Some(401));
         assert_eq!(extract_status_code("some random error"), None);
-        // LlmError::Api Display format (issue #493 fix)
-        assert_eq!(
-            extract_status_code("LLM driver error: API error (403): quota exceeded"),
-            Some(403)
-        );
-        assert_eq!(
-            extract_status_code("API error (401): invalid api key"),
-            Some(401)
-        );
     }
 
     #[test]
     fn test_sanitize_trims_whitespace() {
         assert_eq!(sanitize_user_input("  hello  "), "hello");
-    }
-
-    #[test]
-    fn test_strip_think_tags() {
-        assert_eq!(
-            strip_think_tags("<think>reasoning here</think>The answer is 42."),
-            "The answer is 42."
-        );
-        assert_eq!(
-            strip_think_tags("Hello <think>\nsome thinking\n</think> world"),
-            "Hello  world"
-        );
-        assert_eq!(strip_think_tags("No thinking here"), "No thinking here");
-        assert_eq!(strip_think_tags("<think>all thinking</think>"), "");
     }
 }

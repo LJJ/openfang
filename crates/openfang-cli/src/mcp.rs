@@ -216,23 +216,14 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 /// Write a Content-Length framed JSON-RPC response to the writer.
 fn write_message(writer: &mut impl Write, msg: &Value) {
     let body = serde_json::to_string(msg).unwrap_or_default();
-    if let Err(e) = write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body) {
-        eprintln!("MCP write error: {e}");
-        return;
-    }
-    if let Err(e) = writer.flush() {
-        eprintln!("MCP flush error: {e}");
-    }
+    let _ = write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+    let _ = writer.flush();
 }
 
 /// Handle a JSON-RPC message and return an optional response.
 fn handle_message(backend: &McpBackend, msg: &Value) -> Option<Value> {
     let method = msg["method"].as_str().unwrap_or("");
     let id = msg.get("id").cloned();
-
-    // Per JSON-RPC 2.0 spec: requests MUST have an id field.
-    // Use null if missing so we always send a response.
-    let rid = id.unwrap_or(Value::Null);
 
     match method {
         "initialize" => {
@@ -243,10 +234,10 @@ fn handle_message(backend: &McpBackend, msg: &Value) -> Option<Value> {
                 },
                 "serverInfo": {
                     "name": "openfang",
-                    "version": env!("CARGO_PKG_VERSION")
+                    "version": "0.1.0"
                 }
             });
-            Some(jsonrpc_response(rid, result))
+            Some(jsonrpc_response(id?, result))
         }
 
         "notifications/initialized" => None, // Notification, no response
@@ -278,7 +269,7 @@ fn handle_message(backend: &McpBackend, msg: &Value) -> Option<Value> {
                     })
                 })
                 .collect();
-            Some(jsonrpc_response(rid, json!({ "tools": tools })))
+            Some(jsonrpc_response(id?, json!({ "tools": tools })))
         }
 
         "tools/call" => {
@@ -290,14 +281,14 @@ fn handle_message(backend: &McpBackend, msg: &Value) -> Option<Value> {
                 .to_string();
 
             if message.is_empty() {
-                return Some(jsonrpc_error(rid, -32602, "Missing 'message' argument"));
+                return Some(jsonrpc_error(id?, -32602, "Missing 'message' argument"));
             }
 
             let agent_id = match backend.resolve_tool_agent(tool_name) {
                 Some(id) => id,
                 None => {
                     return Some(jsonrpc_error(
-                        rid,
+                        id?,
                         -32602,
                         &format!("Unknown tool: {tool_name}"),
                     ));
@@ -306,7 +297,7 @@ fn handle_message(backend: &McpBackend, msg: &Value) -> Option<Value> {
 
             match backend.send_message(&agent_id, &message) {
                 Ok(response) => Some(jsonrpc_response(
-                    rid,
+                    id?,
                     json!({
                         "content": [{
                             "type": "text",
@@ -315,7 +306,7 @@ fn handle_message(backend: &McpBackend, msg: &Value) -> Option<Value> {
                     }),
                 )),
                 Err(e) => Some(jsonrpc_response(
-                    rid,
+                    id?,
                     json!({
                         "content": [{
                             "type": "text",
@@ -328,8 +319,8 @@ fn handle_message(backend: &McpBackend, msg: &Value) -> Option<Value> {
         }
 
         _ => {
-            // Unknown method — always respond with error
-            Some(jsonrpc_error(rid, -32601, &format!("Method not found: {method}")))
+            // Unknown method
+            id.map(|id| jsonrpc_error(id, -32601, &format!("Method not found: {method}")))
         }
     }
 }

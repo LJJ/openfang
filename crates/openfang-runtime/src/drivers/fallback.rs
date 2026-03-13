@@ -10,26 +10,44 @@ use tracing::warn;
 
 /// A driver that wraps multiple LLM drivers and tries each in order.
 ///
-/// On failure (including rate-limit and overload), moves to the next driver.
-/// Only returns an error when ALL drivers in the chain are exhausted.
-/// Each driver is paired with the model name it should use.
+/// On failure, moves to the next driver. Rate-limit and overload errors
+/// are bubbled up for retry logic to handle.
 pub struct FallbackDriver {
-    drivers: Vec<(Arc<dyn LlmDriver>, String)>,
+    chain: Vec<FallbackEntry>,
+}
+
+struct FallbackEntry {
+    driver: Arc<dyn LlmDriver>,
+    model_override: Option<String>,
 }
 
 impl FallbackDriver {
-    /// Create a new fallback driver from an ordered chain of (driver, model_name) pairs.
+    /// Create a new fallback driver from an ordered chain of drivers.
     ///
-    /// The first entry is the primary; subsequent are fallbacks.
+    /// The first driver is the primary; subsequent are fallbacks.
     pub fn new(drivers: Vec<Arc<dyn LlmDriver>>) -> Self {
         Self {
-            drivers: drivers.into_iter().map(|d| (d, String::new())).collect(),
+            chain: drivers
+                .into_iter()
+                .map(|driver| FallbackEntry {
+                    driver,
+                    model_override: None,
+                })
+                .collect(),
         }
     }
 
-    /// Create a new fallback driver with explicit model names for each driver.
-    pub fn with_models(drivers: Vec<(Arc<dyn LlmDriver>, String)>) -> Self {
-        Self { drivers }
+    /// Create a fallback driver with optional model overrides per driver.
+    pub fn new_with_models(chain: Vec<(Arc<dyn LlmDriver>, Option<String>)>) -> Self {
+        Self {
+            chain: chain
+                .into_iter()
+                .map(|(driver, model_override)| FallbackEntry {
+                    driver,
+                    model_override,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -38,26 +56,21 @@ impl LlmDriver for FallbackDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let mut last_error = None;
 
-        for (i, (driver, model_name)) in self.drivers.iter().enumerate() {
-            let mut req = request.clone();
-            if !model_name.is_empty() {
-                req.model = model_name.clone();
+        for (i, entry) in self.chain.iter().enumerate() {
+            let mut request_for_driver = request.clone();
+            if let Some(model) = &entry.model_override {
+                request_for_driver.model = model.clone();
             }
-            match driver.complete(req).await {
+
+            match entry.driver.complete(request_for_driver).await {
                 Ok(response) => return Ok(response),
                 Err(e @ LlmError::RateLimited { .. }) | Err(e @ LlmError::Overloaded { .. }) => {
-                    warn!(
-                        driver_index = i,
-                        model = %model_name,
-                        error = %e,
-                        "Driver rate-limited/overloaded, trying next fallback"
-                    );
-                    last_error = Some(e);
+                    // Retryable errors — bubble up for the retry loop to handle
+                    return Err(e);
                 }
                 Err(e) => {
                     warn!(
                         driver_index = i,
-                        model = %model_name,
                         error = %e,
                         "Fallback driver failed, trying next"
                     );
@@ -79,26 +92,20 @@ impl LlmDriver for FallbackDriver {
     ) -> Result<CompletionResponse, LlmError> {
         let mut last_error = None;
 
-        for (i, (driver, model_name)) in self.drivers.iter().enumerate() {
-            let mut req = request.clone();
-            if !model_name.is_empty() {
-                req.model = model_name.clone();
+        for (i, entry) in self.chain.iter().enumerate() {
+            let mut request_for_driver = request.clone();
+            if let Some(model) = &entry.model_override {
+                request_for_driver.model = model.clone();
             }
-            match driver.stream(req, tx.clone()).await {
+
+            match entry.driver.stream(request_for_driver, tx.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(e @ LlmError::RateLimited { .. }) | Err(e @ LlmError::Overloaded { .. }) => {
-                    warn!(
-                        driver_index = i,
-                        model = %model_name,
-                        error = %e,
-                        "Driver rate-limited/overloaded (stream), trying next fallback"
-                    );
-                    last_error = Some(e);
+                    return Err(e);
                 }
                 Err(e) => {
                     warn!(
                         driver_index = i,
-                        model = %model_name,
                         error = %e,
                         "Fallback driver (stream) failed, trying next"
                     );
@@ -195,7 +202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rate_limit_falls_through() {
+    async fn test_rate_limit_bubbles_up() {
         struct RateLimitDriver;
 
         #[async_trait]
@@ -215,33 +222,71 @@ mod tests {
             Arc::new(OkDriver) as Arc<dyn LlmDriver>,
         ]);
         let result = driver.complete(test_request()).await;
-        // Rate limit should fall through to the OkDriver fallback
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().text(), "OK");
+        // Rate limit should NOT fall through to next driver
+        assert!(matches!(result, Err(LlmError::RateLimited { .. })));
     }
 
     #[tokio::test]
-    async fn test_rate_limit_all_fail() {
-        struct RateLimitDriver;
+    async fn test_fallback_overrides_model_for_secondary_driver() {
+        struct CaptureDriver {
+            seen: std::sync::Mutex<Vec<String>>,
+            fail: bool,
+        }
 
         #[async_trait]
-        impl LlmDriver for RateLimitDriver {
+        impl LlmDriver for CaptureDriver {
             async fn complete(
                 &self,
-                _req: CompletionRequest,
+                req: CompletionRequest,
             ) -> Result<CompletionResponse, LlmError> {
-                Err(LlmError::RateLimited {
-                    retry_after_ms: 5000,
-                })
+                self.seen.lock().unwrap().push(req.model);
+                if self.fail {
+                    Err(LlmError::Api {
+                        status: 500,
+                        message: "boom".to_string(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        content: vec![ContentBlock::Text {
+                            text: "OK".to_string(),
+                        }],
+                        stop_reason: StopReason::EndTurn,
+                        tool_calls: vec![],
+                        usage: TokenUsage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        },
+                    })
+                }
             }
         }
 
-        let driver = FallbackDriver::new(vec![
-            Arc::new(RateLimitDriver) as Arc<dyn LlmDriver>,
-            Arc::new(RateLimitDriver) as Arc<dyn LlmDriver>,
+        let primary = Arc::new(CaptureDriver {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let fallback = Arc::new(CaptureDriver {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+
+        let driver = FallbackDriver::new_with_models(vec![
+            (primary.clone() as Arc<dyn LlmDriver>, None),
+            (
+                fallback.clone() as Arc<dyn LlmDriver>,
+                Some("deepseek-chat".to_string()),
+            ),
         ]);
+
         let result = driver.complete(test_request()).await;
-        // All drivers rate-limited — error should bubble up
-        assert!(matches!(result, Err(LlmError::RateLimited { .. })));
+        assert!(result.is_ok());
+        assert_eq!(
+            primary.seen.lock().unwrap().as_slice(),
+            &["test".to_string()]
+        );
+        assert_eq!(
+            fallback.seen.lock().unwrap().as_slice(),
+            &["deepseek-chat".to_string()]
+        );
     }
 }

@@ -64,11 +64,11 @@ struct OpenClawModels {
 #[serde(default, rename_all = "camelCase")]
 struct OpenClawRootTools {
     #[allow(dead_code)]
-    profile: Option<serde_json::Value>,
+    profile: Option<String>,
     #[allow(dead_code)]
-    allow: Option<serde_json::Value>,
+    allow: Option<Vec<String>>,
     #[allow(dead_code)]
-    deny: Option<serde_json::Value>,
+    deny: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -110,36 +110,17 @@ struct OpenClawAgentEntry {
     model: Option<OpenClawAgentModel>,
     tools: Option<OpenClawAgentTools>,
     workspace: Option<String>,
-    skills: Option<serde_json::Value>,
+    skills: Option<Vec<String>>,
     identity: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct OpenClawAgentTools {
-    profile: Option<serde_json::Value>,
-    allow: Option<serde_json::Value>,
-    deny: Option<serde_json::Value>,
-    also_allow: Option<serde_json::Value>,
-}
-
-/// Extract a profile name from a Value (string or {name: "..."}  object).
-fn extract_profile(val: &serde_json::Value) -> Option<String> {
-    val.as_str()
-        .map(|s| s.to_string())
-        .or_else(|| val.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
-}
-
-/// Extract a list of strings from a Value (array of strings, single string, or object keys).
-fn extract_string_list(val: &serde_json::Value) -> Vec<String> {
-    match val {
-        serde_json::Value::Array(arr) => {
-            arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect()
-        }
-        serde_json::Value::String(s) => vec![s.clone()],
-        serde_json::Value::Object(map) => map.keys().cloned().collect(),
-        _ => vec![],
-    }
+    profile: Option<String>,
+    allow: Option<Vec<String>>,
+    deny: Option<Vec<String>>,
+    also_allow: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -168,7 +149,7 @@ struct OpenClawChannels {
 #[serde(default, rename_all = "camelCase")]
 struct OpenClawTelegramConfig {
     bot_token: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     group_policy: Option<String>,
     dm_policy: Option<String>,
     enabled: Option<bool>,
@@ -181,7 +162,7 @@ struct OpenClawDiscordConfig {
     guilds: Option<serde_json::Value>,
     dm_policy: Option<String>,
     group_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -192,7 +173,7 @@ struct OpenClawSlackConfig {
     app_token: Option<String>,
     dm_policy: Option<String>,
     group_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -201,7 +182,7 @@ struct OpenClawSlackConfig {
 struct OpenClawWhatsAppConfig {
     auth_dir: Option<String>,
     dm_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     group_policy: Option<String>,
     enabled: Option<bool>,
 }
@@ -214,7 +195,7 @@ struct OpenClawSignalConfig {
     http_port: Option<u16>,
     account: Option<String>,
     dm_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -224,9 +205,9 @@ struct OpenClawMatrixConfig {
     homeserver: Option<String>,
     user_id: Option<String>,
     access_token: Option<String>,
-    rooms: Option<serde_json::Value>,
+    rooms: Option<Vec<String>>,
     dm_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -247,7 +228,7 @@ struct OpenClawTeamsConfig {
     app_password: Option<String>,
     tenant_id: Option<String>,
     dm_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -259,9 +240,9 @@ struct OpenClawIrcConfig {
     tls: Option<bool>,
     nick: Option<String>,
     password: Option<String>,
-    channels: Option<serde_json::Value>,
+    channels: Option<Vec<String>>,
     dm_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -271,7 +252,7 @@ struct OpenClawMattermostConfig {
     bot_token: Option<String>,
     base_url: Option<String>,
     dm_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -291,7 +272,7 @@ struct OpenClawIMessageConfig {
     cli_path: Option<String>,
     db_path: Option<String>,
     dm_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -301,7 +282,7 @@ struct OpenClawBlueBubblesConfig {
     server_url: Option<String>,
     password: Option<String>,
     dm_policy: Option<String>,
-    allow_from: Option<serde_json::Value>,
+    allow_from: Option<Vec<String>>,
     enabled: Option<bool>,
 }
 
@@ -507,18 +488,16 @@ fn build_channel_table(
     fields: Vec<(&str, toml::Value)>,
     dm_policy: Option<&str>,
     group_policy: Option<&str>,
-    allow_from: Option<&serde_json::Value>,
+    allow_from: Option<&[String]>,
 ) -> toml::Value {
     let mut table = toml::map::Map::new();
     for (key, val) in fields {
         table.insert(key.to_string(), val);
     }
 
-    let allow_list = allow_from.map(extract_string_list).unwrap_or_default();
-
     // Add overrides sub-table if any policy is set
     let has_overrides =
-        dm_policy.is_some() || group_policy.is_some() || !allow_list.is_empty();
+        dm_policy.is_some() || group_policy.is_some() || allow_from.is_some_and(|a| !a.is_empty());
 
     if has_overrides {
         let mut overrides = toml::map::Map::new();
@@ -536,12 +515,14 @@ fn build_channel_table(
                 toml::Value::String(mapped.to_string()),
             );
         }
-        if !allow_list.is_empty() {
-            let arr: Vec<toml::Value> = allow_list
-                .iter()
-                .map(|u| toml::Value::String(u.clone()))
-                .collect();
-            overrides.insert("allowed_users".to_string(), toml::Value::Array(arr));
+        if let Some(users) = allow_from {
+            if !users.is_empty() {
+                let arr: Vec<toml::Value> = users
+                    .iter()
+                    .map(|u| toml::Value::String(u.clone()))
+                    .collect();
+                overrides.insert("allowed_users".to_string(), toml::Value::Array(arr));
+            }
         }
         table.insert("overrides".to_string(), toml::Value::Table(overrides));
     }
@@ -830,14 +811,13 @@ fn scan_from_json5(base: &Path, config_path: &Path, result: &mut ScanResult) {
                 .tools
                 .as_ref()
                 .and_then(|t| t.allow.as_ref())
-                .map(|a| extract_string_list(a).len())
+                .map(|a| a.len())
                 .or_else(|| {
                     entry
                         .tools
                         .as_ref()
                         .and_then(|t| t.profile.as_ref())
-                        .and_then(extract_profile)
-                        .map(|p| tools_for_profile(&p).len())
+                        .map(|p| tools_for_profile(p).len())
                 })
                 .unwrap_or(3);
 
@@ -1273,8 +1253,7 @@ fn migrate_channels_from_json(
                 "bot_token_env",
                 toml::Value::String("TELEGRAM_BOT_TOKEN".into()),
             )];
-            if let Some(ref users_val) = tg.allow_from {
-                let users = extract_string_list(users_val);
+            if let Some(ref users) = tg.allow_from {
                 if !users.is_empty() {
                     let arr: Vec<toml::Value> = users
                         .iter()
@@ -1289,7 +1268,7 @@ fn migrate_channels_from_json(
                     fields,
                     tg.dm_policy.as_deref(),
                     tg.group_policy.as_deref(),
-                    tg.allow_from.as_ref(),
+                    tg.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1316,7 +1295,7 @@ fn migrate_channels_from_json(
                     fields,
                     dc.dm_policy.as_deref(),
                     dc.group_policy.as_deref(),
-                    dc.allow_from.as_ref(),
+                    dc.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1352,7 +1331,7 @@ fn migrate_channels_from_json(
                     fields,
                     sl.dm_policy.as_deref(),
                     sl.group_policy.as_deref(),
-                    sl.allow_from.as_ref(),
+                    sl.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1393,8 +1372,7 @@ fn migrate_channels_from_json(
                 "access_token_env",
                 toml::Value::String("WHATSAPP_ACCESS_TOKEN".into()),
             )];
-            if let Some(ref users_val) = wa.allow_from {
-                let users = extract_string_list(users_val);
+            if let Some(ref users) = wa.allow_from {
                 if !users.is_empty() {
                     let arr: Vec<toml::Value> = users
                         .iter()
@@ -1409,7 +1387,7 @@ fn migrate_channels_from_json(
                     fields,
                     wa.dm_policy.as_deref(),
                     wa.group_policy.as_deref(),
-                    wa.allow_from.as_ref(),
+                    wa.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1440,7 +1418,7 @@ fn migrate_channels_from_json(
                     fields,
                     sig.dm_policy.as_deref(),
                     None,
-                    sig.allow_from.as_ref(),
+                    sig.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1467,8 +1445,7 @@ fn migrate_channels_from_json(
             if let Some(ref uid) = mx.user_id {
                 fields.push(("user_id", toml::Value::String(uid.clone())));
             }
-            if let Some(ref rooms_val) = mx.rooms {
-                let rooms = extract_string_list(rooms_val);
+            if let Some(ref rooms) = mx.rooms {
                 if !rooms.is_empty() {
                     let arr: Vec<toml::Value> = rooms
                         .iter()
@@ -1483,7 +1460,7 @@ fn migrate_channels_from_json(
                     fields,
                     mx.dm_policy.as_deref(),
                     None,
-                    mx.allow_from.as_ref(),
+                    mx.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1557,7 +1534,7 @@ fn migrate_channels_from_json(
                     fields,
                     tm.dm_policy.as_deref(),
                     None,
-                    tm.allow_from.as_ref(),
+                    tm.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1590,8 +1567,7 @@ fn migrate_channels_from_json(
             if irc.password.is_some() {
                 fields.push(("password_env", toml::Value::String("IRC_PASSWORD".into())));
             }
-            if let Some(ref chans_val) = irc.channels {
-                let chans = extract_string_list(chans_val);
+            if let Some(ref chans) = irc.channels {
                 if !chans.is_empty() {
                     let arr: Vec<toml::Value> = chans
                         .iter()
@@ -1606,7 +1582,7 @@ fn migrate_channels_from_json(
                     fields,
                     irc.dm_policy.as_deref(),
                     None,
-                    irc.allow_from.as_ref(),
+                    irc.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1636,7 +1612,7 @@ fn migrate_channels_from_json(
                     fields,
                     mm.dm_policy.as_deref(),
                     None,
-                    mm.allow_from.as_ref(),
+                    mm.allow_from.as_deref(),
                 ),
             );
             report.imported.push(MigrateItem {
@@ -1794,10 +1770,9 @@ fn convert_agent_from_json(
     // Resolve tools
     let mut unmapped_tools = Vec::new();
     let tools: Vec<String> = if let Some(ref agent_tools) = entry.tools {
-        if let Some(ref allow_val) = agent_tools.allow {
-            let allow = extract_string_list(allow_val);
+        if let Some(ref allow) = agent_tools.allow {
             let mut mapped = Vec::new();
-            for t in &allow {
+            for t in allow {
                 if is_known_openfang_tool(t) {
                     mapped.push(t.clone());
                 } else if let Some(of_name) = map_tool_name(t) {
@@ -1807,9 +1782,8 @@ fn convert_agent_from_json(
                 }
             }
             // also_allow
-            if let Some(ref also_val) = agent_tools.also_allow {
-                let also = extract_string_list(also_val);
-                for t in &also {
+            if let Some(ref also) = agent_tools.also_allow {
+                for t in also {
                     if is_known_openfang_tool(t) {
                         mapped.push(t.clone());
                     } else if let Some(of_name) = map_tool_name(t) {
@@ -1820,9 +1794,8 @@ fn convert_agent_from_json(
                 }
             }
             mapped
-        } else if let Some(ref profile_val) = agent_tools.profile {
-            let profile_name = extract_profile(profile_val).unwrap_or_default();
-            tools_for_profile(&profile_name)
+        } else if let Some(ref profile) = agent_tools.profile {
+            tools_for_profile(profile)
         } else {
             resolve_default_tools(defaults)
         }
@@ -1921,10 +1894,8 @@ fn convert_agent_from_json(
 
     // Tool profile hint
     if let Some(ref agent_tools) = entry.tools {
-        if let Some(ref profile_val) = agent_tools.profile {
-            if let Some(profile) = extract_profile(profile_val) {
-                toml_str.push_str(&format!("\nprofile = \"{profile}\"\n"));
-            }
+        if let Some(ref profile) = agent_tools.profile {
+            toml_str.push_str(&format!("\nprofile = \"{profile}\"\n"));
         }
     }
 
@@ -1934,15 +1905,12 @@ fn convert_agent_from_json(
 fn resolve_default_tools(defaults: Option<&OpenClawAgentDefaults>) -> Vec<String> {
     if let Some(defs) = defaults {
         if let Some(ref tools) = defs.tools {
-            if let Some(ref profile_val) = tools.profile {
-                if let Some(profile) = extract_profile(profile_val) {
-                    return tools_for_profile(&profile);
-                }
+            if let Some(ref profile) = tools.profile {
+                return tools_for_profile(profile);
             }
-            if let Some(ref allow_val) = tools.allow {
-                let allow = extract_string_list(allow_val);
+            if let Some(ref allow) = tools.allow {
                 let mut mapped = Vec::new();
-                for t in &allow {
+                for t in allow {
                     if is_known_openfang_tool(t) {
                         mapped.push(t.clone());
                     } else if let Some(of_name) = map_tool_name(t) {
