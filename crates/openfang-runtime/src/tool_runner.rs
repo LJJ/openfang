@@ -1491,11 +1491,22 @@ async fn tool_agent_send(
         message.to_string()
     };
 
-    AGENT_CALL_DEPTH
+    let result = AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
             kh.send_to_agent(agent_id, &final_message).await
         })
-        .await
+        .await;
+
+    // Truncate the response to prevent token bloat in the caller's context.
+    // The caller (world-engine) only needs to know the agent finished, not the
+    // full text of the assistant's reply.
+    result.map(|response| {
+        if response.len() > 100 {
+            "角色已回复".to_string()
+        } else {
+            response
+        }
+    })
 }
 
 async fn tool_agent_spawn(

@@ -393,6 +393,42 @@ fn roleplay_mode_prompt(mode: &str) -> &'static str {
     }
 }
 
+/// Detect world-engine scenario from the incoming message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorldEngineScenario {
+    PrivateChat,
+    ScheduledTick,
+    GroupChat,
+    NonOwnerFallback,
+}
+
+fn detect_world_engine_scenario(message: &str) -> WorldEngineScenario {
+    if message.contains("[SCHEDULED TICK]") {
+        return WorldEngineScenario::ScheduledTick;
+    }
+    let is_group = parse_channel_context_value(message, "is_group")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if is_group {
+        return WorldEngineScenario::GroupChat;
+    }
+    let sender_is_owner = parse_channel_context_value(message, "sender_is_owner")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    if !sender_is_owner {
+        return WorldEngineScenario::NonOwnerFallback;
+    }
+    WorldEngineScenario::PrivateChat
+}
+
+/// Format a tool result value for injection into world-engine context.
+fn format_tool_result(label: &str, result: &Result<serde_json::Value, String>) -> String {
+    match result {
+        Ok(value) => format!("[{}]\n{}", label, serde_json::to_string_pretty(value).unwrap_or_default()),
+        Err(_) => String::new(),
+    }
+}
+
 fn strip_remote_stage_directions(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut ascii_depth = 0u32;
@@ -2233,6 +2269,135 @@ impl OpenFangKernel {
         })
     }
 
+    /// Pre-fetch all state data for world-engine and format as injectable context.
+    /// This eliminates the first round of tool-use where the LLM calls read-only
+    /// state tools — the kernel fetches them in parallel and injects the results.
+    async fn pre_fetch_world_engine_state(
+        &self,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+        message: &str,
+    ) -> String {
+        let scenario = detect_world_engine_scenario(message);
+
+        match scenario {
+            WorldEngineScenario::NonOwnerFallback => {
+                return "[预取状态]\nscenario: non_owner_fallback\n直接输出 [[silent]]，不做任何调用。".into();
+            }
+            WorldEngineScenario::PrivateChat => {
+                use serde_json::json as j;
+                // Parallel fetch batch 1
+                let (life_res, inner_res, narrative_res, digest_res) = tokio::join!(
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_life", "mcp_toolbox_get_life_status", j!({})),
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_inner", "mcp_toolbox_get_inner_state", j!({})),
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_narrative", "mcp_toolbox_consume_last_turn_narrative", j!({})),
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_digest", "mcp_toolbox_get_group_digest", j!({})),
+                );
+
+                // Extract date for schedule fetches
+                let today_str = life_res.as_ref().ok()
+                    .and_then(|v| v.get("current_datetime").or_else(|| v.get("current_time")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let today_date = &today_str.get(..10).unwrap_or(""); // YYYY-MM-DD
+
+                let tomorrow = if let Ok(d) = chrono::NaiveDate::parse_from_str(today_date, "%Y-%m-%d") {
+                    (d + chrono::Duration::days(1)).format("%Y-%m-%d").to_string()
+                } else { String::new() };
+                let day_after = if let Ok(d) = chrono::NaiveDate::parse_from_str(today_date, "%Y-%m-%d") {
+                    (d + chrono::Duration::days(2)).format("%Y-%m-%d").to_string()
+                } else { String::new() };
+
+                // Parallel fetch batch 2: schedules
+                let (sched_tomorrow, sched_day_after) = tokio::join!(
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_sched1", "mcp_toolbox_get_schedule", j!({"date": &tomorrow})),
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_sched2", "mcp_toolbox_get_schedule", j!({"date": &day_after})),
+                );
+
+                let mut parts = vec!["[预取状态]".to_string()];
+                parts.push(format_tool_result("生活状态", &life_res));
+                parts.push(format_tool_result("内在状态", &inner_res));
+                let narrative_text = narrative_res.as_ref().ok()
+                    .and_then(|v| v.get("narrative").or_else(|| v.get("last_turn_narrative")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !narrative_text.is_empty() {
+                    parts.push(format!("[上轮叙事]\n{}", narrative_text));
+                }
+                let digest_text = digest_res.as_ref().ok()
+                    .and_then(|v| v.get("summary").or_else(|| v.get("digest")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !digest_text.is_empty() {
+                    parts.push(format!("[群聊摘要]\n{}", digest_text));
+                }
+                if !tomorrow.is_empty() {
+                    parts.push(format_tool_result(&format!("明天日程 ({})", tomorrow), &sched_tomorrow));
+                }
+                if !day_after.is_empty() {
+                    parts.push(format_tool_result(&format!("后天日程 ({})", day_after), &sched_day_after));
+                }
+                parts.push("[/预取状态]".to_string());
+                parts.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n")
+            }
+            WorldEngineScenario::ScheduledTick => {
+                use serde_json::json as j;
+                let (life_res, inner_res) = tokio::join!(
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_tick_life", "mcp_toolbox_get_life_status", j!({})),
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_tick_inner", "mcp_toolbox_get_inner_state", j!({"include_scores": true})),
+                );
+
+                let today_str = life_res.as_ref().ok()
+                    .and_then(|v| v.get("current_datetime").or_else(|| v.get("current_time")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let today_date = &today_str.get(..10).unwrap_or("");
+                let tomorrow = if let Ok(d) = chrono::NaiveDate::parse_from_str(today_date, "%Y-%m-%d") {
+                    (d + chrono::Duration::days(1)).format("%Y-%m-%d").to_string()
+                } else { String::new() };
+
+                let sched_tomorrow = self.execute_world_engine_tool_json(
+                    agent_id, manifest, "pf_tick_sched", "mcp_toolbox_get_schedule", j!({"date": &tomorrow})
+                ).await;
+
+                // Check if LLM reconcile should be skipped
+                let maintenance_ctx = self.execute_world_engine_tool_json(
+                    agent_id, manifest, "pf_tick_maint", "mcp_toolbox_get_presence_maintenance_context", j!({})
+                ).await;
+                let should_skip = maintenance_ctx.as_ref().ok()
+                    .and_then(|v| v.get("should_skip_llm_reconcile"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let mut parts = vec!["[预取状态]".to_string()];
+                parts.push(format_tool_result("生活状态", &life_res));
+                parts.push(format_tool_result("内在状态（含分数）", &inner_res));
+                if !tomorrow.is_empty() {
+                    parts.push(format_tool_result(&format!("明天日程 ({})", tomorrow), &sched_tomorrow));
+                }
+                parts.push(format_tool_result("维护上下文", &maintenance_ctx));
+                if should_skip {
+                    parts.push("[提示] should_skip_llm_reconcile=true，调用 record_presence_maintenance 后直接输出 [[silent]]".to_string());
+                }
+                parts.push("[/预取状态]".to_string());
+                parts.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n")
+            }
+            WorldEngineScenario::GroupChat => {
+                use serde_json::json as j;
+                let (life_res, inner_res) = tokio::join!(
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_grp_life", "mcp_toolbox_get_life_status", j!({})),
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_grp_inner", "mcp_toolbox_get_inner_state", j!({})),
+                );
+
+                let mut parts = vec!["[预取状态]".to_string()];
+                parts.push(format_tool_result("生活状态", &life_res));
+                parts.push(format_tool_result("内在状态", &inner_res));
+                parts.push("[/预取状态]".to_string());
+                parts.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n")
+            }
+        }
+    }
+
     async fn execute_world_engine_tool(
         &self,
         agent_id: AgentId,
@@ -2296,6 +2461,141 @@ impl OpenFangKernel {
                 tool_name, content
             )
         })
+    }
+
+    /// Handle pending plans after Turn Script execution.
+    /// Reads pending_plan.json (written by settle_plan), consumes it, and if
+    /// non-empty, makes a lightweight LLM call to translate plans into schedule
+    /// operations, then executes them.
+    async fn handle_pending_plans(
+        &self,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+    ) {
+        let plan_file = turn_state_agent_dir(&self.config)
+            .join("life")
+            .join("pending_plan.json");
+        if !plan_file.exists() {
+            return;
+        }
+        let contents = match std::fs::read_to_string(&plan_file) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let plans: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if plans.is_empty() {
+            return;
+        }
+
+        // Consume (delete) the file immediately
+        let _ = std::fs::remove_file(&plan_file);
+
+        // Collect plan text
+        let plan_text: Vec<String> = plans
+            .iter()
+            .filter_map(|p| p.get("plan").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        if plan_text.is_empty() {
+            return;
+        }
+
+        info!(
+            agent_id = %agent_id,
+            plan_count = plan_text.len(),
+            "Handling pending plans from settle_plan"
+        );
+
+        // Get current time context for schedule translation
+        let life_status = self
+            .execute_world_engine_tool_json(
+                agent_id, manifest, "plan_life", "mcp_toolbox_get_life_status",
+                serde_json::json!({}),
+            )
+            .await
+            .ok();
+        let current_time = life_status
+            .as_ref()
+            .and_then(|v| v.get("current_datetime").or_else(|| v.get("current_time")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let interaction_mode = current_interaction_mode(&self.config);
+
+        // Build a minimal prompt for plan → schedule translation
+        let plan_joined = plan_text.join("\n");
+        let translate_prompt = format!(
+            "当前时间：{current_time}\n交互模式：{interaction_mode}\n\n角色确认的计划：\n{plan_joined}\n\n\
+             请将计划翻译为日程操作。输出一个 JSON 数组，每个元素格式：\n\
+             {{\"tool\": \"patch_schedule|update_schedule|reset_schedule\", \"args\": {{...}}}}\n\n\
+             翻译要点：\n\
+             - in_person 下 \"这儿/这里/我这\" 指\"公子家\"，区分\"公子家\"和\"（宋玉的）家\"\n\
+             - location 要具体（\"公子家\"\"三亚酒店\"），不用笼统的 base_location\n\
+             - 每天的日程应有合理的时间分段\n\
+             - 今天剩余变化 → patch_schedule(date, from_time, entries)\n\
+             - 多日计划 → 对每天分别 update_schedule(date, entries)，base_location 也要改\n\
+             - 取消 → reset_schedule(date)\n\n\
+             只输出 JSON 数组，不要其他文字。"
+        );
+
+        // Make a lightweight LLM call using a fallback/cheap model if available
+        let driver = match self.resolve_driver(manifest) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(agent_id = %agent_id, %e, "Failed to resolve driver for plan translation");
+                return;
+            }
+        };
+
+        let messages = vec![openfang_types::message::Message::user(&translate_prompt)];
+        let request = CompletionRequest {
+            model: manifest.fallback_models.first()
+                .map(|f| f.model.clone())
+                .unwrap_or_else(|| manifest.model.model.clone()),
+            messages,
+            tools: vec![],
+            max_tokens: 4096,
+            temperature: 0.1,
+            system: Some("你是日程翻译器。将自然语言计划翻译为结构化日程操作。只输出 JSON。".to_string()),
+            thinking: None,
+        };
+
+        let response = match driver.complete(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(agent_id = %agent_id, %e, "Plan translation LLM call failed");
+                return;
+            }
+        };
+
+        let text = response.text();
+        let text = text.trim();
+        // Try to parse JSON array from the response (strip markdown fences if present)
+        let json_text = text.trim_start_matches("```json").trim_start_matches("```")
+            .trim_end_matches("```").trim();
+
+        let operations: Vec<serde_json::Value> = match serde_json::from_str(json_text) {
+            Ok(ops) => ops,
+            Err(e) => {
+                warn!(agent_id = %agent_id, %e, response_text = text, "Failed to parse plan translation result");
+                return;
+            }
+        };
+
+        // Execute each schedule operation
+        for op in &operations {
+            let tool_name = op.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            let args = op.get("args").cloned().unwrap_or(serde_json::json!({}));
+            let mcp_name = format!("mcp_toolbox_{tool_name}");
+            match self
+                .execute_world_engine_tool(agent_id, manifest, "plan_exec", &mcp_name, args)
+                .await
+            {
+                Ok(_) => info!(agent_id = %agent_id, tool = %tool_name, "Plan schedule operation executed"),
+                Err(e) => warn!(agent_id = %agent_id, tool = %tool_name, %e, "Plan schedule operation failed"),
+            }
+        }
     }
 
     async fn execute_world_engine_turn_script(
@@ -3374,6 +3674,15 @@ impl OpenFangKernel {
             message.to_string()
         };
 
+        // For world-engine: pre-fetch state and inject into user message.
+        // This eliminates the first LLM round where the LLM calls read-only tools.
+        let message_with_links = if entry.name == "world-engine" {
+            let prefetched = self.pre_fetch_world_engine_state(agent_id, &manifest, &message_with_links).await;
+            format!("{message_with_links}\n\n{prefetched}")
+        } else {
+            message_with_links
+        };
+
         // For world-engine: pre-process user message in code (我→user_name)
         // so agent_send injects it directly without LLM rewriting.
         let user_injection = if entry.name == "world-engine" {
@@ -3439,6 +3748,12 @@ impl OpenFangKernel {
             let _ = self
                 .execute_world_engine_turn_script(entry, agent_id, &manifest, message)
                 .await;
+
+            // Handle pending plans in code — previously done by world-engine LLM
+            // calling consume_pending_plan. Now the kernel reads the file directly
+            // and makes a lightweight LLM call for plan→schedule translation if needed.
+            self.handle_pending_plans(agent_id, &manifest).await;
+
             result.response.clear();
         }
 
