@@ -2983,7 +2983,7 @@ impl OpenFangKernel {
                         Ok(_) => {
                             executed_any = true;
                             narrative_fragments.push(format!(
-                                "你在试穿{}，定妆照拍好了会发给公子看",
+                                "你穿上了{}",
                                 name
                             ));
                         }
@@ -5280,6 +5280,38 @@ impl OpenFangKernel {
             serde_json::Value::Object(send_input),
         )
         .await?;
+
+        // Wardrobe: auto-confirm + auto-wear after base photo delivery
+        if request.tool_name == "mcp_toolbox_add_to_wardrobe" {
+            if let Some(item_id) = tool_result.get("item_id").and_then(|v| v.as_str()) {
+                match self
+                    .call_dedicated_mcp_json(
+                        &mut toolbox,
+                        "mcp_toolbox_confirm_wardrobe_item",
+                        serde_json::json!({ "item_id": item_id }),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        info!(item_id, "Wardrobe item auto-confirmed");
+                        // Also set as currently worn
+                        if let Err(error) = self
+                            .call_dedicated_mcp_json(
+                                &mut toolbox,
+                                "mcp_toolbox_wear",
+                                serde_json::json!({ "item_id": item_id }),
+                            )
+                            .await
+                        {
+                            warn!(item_id, %error, "Wardrobe auto-wear failed");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(item_id, %error, "Wardrobe auto-confirm failed");
+                    }
+                }
+            }
+        }
 
         if let Some(archive) = request.archive.as_ref() {
             if archive.prompt.trim().is_empty() {
