@@ -344,7 +344,7 @@ async fn send_response(
     text: String,
     thread_id: Option<&str>,
     output_format: OutputFormat,
-) {
+) -> Result<(), String> {
     let formatted = formatter::format_for_channel(&text, output_format);
     let content = ChannelContent::Text(formatted);
 
@@ -356,7 +356,10 @@ async fn send_response(
 
     if let Err(e) = result {
         error!("Failed to send response: {e}");
+        return Err(e.to_string());
     }
+
+    Ok(())
 }
 
 /// Dispatch a single incoming message — handles bot commands or routes to an agent.
@@ -428,7 +431,7 @@ async fn dispatch_message(
             if let Err(msg) =
                 rate_limiter.check(ct_str, &message.sender.platform_id, ov.rate_limit_per_user)
             {
-                send_response(adapter, &message.sender, msg, thread_id, output_format).await;
+                let _ = send_response(adapter, &message.sender, msg, thread_id, output_format).await;
                 return;
             }
         }
@@ -438,11 +441,11 @@ async fn dispatch_message(
         ChannelContent::Text(t) => t.clone(),
         ChannelContent::Command { name, args } => {
             let result = handle_command(name, args, handle, router, &message.sender).await;
-            send_response(adapter, &message.sender, result, thread_id, output_format).await;
+            let _ = send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
         }
         _ => {
-            send_response(
+            let _ = send_response(
                 adapter,
                 &message.sender,
                 "I can only handle text messages for now.".to_string(),
@@ -495,7 +498,7 @@ async fn dispatch_message(
                 | "a2a"
         ) {
             let result = handle_command(cmd, &args, handle, router, &message.sender).await;
-            send_response(adapter, &message.sender, result, thread_id, output_format).await;
+            let _ = send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
         }
         // Other slash commands pass through to the agent
@@ -510,7 +513,7 @@ async fn dispatch_message(
                 .authorize_channel_user(ct_str, &message.sender.platform_id, "chat")
                 .await
             {
-                send_response(
+                let _ = send_response(
                     adapter,
                     &message.sender,
                     format!("Access denied: {denied}"),
@@ -562,7 +565,7 @@ async fn dispatch_message(
             }
 
             let combined = responses.join("\n\n");
-            send_response(adapter, &message.sender, combined, thread_id, output_format).await;
+            let _ = send_response(adapter, &message.sender, combined, thread_id, output_format).await;
             return;
         }
     }
@@ -577,7 +580,7 @@ async fn dispatch_message(
     let agent_id = match agent_id {
         Some(id) => id,
         None => {
-            send_response(
+            let _ = send_response(
                 adapter,
                 &message.sender,
                 "No agent assigned. Use /agents to list available agents, then /agent <name> to select one.".to_string(),
@@ -593,7 +596,7 @@ async fn dispatch_message(
         .authorize_channel_user(ct_str, &message.sender.platform_id, "chat")
         .await
     {
-        send_response(
+        let _ = send_response(
             adapter,
             &message.sender,
             format!("Access denied: {denied}"),
@@ -607,9 +610,16 @@ async fn dispatch_message(
     // Auto-reply check — if enabled, the engine decides whether to process this message.
     // If auto-reply is enabled but suppressed for this message, skip agent call entirely.
     if let Some(reply) = handle.check_auto_reply(agent_id, &text).await {
-        send_response(adapter, &message.sender, reply, thread_id, output_format).await;
+        let send_result =
+            send_response(adapter, &message.sender, reply, thread_id, output_format).await;
         handle
-            .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None)
+            .record_delivery(
+                agent_id,
+                ct_str,
+                &message.sender.platform_id,
+                send_result.is_ok(),
+                send_result.as_ref().err().map(|e| e.as_str()),
+            )
             .await;
         return;
     }
@@ -620,15 +630,22 @@ async fn dispatch_message(
     // Send to agent and relay response
     match handle.send_message(agent_id, &text).await {
         Ok(response) => {
-            send_response(adapter, &message.sender, response, thread_id, output_format).await;
+            let send_result =
+                send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
-                .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None)
+                .record_delivery(
+                    agent_id,
+                    ct_str,
+                    &message.sender.platform_id,
+                    send_result.is_ok(),
+                    send_result.as_ref().err().map(|e| e.as_str()),
+                )
                 .await;
         }
         Err(e) => {
             warn!("Agent error for {agent_id}: {e}");
             let err_msg = format!("Agent error: {e}");
-            send_response(
+            let _ = send_response(
                 adapter,
                 &message.sender,
                 err_msg.clone(),

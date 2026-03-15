@@ -3,11 +3,22 @@ const SYSTEM_FRAGMENTS: &[&str] = &[
     "[Task completed",
     "[The model returned an empty response",
     "[no response]",
+    "[SYSTEM] Please output your Turn Script directly",
     "tool call",
     "tool result",
     "chat_id:",
     "sender_open_id:",
     "channel:",
+    "NO_REPLY",
+    "OK. NO_REPLY",
+];
+
+const INTERNAL_SUMMARY_PREFIXES: &[&str] = &[
+    "给公子回了消息",
+    "给他回了消息",
+    "给公子发了消息",
+    "看起来 Turn Script 文件路径不对",
+    "既然 `pending.json` 为空",
 ];
 
 const MEMORY_CUES: &[&str] = &[
@@ -77,6 +88,10 @@ pub fn project_memory_imprint(user_message: &str, assistant_response: &str) -> O
         return None;
     }
 
+    if is_internal_summary(&assistant) {
+        return None;
+    }
+
     let user_fragment = select_fragment(&user);
     let assistant_fragment = select_fragment(&assistant);
     let score =
@@ -129,6 +144,15 @@ fn is_trivial_exchange(user: &str, assistant: &str) -> bool {
 
 fn is_trivial_message(text: &str) -> bool {
     TRIVIAL_MESSAGES.contains(&text) || text.chars().count() <= 2
+}
+
+fn is_internal_summary(text: &str) -> bool {
+    let trimmed = text.trim();
+    INTERNAL_SUMMARY_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+        || (trimmed.starts_with("拍了张")
+            && (trimmed.contains("发给公子") || trimmed.contains("发给他")))
 }
 
 fn select_fragment(text: &str) -> Option<String> {
@@ -196,16 +220,16 @@ fn render_memory_imprint(user: Option<&str>, assistant: Option<&str>) -> Option<
             if user.contains('吗') || user.contains('?') || user.contains('？') =>
         {
             Some(format!(
-                "你记得他问过你“{}”，你当时回他“{}”。",
+                "你记得公子问过你“{}”，你当时回了“{}”。",
                 user, assistant
             ))
         }
         (Some(user), Some(assistant)) => Some(format!(
-            "你记得他说过“{}”。你也把自己当时那句“{}”留在了心里。",
+            "你记得公子说过“{}”。你也把自己当时那句“{}”留在了心里。",
             user, assistant
         )),
-        (Some(user), None) => Some(format!("你记得他说过“{}”。", user)),
-        (None, Some(assistant)) => Some(format!("你记得自己当时回过他“{}”。", assistant)),
+        (Some(user), None) => Some(format!("你记得公子说过“{}”。", user)),
+        (None, Some(assistant)) => Some(format!("你记得自己当时回过公子“{}”。", assistant)),
         (None, None) => None,
     }
 }
@@ -239,5 +263,11 @@ mod tests {
         assert!(memory.contains("我不喜欢你在群里太冷"));
         assert!(memory.contains("亲近"));
         assert!(!memory.contains("User asked"));
+    }
+
+    #[test]
+    fn skips_internal_action_summaries() {
+        let memory = project_memory_imprint("你在干嘛", "给公子回了消息，说我在家看书。");
+        assert!(memory.is_none());
     }
 }

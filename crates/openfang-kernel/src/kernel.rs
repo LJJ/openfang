@@ -100,18 +100,17 @@ fn reconcile_template_backed_manifest(
 ) -> Result<Option<AgentManifest>, String> {
     let template = load_template_manifest(config, agent_name)?;
     let Some(mut template) = template else {
-        if persisted.agent_class == AgentClass::Roleplay {
+        if persisted.agent_class.is_template_backed() {
             let manifest_path = template_manifest_path(config, agent_name);
             return Err(format!(
-                "Roleplay agent template missing: {}",
+                "Template-backed agent template missing: {}",
                 manifest_path.display()
             ));
         }
         return Ok(None);
     };
 
-    if template.agent_class != AgentClass::Roleplay && persisted.agent_class != AgentClass::Roleplay
-    {
+    if !template.agent_class.is_template_backed() && !persisted.agent_class.is_template_backed() {
         return Ok(None);
     }
 
@@ -120,6 +119,234 @@ fn reconcile_template_backed_manifest(
     }
 
     Ok(Some(template))
+}
+
+fn stateless_orchestrator(manifest: &AgentManifest) -> bool {
+    manifest.agent_class == AgentClass::Orchestrator
+}
+
+fn fresh_agent_session(
+    agent_id: AgentId,
+    session_id: SessionId,
+) -> openfang_memory::session::Session {
+    openfang_memory::session::Session {
+        id: session_id,
+        agent_id,
+        messages: Vec::new(),
+        context_window_tokens: 0,
+        label: None,
+    }
+}
+
+fn parse_channel_context_value(message: &str, key: &str) -> Option<String> {
+    let mut in_channel_context = false;
+    for line in message.lines() {
+        let trimmed = line.trim();
+        if !in_channel_context {
+            if trimmed == "[Channel context]" {
+                in_channel_context = true;
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            break;
+        }
+        let (candidate_key, candidate_value) = trimmed.split_once(':')?;
+        if candidate_key.trim() == key {
+            return Some(candidate_value.trim().to_string());
+        }
+    }
+    None
+}
+
+fn parse_feishu_delivery_target(message: &str) -> Option<(String, String)> {
+    if parse_channel_context_value(message, "channel")?.as_str() != "feishu" {
+        return None;
+    }
+
+    if let Some(chat_id) = parse_channel_context_value(message, "chat_id") {
+        return Some((chat_id, "chat_id".to_string()));
+    }
+
+    parse_channel_context_value(message, "sender_open_id")
+        .map(|open_id| (open_id, "open_id".to_string()))
+}
+
+fn state_agent_name() -> String {
+    std::env::var("OPENFANG_STATE_AGENT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "assistant".to_string())
+}
+
+fn turn_script_pending_path(config: &KernelConfig) -> PathBuf {
+    config
+        .home_dir
+        .join("agents")
+        .join(state_agent_name())
+        .join("intents")
+        .join("pending.json")
+}
+
+fn turn_state_agent_dir(config: &KernelConfig) -> PathBuf {
+    config.home_dir.join("agents").join(state_agent_name())
+}
+
+fn turn_state_context_cache_path(config: &KernelConfig) -> PathBuf {
+    turn_state_agent_dir(config).join("context_cache.json")
+}
+
+fn read_turn_script_intents(config: &KernelConfig) -> Vec<serde_json::Value> {
+    let pending_path = turn_script_pending_path(config);
+    let Ok(contents) = std::fs::read_to_string(&pending_path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<serde_json::Value>>(&contents).unwrap_or_default()
+}
+
+fn write_turn_script_intents(
+    config: &KernelConfig,
+    intents: &[serde_json::Value],
+) -> Result<(), String> {
+    let pending_path = turn_script_pending_path(config);
+    if let Some(parent) = pending_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create turn script dir failed: {e}"))?;
+    }
+    let payload = serde_json::to_string_pretty(intents)
+        .map_err(|e| format!("serialize turn script failed: {e}"))?;
+    std::fs::write(&pending_path, payload).map_err(|e| format!("write turn script failed: {e}"))
+}
+
+fn store_last_turn_narrative(config: &KernelConfig, narrative: &str) -> Result<(), String> {
+    let cache_path = turn_state_context_cache_path(config);
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create context cache dir failed: {e}"))?;
+    }
+
+    let mut cache = std::fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    cache["last_turn_narrative"] = serde_json::Value::String(narrative.to_string());
+    cache["updated_at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+
+    let payload = serde_json::to_string_pretty(&cache)
+        .map_err(|e| format!("serialize context cache failed: {e}"))?;
+    std::fs::write(&cache_path, payload).map_err(|e| format!("write context cache failed: {e}"))
+}
+
+fn owner_delivery_target(message: &str) -> Option<(String, String)> {
+    parse_feishu_delivery_target(message).or_else(|| {
+        std::env::var("FEISHU_OWNER_OPEN_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|open_id| (open_id, "open_id".to_string()))
+    })
+}
+
+fn current_interaction_mode(config: &KernelConfig) -> String {
+    let state_path = turn_state_agent_dir(config).join("life").join("state.json");
+    let Ok(contents) = std::fs::read_to_string(state_path) else {
+        return "remote".to_string();
+    };
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("interaction_mode")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .filter(|mode| mode == "remote" || mode == "in_person")
+        .unwrap_or_else(|| "remote".to_string())
+}
+
+fn strip_remote_stage_directions(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut ascii_depth = 0u32;
+    let mut cjk_depth = 0u32;
+
+    for ch in text.chars() {
+        match ch {
+            '(' => ascii_depth += 1,
+            ')' => ascii_depth = ascii_depth.saturating_sub(1),
+            '（' => cjk_depth += 1,
+            '）' => cjk_depth = cjk_depth.saturating_sub(1),
+            _ if ascii_depth == 0 && cjk_depth == 0 => result.push(ch),
+            _ => {}
+        }
+    }
+
+    result.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn preferred_image_size(description: &str) -> &'static str {
+    let horizontal_hints = [
+        "横", "躺", "床", "沙发", "餐桌", "桌边", "窗边", "靠着", "趴", "窝", "侧躺",
+    ];
+    if horizontal_hints
+        .iter()
+        .any(|hint| description.contains(hint))
+    {
+        "2048x1536"
+    } else {
+        "1536x2048"
+    }
+}
+
+fn preferred_video_aspect_ratio(description: &str) -> &'static str {
+    let horizontal_hints = [
+        "横", "并肩", "全身", "走路", "走几步", "转身", "转一圈", "沙发", "床", "窗边",
+        "餐桌", "空间", "背景", "环境",
+    ];
+    if horizontal_hints
+        .iter()
+        .any(|hint| description.contains(hint))
+    {
+        "16:9"
+    } else {
+        "9:16"
+    }
+}
+
+fn preferred_video_duration(description: &str) -> &'static str {
+    let longer_hints = [
+        "完整", "起手", "变化", "落点", "慢慢", "停顿", "转一圈", "走几步", "说一段",
+        "小视频", "一小段",
+    ];
+    if longer_hints
+        .iter()
+        .any(|hint| description.contains(hint))
+    {
+        "8"
+    } else {
+        "5"
+    }
+}
+
+fn world_engine_execution_tools() -> Vec<String> {
+    [
+        "mcp_feishu_send_text_message",
+        "mcp_feishu_send_image_message",
+        "mcp_feishu_send_video_message",
+        "mcp_feishu_send_audio_message",
+        "mcp_toolbox_get_inner_state",
+        "mcp_toolbox_set_interaction_mode",
+        "mcp_toolbox_list_wardrobe",
+        "mcp_toolbox_wear",
+        "mcp_toolbox_get_life_status",
+        "mcp_toolbox_get_current_outfit",
+        "mcp_toolbox_get_avatar",
+        "mcp_toolbox_generate_image",
+        "mcp_toolbox_generate_video",
+        "mcp_toolbox_save_selfie",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 /// The main OpenFang kernel — coordinates all subsystems.
@@ -488,6 +715,16 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
 
 /// Append an assistant response summary to the daily memory log (best-effort, append-only).
 /// Caps daily log at 1MB to prevent unbounded growth.
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    text.char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| &text[..idx])
+        .unwrap_or(text)
+}
+
 fn append_daily_memory_log(workspace: &Path, response: &str) {
     use std::io::Write;
     let trimmed = response.trim();
@@ -503,8 +740,8 @@ fn append_daily_memory_log(workspace: &Path, response: &str) {
         }
     }
     // Truncate long responses for the log
-    let summary = if trimmed.len() > 500 {
-        &trimmed[..500]
+    let summary = if trimmed.chars().count() > 500 {
+        truncate_chars(trimmed, 500)
     } else {
         trimmed
     };
@@ -1401,17 +1638,15 @@ impl OpenFangKernel {
         }
 
         // LLM agent: true streaming via agent loop
-        let mut session = self
-            .memory
-            .get_session(entry.session_id)
-            .map_err(KernelError::OpenFang)?
-            .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
-                agent_id,
-                messages: Vec::new(),
-                context_window_tokens: 0,
-                label: None,
-            });
+        let stateless_session = stateless_orchestrator(&entry.manifest);
+        let mut session = if stateless_session {
+            fresh_agent_session(agent_id, entry.session_id)
+        } else {
+            self.memory
+                .get_session(entry.session_id)
+                .map_err(KernelError::OpenFang)?
+                .unwrap_or_else(|| fresh_agent_session(agent_id, entry.session_id))
+        };
 
         // Check if auto-compaction is needed: message-count OR token-count trigger
         let needs_compact = {
@@ -1419,23 +1654,27 @@ impl OpenFangKernel {
                 estimate_token_count, needs_compaction as check_compact,
                 needs_compaction_by_tokens, CompactionConfig,
             };
-            let config = CompactionConfig::default();
-            let by_messages = check_compact(&session, &config);
-            let estimated = estimate_token_count(
-                &session.messages,
-                Some(&entry.manifest.model.system_prompt),
-                None,
-            );
-            let by_tokens = needs_compaction_by_tokens(estimated, &config);
-            if by_tokens && !by_messages {
-                info!(
-                    agent_id = %agent_id,
-                    estimated_tokens = estimated,
-                    messages = session.messages.len(),
-                    "Token-based compaction triggered (messages below threshold but tokens above)"
+            if stateless_session {
+                false
+            } else {
+                let config = CompactionConfig::default();
+                let by_messages = check_compact(&session, &config);
+                let estimated = estimate_token_count(
+                    &session.messages,
+                    Some(&entry.manifest.model.system_prompt),
+                    None,
                 );
+                let by_tokens = needs_compaction_by_tokens(estimated, &config);
+                if by_tokens && !by_messages {
+                    info!(
+                        agent_id = %agent_id,
+                        estimated_tokens = estimated,
+                        messages = session.messages.len(),
+                        "Token-based compaction triggered (messages below threshold but tokens above)"
+                    );
+                }
+                by_messages || by_tokens
             }
-            by_messages || by_tokens
         };
 
         let tools = self.available_tools(agent_id);
@@ -1505,11 +1744,14 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "MEMORY.md")),
-                canonical_context: self
-                    .memory
-                    .canonical_context(agent_id, None)
-                    .ok()
-                    .and_then(|(s, _)| s),
+                canonical_context: if stateless_session {
+                    None
+                } else {
+                    self.memory
+                        .canonical_context(agent_id, None)
+                        .ok()
+                        .and_then(|(s, _)| s)
+                },
                 user_name,
                 channel_type: None,
                 is_subagent: manifest
@@ -1652,7 +1894,7 @@ impl OpenFangKernel {
             match result {
                 Ok(result) => {
                     // Append new messages to canonical session for cross-channel memory
-                    if session.messages.len() > messages_before {
+                    if !stateless_session && session.messages.len() > messages_before {
                         let new_messages = session.messages[messages_before..].to_vec();
                         if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
                             warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
@@ -1685,7 +1927,7 @@ impl OpenFangKernel {
                         };
                         let config = CompactionConfig::default();
                         let estimated = estimate_token_count(&session.messages, None, None);
-                        if needs_compaction_by_tokens(estimated, &config) {
+                        if !stateless_session && needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
                             tokio::spawn(async move {
                                 info!(agent_id = %agent_id, estimated_tokens = estimated, "Post-loop compaction triggered");
@@ -1858,7 +2100,877 @@ impl OpenFangKernel {
         })
     }
 
-    /// Execute the default LLM-based agent loop.
+    async fn execute_world_engine_tool(
+        &self,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        let caller_agent_id = agent_id.to_string();
+        let allowed_tools = world_engine_execution_tools();
+        let tool_result = openfang_runtime::tool_runner::execute_tool(
+            tool_use_id,
+            tool_name,
+            &input,
+            None,
+            Some(&allowed_tools),
+            Some(&caller_agent_id),
+            None,
+            Some(&self.mcp_connections),
+            Some(&self.web_ctx),
+            Some(&self.browser_ctx),
+            None,
+            manifest.workspace.as_deref(),
+            Some(&self.media_engine),
+            None,
+            if self.config.tts.enabled {
+                Some(&self.tts_engine)
+            } else {
+                None
+            },
+            if self.config.docker.enabled {
+                Some(&self.config.docker)
+            } else {
+                None
+            },
+            Some(&self.process_manager),
+        )
+        .await;
+
+        if tool_result.is_error {
+            Err(tool_result.content)
+        } else {
+            Ok(tool_result.content)
+        }
+    }
+
+    async fn execute_world_engine_tool_json(
+        &self,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let content = self
+            .execute_world_engine_tool(agent_id, manifest, tool_use_id, tool_name, input)
+            .await?;
+        serde_json::from_str(&content).map_err(|e| {
+            format!(
+                "tool '{}' returned non-json content: {} ({e})",
+                tool_name, content
+            )
+        })
+    }
+
+    async fn execute_world_engine_turn_script(
+        &self,
+        entry: &AgentEntry,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+        message: &str,
+    ) -> KernelResult<bool> {
+        if entry.name != "world-engine" {
+            return Ok(false);
+        }
+
+        let intents = read_turn_script_intents(&self.config);
+        if intents.is_empty() {
+            return Ok(false);
+        }
+
+        let delivery_target = owner_delivery_target(message);
+        let interaction_mode = current_interaction_mode(&self.config);
+        let mut executed_any = false;
+        let mut narrative_fragments: Vec<String> = Vec::new();
+
+        for (index, intent) in intents.iter().enumerate() {
+            let Some(intent_type) = intent.get("type").and_then(|value| value.as_str()) else {
+                warn!(
+                    agent = %entry.name,
+                    agent_id = %agent_id,
+                    index,
+                    "World-engine encountered Turn Script item without type"
+                );
+                continue;
+            };
+
+            match intent_type {
+                "text" => {
+                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                        warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for text intent");
+                        continue;
+                    };
+                    let Some(raw_text) = intent.get("content").and_then(|value| value.as_str())
+                    else {
+                        continue;
+                    };
+                    let text = if interaction_mode == "remote" {
+                        strip_remote_stage_directions(raw_text)
+                    } else {
+                        raw_text.trim().to_string()
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    match self
+                        .execute_world_engine_tool(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_text_{index}"),
+                            "mcp_feishu_send_text_message",
+                            serde_json::json!({
+                                "receive_id": receive_id,
+                                "receive_id_type": receive_id_type,
+                                "text": text,
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(_) => executed_any = true,
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine text intent failed")
+                        }
+                    }
+                }
+                "voice" => {
+                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                        warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for voice intent");
+                        continue;
+                    };
+                    let params = intent.get("params").and_then(|value| value.as_object());
+                    let text = params
+                        .and_then(|params| params.get("content").or_else(|| params.get("text")))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    let inner_state = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_voice_state_{index}"),
+                            "mcp_toolbox_get_inner_state",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+
+                    let emotion = inner_state
+                        .as_ref()
+                        .and_then(|value| value.get("voice_hint"))
+                        .and_then(|value| value.get("emotion"))
+                        .and_then(|value| value.as_str());
+
+                    let speaker = manifest
+                        .metadata
+                        .get("voice")
+                        .and_then(|value| value.get("speaker"))
+                        .and_then(|value| value.as_str());
+
+                    let mut payload = serde_json::json!({
+                        "receive_id": receive_id,
+                        "receive_id_type": receive_id_type,
+                        "text": text,
+                    });
+                    if let Some(emotion) = emotion {
+                        payload["emotion"] = serde_json::Value::String(emotion.to_string());
+                    }
+                    if let Some(speaker) = speaker {
+                        payload["speaker"] = serde_json::Value::String(speaker.to_string());
+                    }
+
+                    match self
+                        .execute_world_engine_tool(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_voice_{index}"),
+                            "mcp_feishu_send_audio_message",
+                            payload,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            executed_any = true;
+                            narrative_fragments.push(format!("你给公子发了一条语音：{}", text));
+                        }
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine voice intent failed")
+                        }
+                    }
+                }
+                "memory" => {
+                    let content = intent
+                        .get("params")
+                        .and_then(|value| value.get("content"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if content.is_empty() {
+                        continue;
+                    }
+                    let memory_key = format!(
+                        "self.episode.{}",
+                        chrono::Utc::now().format("%Y%m%d%H%M%S%.3f")
+                    );
+                    let memory_value = serde_json::json!({
+                        "content": content,
+                        "created_at": chrono::Utc::now().to_rfc3339(),
+                        "source": "world_engine_turn_script",
+                    });
+                    match self.memory.structured_set(
+                        shared_memory_agent_id(),
+                        &memory_key,
+                        memory_value,
+                    ) {
+                        Ok(_) => executed_any = true,
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine memory intent failed")
+                        }
+                    }
+                }
+                "request_in_person" => {
+                    let _ = self
+                        .execute_world_engine_tool(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_mode_{index}"),
+                            "mcp_toolbox_set_interaction_mode",
+                            serde_json::json!({ "mode": "in_person" }),
+                        )
+                        .await;
+                    if let Some((receive_id, receive_id_type)) = delivery_target.clone() {
+                        let transition_text = "她放下了手边的事，走过来了。";
+                        match self
+                            .execute_world_engine_tool(
+                                agent_id,
+                                manifest,
+                                &format!("world_engine_transition_{index}"),
+                                "mcp_feishu_send_text_message",
+                                serde_json::json!({
+                                    "receive_id": receive_id,
+                                    "receive_id_type": receive_id_type,
+                                    "text": transition_text,
+                                }),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                executed_any = true;
+                                narrative_fragments.push("你放下了手边的事，去找公子了".to_string());
+                            }
+                            Err(error) => {
+                                warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine in-person transition failed")
+                            }
+                        }
+                    }
+                }
+                "wardrobe_change" => {
+                    let style = intent
+                        .get("params")
+                        .and_then(|value| value.get("style"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if style.is_empty() {
+                        continue;
+                    }
+                    match self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_wardrobe_list_{index}"),
+                            "mcp_toolbox_list_wardrobe",
+                            serde_json::json!({}),
+                        )
+                        .await
+                    {
+                        Ok(list) => {
+                            let selected = list
+                                .get("items")
+                                .and_then(|value| value.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter(|item| {
+                                    item.get("status").and_then(|value| value.as_str())
+                                        == Some("confirmed")
+                                })
+                                .find(|item| {
+                                    let name = item
+                                        .get("name")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("");
+                                    let tags = item.get("tags").and_then(|value| value.as_array());
+                                    name.contains(style)
+                                        || style.contains(name)
+                                        || tags
+                                            .into_iter()
+                                            .flatten()
+                                            .filter_map(|value| value.as_str())
+                                            .any(|tag| tag.contains(style) || style.contains(tag))
+                                })
+                                .cloned();
+
+                            if let Some(item) = selected {
+                                if let Some(item_id) =
+                                    item.get("item_id").and_then(|value| value.as_str())
+                                {
+                                    match self
+                                        .execute_world_engine_tool(
+                                            agent_id,
+                                            manifest,
+                                            &format!("world_engine_wear_{index}"),
+                                            "mcp_toolbox_wear",
+                                            serde_json::json!({ "item_id": item_id }),
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            executed_any = true;
+                                            let worn_name = item
+                                                .get("name")
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or(style);
+                                            narrative_fragments
+                                                .push(format!("你换上了{}", worn_name));
+                                        }
+                                        Err(error) => {
+                                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine wardrobe change failed")
+                                        }
+                                    }
+                                }
+                            } else {
+                                warn!(agent = %entry.name, agent_id = %agent_id, index, style, "World-engine could not match wardrobe style to a confirmed item");
+                            }
+                        }
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine wardrobe listing failed")
+                        }
+                    }
+                }
+                "wardrobe_add" => {
+                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                        warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for wardrobe_add intent");
+                        continue;
+                    };
+                    let params = intent.get("params").and_then(|value| value.as_object());
+                    let name = params
+                        .and_then(|p| p.get("name"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    let outfit_prompt = params
+                        .and_then(|p| p.get("outfit_prompt"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if name.is_empty() || outfit_prompt.is_empty() {
+                        continue;
+                    }
+                    let tags = params
+                        .and_then(|p| p.get("tags"))
+                        .and_then(|value| value.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let mut add_input = serde_json::json!({
+                        "name": name,
+                        "outfit_prompt": outfit_prompt,
+                    });
+                    if !tags.is_empty() {
+                        add_input["tags"] = serde_json::Value::Array(tags);
+                    }
+
+                    let async_request = kernel_handle::AsyncMediaRequest {
+                        caller_agent_id: agent_id.to_string(),
+                        tool_name: "mcp_toolbox_add_to_wardrobe".to_string(),
+                        tool_input: add_input,
+                        receive_id,
+                        receive_id_type,
+                        result_path_key: "preview_path".to_string(),
+                        send_tool_name: "mcp_feishu_send_image_message".to_string(),
+                        send_path_key: "image_path".to_string(),
+                        file_name: None,
+                        failure_notice: "我刚才已经在试这件了，但定妆照这一下没出成。你先别等空，我现在重新拍一版，拍好就发你看。".to_string(),
+                        archive: None,
+                    };
+
+                    let payload = match serde_json::to_string(&async_request) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine failed to serialize wardrobe_add task");
+                            continue;
+                        }
+                    };
+                    let created_by = agent_id.to_string();
+                    match self
+                        .memory
+                        .task_post(
+                            ASYNC_MEDIA_TASK_TITLE,
+                            &payload,
+                            Some(ASYNC_MEDIA_WORKER_ID),
+                            Some(&created_by),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            executed_any = true;
+                            narrative_fragments.push(format!(
+                                "你在试穿{}，定妆照拍好了会发给公子看",
+                                name
+                            ));
+                        }
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine failed to enqueue wardrobe_add");
+                        }
+                    }
+                }
+                "wardrobe_confirm" => {
+                    let item_id = intent
+                        .get("params")
+                        .and_then(|value| value.get("item_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if item_id.is_empty() {
+                        continue;
+                    }
+                    match self
+                        .execute_world_engine_tool(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_wardrobe_confirm_{index}"),
+                            "mcp_toolbox_confirm_wardrobe_item",
+                            serde_json::json!({ "item_id": item_id }),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            executed_any = true;
+                            narrative_fragments.push("这件衣服正式收进衣橱了".to_string());
+                        }
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine wardrobe confirm failed")
+                        }
+                    }
+                }
+                "selfie_video" | "scene_video" => {
+                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                        warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for video intent");
+                        continue;
+                    };
+                    let params = intent.get("params").and_then(|value| value.as_object());
+                    let description = params
+                        .and_then(|params| params.get("description"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if description.is_empty() {
+                        continue;
+                    }
+
+                    let life = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_video_life_{index}"),
+                            "mcp_toolbox_get_life_status",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+                    let inner = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_video_inner_{index}"),
+                            "mcp_toolbox_get_inner_state",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+                    let outfit = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_video_outfit_{index}"),
+                            "mcp_toolbox_get_current_outfit",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+                    let avatar = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_video_avatar_{index}"),
+                            "mcp_toolbox_get_avatar",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+
+                    let location = life
+                        .as_ref()
+                        .and_then(|value| value.pointer("/current_activity/location"))
+                        .or_else(|| life.as_ref().and_then(|value| value.get("location")))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("她此刻所在的地方");
+                    let activity = life
+                        .as_ref()
+                        .and_then(|value| value.pointer("/current_activity/activity"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("手头的事");
+                    let selfie_hint = inner
+                        .as_ref()
+                        .and_then(|value| value.get("selfie_hint"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("克制里带一点松弛，真实手机拍摄");
+                    let outward_style = inner
+                        .as_ref()
+                        .and_then(|value| value.get("outward_style"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("自然、真实、生活里的一瞬");
+
+                    let element_id = outfit
+                        .as_ref()
+                        .and_then(|value| value.get("element_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+
+                    let mut prompt = if intent_type == "selfie_video" {
+                        format!(
+                            "真实手机自拍视频，写实生活现场。地点在{}，她刚刚在{}。视频要表达：{}。镜头气质：{}。外在状态：{}。",
+                            location, activity, description, selfie_hint, outward_style
+                        )
+                    } else {
+                        format!(
+                            "真实生活抓拍视频，写实影像，像男友第一视角或共享现场。地点在{}，她刚刚在{}。这一幕正在发生：{}。镜头气质：{}。外在状态：{}。",
+                            location, activity, description, selfie_hint, outward_style
+                        )
+                    };
+                    if element_id.is_some() {
+                        prompt = format!("人物保持为<<<element_1>>>。{}", prompt);
+                    }
+
+                    let mut payload = serde_json::json!({
+                        "prompt": prompt,
+                        "aspect_ratio": preferred_video_aspect_ratio(description),
+                        "duration": preferred_video_duration(description),
+                        "sound": "on",
+                    });
+
+                    if let Some(element_id) = element_id {
+                        payload["element_list"] = serde_json::json!([
+                            { "element_id": element_id }
+                        ]);
+                    } else {
+                        let mut input_images: Vec<String> = Vec::new();
+                        if let Some(base_path) = outfit
+                            .as_ref()
+                            .and_then(|value| value.get("base_path"))
+                            .and_then(|value| value.as_str())
+                        {
+                            input_images.push(base_path.to_string());
+                        } else if let Some(avatar_path) = avatar
+                            .as_ref()
+                            .and_then(|value| value.get("path"))
+                            .and_then(|value| value.as_str())
+                        {
+                            input_images.push(avatar_path.to_string());
+                        }
+                        if !input_images.is_empty() {
+                            payload["input_images"] = serde_json::json!(input_images);
+                            payload["reference_mode"] =
+                                serde_json::Value::String("reference".to_string());
+                        }
+                    }
+
+                    let async_request = kernel_handle::AsyncMediaRequest {
+                        caller_agent_id: agent_id.to_string(),
+                        tool_name: "mcp_toolbox_generate_video".to_string(),
+                        tool_input: payload,
+                        receive_id,
+                        receive_id_type,
+                        result_path_key: "video_path".to_string(),
+                        send_tool_name: "mcp_feishu_send_video_message".to_string(),
+                        send_path_key: "video_path".to_string(),
+                        file_name: Some(if intent_type == "selfie_video" { "宋玉-自拍视频.mp4" } else { "这一幕.mp4" }.to_string()),
+                        failure_notice: if intent_type == "selfie_video" {
+                            "我刚才已经在给你录了，但这一条没顺利出来。你先别空等，我现在重新录一版，录好了就立刻给你。".to_string()
+                        } else {
+                            "刚才想留住这一幕，但没出来。再试一次。".to_string()
+                        },
+                        archive: Some(kernel_handle::AsyncMediaArchiveRequest {
+                            media_type: "video".to_string(),
+                            prompt: prompt.clone(),
+                            scene: description.to_string(),
+                        }),
+                    };
+
+                    let payload = match serde_json::to_string(&async_request) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine failed to serialize selfie video task");
+                            continue;
+                        }
+                    };
+                    let created_by = agent_id.to_string();
+                    match self
+                        .memory
+                        .task_post(
+                            ASYNC_MEDIA_TASK_TITLE,
+                            &payload,
+                            Some(ASYNC_MEDIA_WORKER_ID),
+                            Some(&created_by),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            executed_any = true;
+                            if intent_type == "selfie_video" {
+                                narrative_fragments.push(format!(
+                                    "你录了一段自拍视频，准备发给公子：{}",
+                                    description
+                                ));
+                            } else {
+                                narrative_fragments.push(format!(
+                                    "你们在一起的这一幕被留住了：{}",
+                                    description
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine failed to enqueue selfie video");
+                        }
+                    }
+                }
+                "selfie" | "visual_moment" => {
+                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                        warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for image intent");
+                        continue;
+                    };
+                    let params = intent.get("params").and_then(|value| value.as_object());
+                    let description = params
+                        .and_then(|params| params.get("description"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if description.is_empty() {
+                        continue;
+                    }
+                    let expression = params
+                        .and_then(|params| params.get("expression"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+
+                    let life = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_life_{index}"),
+                            "mcp_toolbox_get_life_status",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+                    let inner = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_inner_{index}"),
+                            "mcp_toolbox_get_inner_state",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+                    let outfit = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_outfit_{index}"),
+                            "mcp_toolbox_get_current_outfit",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+                    let avatar = self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_avatar_{index}"),
+                            "mcp_toolbox_get_avatar",
+                            serde_json::json!({}),
+                        )
+                        .await
+                        .ok();
+
+                    let location = life
+                        .as_ref()
+                        .and_then(|value| value.pointer("/current_activity/location"))
+                        .or_else(|| life.as_ref().and_then(|value| value.get("location")))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("她此刻所在的地方");
+                    let activity = life
+                        .as_ref()
+                        .and_then(|value| value.pointer("/current_activity/activity"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("手头的事");
+                    let selfie_hint = inner
+                        .as_ref()
+                        .and_then(|value| value.get("selfie_hint"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("克制里带一点松弛，真实手机拍摄");
+                    let outward_style = inner
+                        .as_ref()
+                        .and_then(|value| value.get("outward_style"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("自然、真实、生活里的一瞬");
+
+                    let mut prompt = if intent_type == "selfie" {
+                        format!(
+                            "真实手机自拍，写实摄影，生活现场。地点在{}，她刚刚在{}。画面要求：{}。镜头气质：{}。外在状态：{}。",
+                            location, activity, description, selfie_hint, outward_style
+                        )
+                    } else {
+                        format!(
+                            "真实生活抓拍，写实摄影，像男友第一视角或共享现场。地点在{}，她刚刚在{}。画面要求：{}。镜头气质：{}。外在状态：{}。",
+                            location, activity, description, selfie_hint, outward_style
+                        )
+                    };
+                    if let Some(expression) = expression {
+                        prompt.push_str(&format!(" 表情与视线：{}。", expression));
+                    }
+
+                    let mut input_images: Vec<String> = Vec::new();
+                    if let Some(base_path) = outfit
+                        .as_ref()
+                        .and_then(|value| value.get("base_path"))
+                        .and_then(|value| value.as_str())
+                    {
+                        input_images.push(base_path.to_string());
+                    } else if let Some(avatar_path) = avatar
+                        .as_ref()
+                        .and_then(|value| value.get("path"))
+                        .and_then(|value| value.as_str())
+                    {
+                        input_images.push(avatar_path.to_string());
+                    }
+
+                    match self
+                        .execute_world_engine_tool_json(
+                            agent_id,
+                            manifest,
+                            &format!("world_engine_image_{index}"),
+                            "mcp_toolbox_generate_image",
+                            serde_json::json!({
+                                "prompt": prompt,
+                                "input_images": input_images,
+                                "size": preferred_image_size(description),
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(image) => {
+                            if let Some(image_path) =
+                                image.get("image_path").and_then(|value| value.as_str())
+                            {
+                                match self
+                                    .execute_world_engine_tool(
+                                        agent_id,
+                                        manifest,
+                                        &format!("world_engine_send_image_{index}"),
+                                        "mcp_feishu_send_image_message",
+                                        serde_json::json!({
+                                            "receive_id": receive_id,
+                                            "receive_id_type": receive_id_type,
+                                            "image_path": image_path,
+                                        }),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        executed_any = true;
+                                        if intent_type == "selfie" {
+                                            let _ = self
+                                                .execute_world_engine_tool(
+                                                    agent_id,
+                                                    manifest,
+                                                    &format!("world_engine_save_selfie_{index}"),
+                                                    "mcp_toolbox_save_selfie",
+                                                    serde_json::json!({
+                                                        "type": "photo",
+                                                        "source_path": image_path,
+                                                        "prompt": prompt,
+                                                        "scene": description,
+                                                    }),
+                                                )
+                                                .await;
+                                            narrative_fragments.push(format!(
+                                                "你拍了一张自拍发给了公子：{}",
+                                                description
+                                            ));
+                                        } else {
+                                            narrative_fragments.push(format!(
+                                                "你让公子看见了此刻的画面：{}",
+                                                description
+                                            ));
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine image delivery failed")
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine image generation failed")
+                        }
+                    }
+                }
+                other => {
+                    warn!(
+                        agent = %entry.name,
+                        agent_id = %agent_id,
+                        index,
+                        intent_type = other,
+                        "World-engine encountered unsupported Turn Script intent"
+                    );
+                }
+            }
+        }
+
+        if !narrative_fragments.is_empty() {
+            let narrative = narrative_fragments.join("，");
+            if let Err(error) = store_last_turn_narrative(&self.config, &narrative) {
+                warn!(
+                    agent = %entry.name,
+                    agent_id = %agent_id,
+                    %error,
+                    "World-engine failed to store last turn narrative"
+                );
+            }
+        }
+
+        if let Err(error) = write_turn_script_intents(&self.config, &[]) {
+            warn!(
+                agent = %entry.name,
+                agent_id = %agent_id,
+                %error,
+                "World-engine failed to clear Turn Script after deterministic execution"
+            );
+        }
+
+        Ok(executed_any)
+    }
+
     async fn execute_llm_agent(
         &self,
         entry: &AgentEntry,
@@ -1872,17 +2984,15 @@ impl OpenFangKernel {
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
 
-        let mut session = self
-            .memory
-            .get_session(entry.session_id)
-            .map_err(KernelError::OpenFang)?
-            .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
-                agent_id,
-                messages: Vec::new(),
-                context_window_tokens: 0,
-                label: None,
-            });
+        let stateless_session = stateless_orchestrator(&entry.manifest);
+        let mut session = if stateless_session {
+            fresh_agent_session(agent_id, entry.session_id)
+        } else {
+            self.memory
+                .get_session(entry.session_id)
+                .map_err(KernelError::OpenFang)?
+                .unwrap_or_else(|| fresh_agent_session(agent_id, entry.session_id))
+        };
 
         let messages_before = session.messages.len();
 
@@ -1955,11 +3065,14 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "MEMORY.md")),
-                canonical_context: self
-                    .memory
-                    .canonical_context(agent_id, None)
-                    .ok()
-                    .and_then(|(s, _)| s),
+                canonical_context: if stateless_session {
+                    None
+                } else {
+                    self.memory
+                        .canonical_context(agent_id, None)
+                        .ok()
+                        .and_then(|(s, _)| s)
+                },
                 user_name,
                 channel_type: None,
                 is_subagent: manifest
@@ -2068,7 +3181,7 @@ impl OpenFangKernel {
             message.to_string()
         };
 
-        let result = run_agent_loop(
+        let mut result = run_agent_loop(
             &manifest,
             &message_with_links,
             &mut session,
@@ -2102,8 +3215,19 @@ impl OpenFangKernel {
         .await
         .map_err(KernelError::OpenFang)?;
 
+        // World Engine is an orchestrator, not a user-facing agent.
+        // Its response must NEVER reach the user — the Turn Script executor
+        // handles all delivery.  Clear unconditionally to prevent any LLM
+        // output from leaking through the Gateway.
+        if entry.name == "world-engine" {
+            let _ = self
+                .execute_world_engine_turn_script(entry, agent_id, &manifest, message)
+                .await;
+            result.response.clear();
+        }
+
         // Append new messages to canonical session for cross-channel memory
-        if session.messages.len() > messages_before {
+        if !stateless_session && session.messages.len() > messages_before {
             let new_messages = session.messages[messages_before..].to_vec();
             if let Err(e) = self.memory.append_canonical(agent_id, &new_messages, None) {
                 warn!("Failed to update canonical session: {e}");
@@ -2339,7 +3463,11 @@ impl OpenFangKernel {
                 .take(5)
                 .enumerate()
                 .map(|(i, t)| {
-                    let truncated = if t.len() > 200 { &t[..200] } else { t };
+                    let truncated = if t.chars().count() > 200 {
+                        truncate_chars(t, 200)
+                    } else {
+                        t
+                    };
                     format!("{}. {}", i + 1, truncated)
                 })
                 .collect::<Vec<_>>()
@@ -3462,6 +4590,23 @@ impl OpenFangKernel {
         Arc::clone(self)
     }
 
+    fn mcp_extra_env(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([
+            (
+                "OPENFANG_HOME".to_string(),
+                self.config.home_dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "OPENFANG_STATE_ROOT".to_string(),
+                self.config
+                    .home_dir
+                    .join("agents")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ])
+    }
+
     async fn connect_dedicated_mcp(
         &self,
         server_name: &str,
@@ -3488,6 +4633,7 @@ impl OpenFangKernel {
             transport,
             timeout_secs: server.timeout_secs,
             env: server.env,
+            extra_env: self.mcp_extra_env(),
         })
         .await
     }
@@ -3669,8 +4815,9 @@ impl OpenFangKernel {
                         continue;
                     }
                 };
-                let request: kernel_handle::AsyncMediaRequest = match serde_json::from_str(description)
-                {
+                let request: kernel_handle::AsyncMediaRequest = match serde_json::from_str(
+                    description,
+                ) {
                     Ok(request) => request,
                     Err(error) => {
                         let error = format!("Invalid task payload: {error}");
@@ -3712,7 +4859,8 @@ impl OpenFangKernel {
                         attempts,
                     } => {
                         warn!(task_id = %task_id, %error, "Async media task failed");
-                        if let Err(notify_error) = kernel.notify_async_media_failure(&request).await {
+                        if let Err(notify_error) = kernel.notify_async_media_failure(&request).await
+                        {
                             warn!(task_id = %task_id, %notify_error, "Async media worker failed to send failure notice");
                         }
                         if let Err(complete_error) = kernel
@@ -3988,6 +5136,7 @@ impl OpenFangKernel {
                 transport,
                 timeout_secs: server_config.timeout_secs,
                 env: server_config.env.clone(),
+                extra_env: self.mcp_extra_env(),
             };
 
             match McpConnection::connect(mcp_config).await {
@@ -4096,6 +5245,7 @@ impl OpenFangKernel {
                 transport,
                 timeout_secs: server_config.timeout_secs,
                 env: server_config.env.clone(),
+                extra_env: self.mcp_extra_env(),
             };
 
             self.extension_health.register(&server_config.name);
@@ -4214,6 +5364,7 @@ impl OpenFangKernel {
             transport,
             timeout_secs: server_config.timeout_secs,
             env: server_config.env.clone(),
+            extra_env: self.mcp_extra_env(),
         };
 
         match McpConnection::connect(mcp_config).await {
@@ -5575,7 +6726,9 @@ tools = ["file_read"]
         assert!(is_retryable_async_media_error(
             "JSON-RPC error -32000: fetch failed"
         ));
-        assert!(is_retryable_async_media_error("HTTP status 503 from upstream"));
+        assert!(is_retryable_async_media_error(
+            "HTTP status 503 from upstream"
+        ));
     }
 
     #[test]

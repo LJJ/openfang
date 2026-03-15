@@ -893,10 +893,10 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             msg.push_str(&format!("  {} — {}\n", card.name, url));
             let desc = &card.description;
             if !desc.is_empty() {
-                let short = if desc.len() > 60 {
-                    &desc[..60]
+                let short = if desc.chars().count() > 60 {
+                    desc.chars().take(60).collect::<String>()
                 } else {
-                    desc.as_str()
+                    desc.clone()
                 };
                 msg.push_str(&format!("    {short}\n"));
             }

@@ -8,7 +8,7 @@
 
 use openfang_types::tool::ToolDefinition;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info};
@@ -30,6 +30,9 @@ pub struct McpServerConfig {
     /// Environment variables to pass through to the subprocess (sandboxed).
     #[serde(default)]
     pub env: Vec<String>,
+    /// Explicit environment values injected into the subprocess.
+    #[serde(default)]
+    pub extra_env: BTreeMap<String, String>,
 }
 
 fn default_timeout() -> u64 {
@@ -39,6 +42,8 @@ fn default_timeout() -> u64 {
 const MCP_DEFAULT_ENV_PASSTHROUGH: &[&str] = &[
     "PATH",
     "HOME",
+    "OPENFANG_HOME",
+    "OPENFANG_STATE_ROOT",
     "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME",
     "XDG_DATA_HOME",
@@ -135,7 +140,7 @@ impl McpConnection {
     pub async fn connect(config: McpServerConfig) -> Result<Self, String> {
         let transport = match &config.transport {
             McpTransport::Stdio { command, args } => {
-                Self::connect_stdio(command, args, &config.env).await?
+                Self::connect_stdio(command, args, &config.env, &config.extra_env).await?
             }
             McpTransport::Sse { url } => {
                 // SSRF check: reject private/localhost URLs unless explicitly configured
@@ -399,6 +404,7 @@ impl McpConnection {
         command: &str,
         args: &[String],
         env_whitelist: &[String],
+        extra_env: &BTreeMap<String, String>,
     ) -> Result<McpTransportHandle, String> {
         // Validate command path (no path traversal)
         if command.contains("..") {
@@ -414,6 +420,9 @@ impl McpConnection {
         // Sandbox: clear environment, only pass whitelisted vars
         cmd.env_clear();
         for (var_name, value) in collect_stdio_env(env_whitelist) {
+            cmd.env(var_name, value);
+        }
+        for (var_name, value) in extra_env {
             cmd.env(var_name, value);
         }
 
@@ -616,6 +625,7 @@ mod tests {
             },
             timeout_secs: 30,
             env: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
+            extra_env: BTreeMap::new(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -640,6 +650,7 @@ mod tests {
             },
             timeout_secs: 60,
             env: vec![],
+            extra_env: BTreeMap::new(),
         };
         let json = serde_json::to_string(&sse_config).unwrap();
         let back: McpServerConfig = serde_json::from_str(&json).unwrap();
@@ -677,5 +688,23 @@ mod tests {
         let home_count = envs.iter().filter(|(name, _)| name == "HOME").count();
 
         assert_eq!(home_count, 1);
+    }
+
+    #[test]
+    fn test_collect_stdio_env_includes_openfang_roots_when_present() {
+        std::env::set_var("OPENFANG_HOME", "/tmp/.openfang");
+        std::env::set_var("OPENFANG_STATE_ROOT", "/tmp/.openfang/agents");
+
+        let envs = collect_stdio_env(&[]);
+        let env_map: BTreeMap<_, _> = envs.into_iter().collect();
+
+        assert_eq!(
+            env_map.get("OPENFANG_HOME").map(String::as_str),
+            Some("/tmp/.openfang")
+        );
+        assert_eq!(
+            env_map.get("OPENFANG_STATE_ROOT").map(String::as_str),
+            Some("/tmp/.openfang/agents")
+        );
     }
 }

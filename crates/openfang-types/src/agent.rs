@@ -369,6 +369,15 @@ pub enum AgentClass {
     Utility,
     /// Persistent persona/roleplay agent backed by its on-disk template.
     Roleplay,
+    /// Stateless orchestrator backed by its on-disk template (e.g. world-engine).
+    Orchestrator,
+}
+
+impl AgentClass {
+    /// Whether this class requires an on-disk template and should be reconciled on startup.
+    pub fn is_template_backed(self) -> bool {
+        matches!(self, AgentClass::Roleplay | AgentClass::Orchestrator)
+    }
 }
 
 /// LLM model configuration for an agent.
@@ -1163,5 +1172,13 @@ mod tests {
         let json = r#"{"name":"songyu","agent_class":"roleplay"}"#;
         let manifest: AgentManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.agent_class, AgentClass::Roleplay);
+    }
+
+    #[test]
+    fn test_manifest_agent_class_orchestrator_serde() {
+        let json = r#"{"name":"world-engine","agent_class":"orchestrator"}"#;
+        let manifest: AgentManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.agent_class, AgentClass::Orchestrator);
+        assert!(manifest.agent_class.is_template_backed());
     }
 }

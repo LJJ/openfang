@@ -4,7 +4,7 @@
 //! complete a complex task, but that same raw execution trace should not be
 //! carried into future turns as durable dialogue context.
 
-use openfang_types::message::{ContentBlock, Message, MessageContent};
+use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 
 /// High-level message lanes used by the projection layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +21,46 @@ pub enum MessageLane {
     Reasoning,
     /// Empty / unknown payload after projection.
     Empty,
+}
+
+fn is_internal_trace_text(role: Role, text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let exact_tokens = ["no_reply", "[no reply needed]", "ok. no_reply"];
+    if role == Role::Assistant && exact_tokens.iter().any(|token| lower == *token) {
+        return true;
+    }
+
+    let assistant_prefixes = [
+        "[task completed",
+        "[the model returned an empty response",
+        "[no response]",
+        "看起来 turn script 文件路径不对",
+        "让我尝试读取环境变量来获取正确的路径",
+        "既然 `pending.json` 为空",
+        "根据职责 a 第 8 条",
+        "因此，我将输出 no_reply",
+        "给公子回了消息",
+        "给他回了消息",
+        "给公子发了消息",
+    ];
+
+    let user_prefixes = ["[system] please output your turn script directly"];
+
+    match role {
+        Role::Assistant => {
+            assistant_prefixes
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+                || (lower.starts_with("拍了张") && (lower.contains("发给公子") || lower.contains("发给他")))
+        }
+        Role::User => user_prefixes.iter().any(|prefix| lower.starts_with(prefix)),
+        Role::System => true,
+    }
 }
 
 /// Classify a message by the kinds of blocks it contains.
@@ -63,10 +103,10 @@ pub fn classify_message_lane(message: &Message) -> MessageLane {
     }
 }
 
-fn strip_execution_blocks(content: &MessageContent) -> Option<MessageContent> {
+fn strip_execution_blocks(role: Role, content: &MessageContent) -> Option<MessageContent> {
     match content {
         MessageContent::Text(text) => {
-            if text.is_empty() {
+            if is_internal_trace_text(role, text) {
                 None
             } else {
                 Some(MessageContent::Text(text.clone()))
@@ -76,7 +116,13 @@ fn strip_execution_blocks(content: &MessageContent) -> Option<MessageContent> {
             let kept: Vec<ContentBlock> = blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(ContentBlock::Text { text: text.clone() }),
+                    ContentBlock::Text { text } => {
+                        if is_internal_trace_text(role, text) {
+                            None
+                        } else {
+                            Some(ContentBlock::Text { text: text.clone() })
+                        }
+                    }
                     ContentBlock::Unknown => Some(ContentBlock::Unknown),
                     ContentBlock::Image { .. } => None,
                     ContentBlock::ToolUse { .. }
@@ -99,7 +145,7 @@ pub fn project_for_persistent_dialogue(messages: &[Message]) -> Vec<Message> {
     messages
         .iter()
         .filter_map(|msg| {
-            strip_execution_blocks(&msg.content).map(|content| Message {
+            strip_execution_blocks(msg.role, &msg.content).map(|content| Message {
                 role: msg.role,
                 content,
             })
@@ -172,5 +218,20 @@ mod tests {
 
         let projected = project_for_persistent_dialogue(&messages);
         assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn project_for_persistent_dialogue_drops_internal_trace_text() {
+        let messages = vec![
+            Message::assistant("OK. NO_REPLY"),
+            Message::assistant("给公子回了消息，问他怎么了。"),
+            Message::user("拍了张照片给你看"),
+            Message::assistant("正常回复"),
+        ];
+
+        let projected = project_for_persistent_dialogue(&messages);
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0].content.text_content(), "拍了张照片给你看");
+        assert_eq!(projected[1].content.text_content(), "正常回复");
     }
 }

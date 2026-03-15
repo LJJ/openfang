@@ -150,6 +150,62 @@ fn parse_feishu_delivery_target(message: &str) -> Option<FeishuDeliveryTarget> {
     })
 }
 
+fn manifest_silent_after_tools(manifest: &AgentManifest) -> HashSet<String> {
+    manifest
+        .metadata
+        .get("turn_behavior")
+        .and_then(|value| value.get("silent_after_tools"))
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+/// When a tool-only agent (configured with `silent_after_tools`) produces text
+/// without calling any tools, auto-append the text into the Turn Script as a
+/// `text` intent.  This enforces "delivery is a code concern" — the kernel's
+/// Turn Script executor will pick it up and send it to the user regardless of
+/// whether the LLM remembered to call the `reply` tool.
+fn auto_wrap_text_to_turn_script(text: &str) -> Result<(), String> {
+    let state_agent = std::env::var("OPENFANG_STATE_AGENT")
+        .unwrap_or_else(|_| "assistant".to_string());
+    let home_dir = std::env::var("OPENFANG_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ljj".to_string());
+        format!("{home}/.openfang")
+    });
+    let pending_path = std::path::PathBuf::from(&home_dir)
+        .join("agents")
+        .join(&state_agent)
+        .join("intents")
+        .join("pending.json");
+
+    let mut intents: Vec<serde_json::Value> = if pending_path.exists() {
+        std::fs::read_to_string(&pending_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    intents.push(serde_json::json!({
+        "type": "text",
+        "content": text,
+    }));
+
+    if let Some(parent) = pending_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create intents dir: {e}"))?;
+    }
+    std::fs::write(
+        &pending_path,
+        serde_json::to_string_pretty(&intents)
+            .map_err(|e| format!("serialize: {e}"))?,
+    )
+    .map_err(|e| format!("write pending.json: {e}"))
+}
+
 fn compact_session_execution_trace(session: &mut Session) {
     let compacted = crate::session_projection::project_for_persistent_dialogue(&session.messages);
     session.messages = crate::session_repair::validate_and_repair(&compacted);
@@ -270,6 +326,56 @@ fn extract_side_channel_text(tool_calls: &[ToolCall]) -> String {
         }
     }
     parts.join("\n")
+}
+
+fn persistent_turn_placeholder(tool_calls: &[ToolCall]) -> String {
+    let mut parts = Vec::new();
+
+    for tc in tool_calls {
+        match tc.name.as_str() {
+            "mcp_toolbox_reply" => {
+                if let Some(text) = tc.input.get("content").and_then(|v| v.as_str()) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            "mcp_toolbox_send_voice" => {
+                if let Some(text) = tc.input.get("content").and_then(|v| v.as_str()) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        parts.push(format!("[语音回复] {text}"));
+                    }
+                }
+            }
+            "mcp_toolbox_take_photo" => {
+                parts.push("[发来一张照片]".to_string());
+            }
+            "mcp_toolbox_take_video" => {
+                parts.push("[发来一段视频]".to_string());
+            }
+            "mcp_toolbox_this_moment" => {
+                parts.push("[分享了眼前的画面]".to_string());
+            }
+            "mcp_toolbox_change_clothes" => {
+                parts.push("[你换了身衣服]".to_string());
+            }
+            "mcp_toolbox_go_find_him" => {
+                parts.push("[你走过来了]".to_string());
+            }
+            "mcp_toolbox_remember" => {
+                parts.push("[你把这件事记下了]".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if parts.is_empty() {
+        "[进行了非文字互动]".to_string()
+    } else {
+        parts.join("\n")
+    }
 }
 
 fn contains_any(text: &str, patterns: &[&str]) -> bool {
@@ -1223,6 +1329,40 @@ pub async fn run_agent_loop(
                     });
                 }
 
+                // Auto-wrap: tool-only agent produced text without calling any
+                // tool → write the text into Turn Script so the kernel delivers
+                // it.  This makes message delivery a code guarantee, not an LLM
+                // best-effort.
+                {
+                    let silent_after = manifest_silent_after_tools(manifest);
+                    if !silent_after.is_empty()
+                        && !text.trim().is_empty()
+                        && response.tool_calls.is_empty()
+                    {
+                        warn!(
+                            agent = %manifest.name,
+                            "Tool-only agent produced text without tool calls — auto-wrapping into Turn Script"
+                        );
+                        if let Err(e) = auto_wrap_text_to_turn_script(&text) {
+                            warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script");
+                        }
+                        session.messages.push(Message::assistant(text));
+                        save_projected_session(memory, session)?;
+                        return Ok(AgentLoopResult {
+                            response: String::new(),
+                            total_usage,
+                            iterations: iteration + 1,
+                            cost_usd: None,
+                            silent: true,
+                            directives: openfang_types::message::ReplyDirectives {
+                                reply_to: parsed_directives.reply_to,
+                                current_thread: parsed_directives.current_thread,
+                                silent: true,
+                            },
+                        });
+                    }
+                }
+
                 // One-shot retry: if the very first LLM call returns empty text
                 // with no tool use, try once more before accepting the empty result.
                 // This catches transient LLM hiccups (overload, empty stream, etc.).
@@ -1528,10 +1668,26 @@ pub async fn run_agent_loop(
                     }
                 }
 
+                let had_tool_errors = tool_result_blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+                });
+                let silent_after_tools = manifest_silent_after_tools(manifest);
+                let should_silent_after_tools = !silent_after_tools.is_empty()
+                    && !had_tool_errors
+                    && successful_tools_this_turn
+                        .iter()
+                        .any(|tool_name| silent_after_tools.contains(tool_name));
+
                 // If a tool already delivered the response (e.g. voice message via MCP),
-                // exit silently — no need for another LLM round just to produce text.
-                if response_already_delivered {
-                    debug!(agent = %manifest.name, "Tool delivered response via side-channel — silent exit");
+                // or this agent is configured to finish immediately after successful
+                // tool execution, exit silently — no need for another LLM round.
+                if response_already_delivered || should_silent_after_tools {
+                    let reason = if response_already_delivered {
+                        "response delivered via side-channel"
+                    } else {
+                        "configured silent-after-tools"
+                    };
+                    debug!(agent = %manifest.name, reason, "Ending turn silently after tool execution");
                     // Still save the tool results to session for context continuity
                     let tool_results_msg = Message {
                         role: Role::User,
@@ -1539,13 +1695,17 @@ pub async fn run_agent_loop(
                     };
                     session.messages.push(tool_results_msg);
 
-                    // Extract the spoken/delivered text from side-channel tool inputs
-                    // so it persists in history after session projection strips tool blocks.
-                    let delivered_text = extract_side_channel_text(&response.tool_calls);
-                    let placeholder = if delivered_text.is_empty() {
-                        "[response delivered via voice/media]".to_string()
+                    let placeholder = if response_already_delivered {
+                        // Extract the spoken/delivered text from side-channel tool inputs
+                        // so it persists in history after session projection strips tool blocks.
+                        let delivered_text = extract_side_channel_text(&response.tool_calls);
+                        if delivered_text.is_empty() {
+                            persistent_turn_placeholder(&response.tool_calls)
+                        } else {
+                            format!("[语音回复] {delivered_text}")
+                        }
                     } else {
-                        format!("[语音回复] {delivered_text}")
+                        persistent_turn_placeholder(&response.tool_calls)
                     };
                     session.messages.push(Message::assistant(placeholder));
                     save_projected_session(memory, session)?;
@@ -2197,6 +2357,37 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
 
+                // Auto-wrap (streaming): same logic as non-streaming path.
+                {
+                    let silent_after = manifest_silent_after_tools(manifest);
+                    if !silent_after.is_empty()
+                        && !text.trim().is_empty()
+                        && response.tool_calls.is_empty()
+                    {
+                        warn!(
+                            agent = %manifest.name,
+                            "Tool-only agent produced text without tool calls (streaming) — auto-wrapping into Turn Script"
+                        );
+                        if let Err(e) = auto_wrap_text_to_turn_script(&text) {
+                            warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script (streaming)");
+                        }
+                        session.messages.push(Message::assistant(text));
+                        save_projected_session(memory, session)?;
+                        return Ok(AgentLoopResult {
+                            response: String::new(),
+                            total_usage,
+                            iterations: iteration + 1,
+                            cost_usd: None,
+                            silent: true,
+                            directives: openfang_types::message::ReplyDirectives {
+                                reply_to: parsed_directives_s.reply_to,
+                                current_thread: parsed_directives_s.current_thread,
+                                silent: true,
+                            },
+                        });
+                    }
+                }
+
                 // One-shot retry: if the very first LLM call returns empty text
                 // with no tool use, try once more before accepting the empty result.
                 if text.trim().is_empty() && iteration == 0 && response.tool_calls.is_empty() {
@@ -2543,23 +2734,43 @@ pub async fn run_agent_loop_streaming(
                     }
                 }
 
+                let had_tool_errors = tool_result_blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+                });
+                let silent_after_tools = manifest_silent_after_tools(manifest);
+                let should_silent_after_tools = !silent_after_tools.is_empty()
+                    && !had_tool_errors
+                    && successful_tools_this_turn
+                        .iter()
+                        .any(|tool_name| silent_after_tools.contains(tool_name));
+
                 // If a tool already delivered the response (e.g. voice message via MCP),
-                // exit silently — no need for another LLM round just to produce text.
-                if response_already_delivered {
-                    debug!(agent = %manifest.name, "Tool delivered response via side-channel — silent exit (streaming)");
+                // or this agent is configured to finish immediately after successful
+                // tool execution, exit silently — no need for another LLM round.
+                if response_already_delivered || should_silent_after_tools {
+                    let reason = if response_already_delivered {
+                        "response delivered via side-channel"
+                    } else {
+                        "configured silent-after-tools"
+                    };
+                    debug!(agent = %manifest.name, reason, "Ending turn silently after tool execution (streaming)");
                     let tool_results_msg = Message {
                         role: Role::User,
                         content: MessageContent::Blocks(tool_result_blocks),
                     };
                     session.messages.push(tool_results_msg);
 
-                    // Extract the spoken/delivered text from side-channel tool inputs
-                    // so it persists in history after session projection strips tool blocks.
-                    let delivered_text = extract_side_channel_text(&response.tool_calls);
-                    let placeholder = if delivered_text.is_empty() {
-                        "[response delivered via voice/media]".to_string()
+                    let placeholder = if response_already_delivered {
+                        // Extract the spoken/delivered text from side-channel tool inputs
+                        // so it persists in history after session projection strips tool blocks.
+                        let delivered_text = extract_side_channel_text(&response.tool_calls);
+                        if delivered_text.is_empty() {
+                            persistent_turn_placeholder(&response.tool_calls)
+                        } else {
+                            format!("[语音回复] {delivered_text}")
+                        }
                     } else {
-                        format!("[语音回复] {delivered_text}")
+                        persistent_turn_placeholder(&response.tool_calls)
                     };
                     session.messages.push(Message::assistant(placeholder));
                     save_projected_session(memory, session)?;

@@ -9,6 +9,27 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    text.char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| &text[..idx])
+        .unwrap_or(text)
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    let mut indices = text.char_indices().rev();
+    match indices.nth(max_chars) {
+        Some((idx, ch)) => &text[idx + ch.len_utf8()..],
+        None => text,
+    }
+}
+
 /// A conversation session with message history.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -429,8 +450,8 @@ impl SessionStore {
                     let text = msg.content.text_content();
                     if !text.is_empty() {
                         // Truncate individual messages in summary to keep it compact
-                        let truncated = if text.len() > 200 {
-                            format!("{}...", &text[..200])
+                        let truncated = if text.chars().count() > 200 {
+                            format!("{}...", truncate_chars(&text, 200))
                         } else {
                             text
                         };
@@ -439,8 +460,8 @@ impl SessionStore {
                 }
                 // Keep summary under ~4000 chars
                 let mut full_summary = summary_parts.join("\n");
-                if full_summary.len() > 4000 {
-                    full_summary = full_summary[full_summary.len() - 4000..].to_string();
+                if full_summary.chars().count() > 4000 {
+                    full_summary = tail_chars(&full_summary, 4000).to_string();
                 }
                 canonical.compacted_summary = Some(full_summary);
                 canonical.compaction_cursor = to_compact;
@@ -726,6 +747,21 @@ mod tests {
         // After compaction: should keep DEFAULT_CANONICAL_WINDOW (50) messages
         assert!(canonical.messages.len() <= 60); // some tolerance
         assert!(canonical.compacted_summary.is_some());
+    }
+
+    #[test]
+    fn test_canonical_compaction_handles_unicode_boundaries() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let msgs: Vec<Message> = (0..120)
+            .map(|i| Message::user(format!("第{i}轮：公子这张图里，是个女孩子在室内做拉伸，旁边还有落地灯、小推车一类的家居摆设。")))
+            .collect();
+
+        let canonical = store.append_canonical(agent_id, &msgs, Some(100)).unwrap();
+        let summary = canonical.compacted_summary.unwrap();
+
+        assert!(!summary.is_empty());
+        assert!(summary.chars().count() <= 4003);
     }
 
     #[test]
