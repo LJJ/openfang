@@ -104,7 +104,8 @@ fn tool_timeout_secs(tool_name: &str) -> u64 {
     DEFAULT_TOOL_TIMEOUT_SECS
 }
 
-struct FeishuDeliveryTarget {
+struct ChannelDeliveryTarget {
+    channel: String,
     receive_id: String,
     receive_id_type: String,
 }
@@ -130,24 +131,36 @@ fn parse_channel_context_value(message: &str, key: &str) -> Option<String> {
     None
 }
 
-fn parse_feishu_delivery_target(message: &str) -> Option<FeishuDeliveryTarget> {
-    if parse_channel_context_value(message, "channel")?.as_str() != "feishu" {
-        return None;
-    }
+fn parse_channel_delivery_target(message: &str) -> Option<ChannelDeliveryTarget> {
+    let channel = parse_channel_context_value(message, "channel")?;
 
-    if let Some(chat_id) = parse_channel_context_value(message, "chat_id") {
-        return Some(FeishuDeliveryTarget {
-            receive_id: chat_id,
-            receive_id_type: "chat_id".to_string(),
-        });
-    }
-
-    parse_channel_context_value(message, "sender_open_id").map(|sender_open_id| {
-        FeishuDeliveryTarget {
-            receive_id: sender_open_id,
-            receive_id_type: "open_id".to_string(),
+    match channel.as_str() {
+        "feishu" => {
+            if let Some(chat_id) = parse_channel_context_value(message, "chat_id") {
+                return Some(ChannelDeliveryTarget {
+                    channel,
+                    receive_id: chat_id,
+                    receive_id_type: "chat_id".to_string(),
+                });
+            }
+            parse_channel_context_value(message, "sender_open_id").map(|sender_open_id| {
+                ChannelDeliveryTarget {
+                    channel,
+                    receive_id: sender_open_id,
+                    receive_id_type: "open_id".to_string(),
+                }
+            })
         }
-    })
+        "discord" => {
+            let chat_id = parse_channel_context_value(message, "chat_id")?;
+            Some(ChannelDeliveryTarget {
+                channel,
+                receive_id: chat_id,
+                receive_id_type: "chat_id".to_string(),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn manifest_silent_after_tools(manifest: &AgentManifest) -> HashSet<String> {
@@ -838,23 +851,20 @@ fn build_async_media_plan(
         return None;
     }
 
-    if parse_channel_context_value(user_message, "channel")?.as_str() != "feishu" {
-        return None;
-    }
-
-    let delivery_target = parse_feishu_delivery_target(user_message)?;
+    let delivery_target = parse_channel_delivery_target(user_message)?;
     let is_selfie = is_selfie_media_request(tool_call);
 
     let (request, mode, llm_note) = match tool_call.name.as_str() {
         "mcp_toolbox_generate_video" => (
             crate::kernel_handle::AsyncMediaRequest {
                 caller_agent_id: caller_agent_id.to_string(),
+                channel: delivery_target.channel.clone(),
                 tool_name: tool_call.name.clone(),
                 tool_input: tool_call.input.clone(),
                 receive_id: delivery_target.receive_id,
                 receive_id_type: delivery_target.receive_id_type,
                 result_path_key: "video_path".to_string(),
-                send_tool_name: "mcp_feishu_send_video_message".to_string(),
+                send_tool_name: format!("mcp_{}_send_video_message", delivery_target.channel),
                 send_path_key: "video_path".to_string(),
                 file_name: Some(ASYNC_SELFIE_VIDEO_FILE_NAME.to_string()),
                 failure_notice: "我刚才已经在给你录了，但这一条没顺利出来。你先别空等，我现在重新录一版，录好了就立刻给你。".to_string(),
@@ -876,12 +886,13 @@ fn build_async_media_plan(
         "mcp_toolbox_generate_image" => (
             crate::kernel_handle::AsyncMediaRequest {
                 caller_agent_id: caller_agent_id.to_string(),
+                channel: delivery_target.channel.clone(),
                 tool_name: tool_call.name.clone(),
                 tool_input: tool_call.input.clone(),
                 receive_id: delivery_target.receive_id,
                 receive_id_type: delivery_target.receive_id_type,
                 result_path_key: "image_path".to_string(),
-                send_tool_name: "mcp_feishu_send_image_message".to_string(),
+                send_tool_name: format!("mcp_{}_send_image_message", delivery_target.channel),
                 send_path_key: "image_path".to_string(),
                 file_name: None,
                 failure_notice: if is_selfie {
@@ -911,12 +922,13 @@ fn build_async_media_plan(
         "mcp_toolbox_add_to_wardrobe" => (
             crate::kernel_handle::AsyncMediaRequest {
                 caller_agent_id: caller_agent_id.to_string(),
+                channel: delivery_target.channel.clone(),
                 tool_name: tool_call.name.clone(),
                 tool_input: tool_call.input.clone(),
                 receive_id: delivery_target.receive_id,
                 receive_id_type: delivery_target.receive_id_type,
                 result_path_key: "preview_path".to_string(),
-                send_tool_name: "mcp_feishu_send_image_message".to_string(),
+                send_tool_name: format!("mcp_{}_send_image_message", delivery_target.channel),
                 send_path_key: "image_path".to_string(),
                 file_name: None,
                 failure_notice: "我刚才已经在试这件了，但定妆照这一下没出成。你先别等空，我现在重新拍一版，拍好就发你看。".to_string(),

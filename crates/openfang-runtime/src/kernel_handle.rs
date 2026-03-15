@@ -30,6 +30,7 @@ pub struct AsyncMediaArchiveRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AsyncMediaRequest {
     pub caller_agent_id: String,
+    pub channel: String,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub receive_id: String,

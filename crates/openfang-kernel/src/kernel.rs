@@ -4684,7 +4684,7 @@ impl OpenFangKernel {
             })?
             .to_string();
 
-        let mut feishu = self.connect_dedicated_mcp("feishu").await?;
+        let mut channel_mcp = self.connect_dedicated_mcp(&request.channel).await?;
         let mut send_input = serde_json::Map::new();
         send_input.insert(
             "receive_id".to_string(),
@@ -4705,7 +4705,7 @@ impl OpenFangKernel {
             );
         }
         self.call_dedicated_mcp_json(
-            &mut feishu,
+            &mut channel_mcp,
             &request.send_tool_name,
             serde_json::Value::Object(send_input),
         )
@@ -4749,10 +4749,11 @@ impl OpenFangKernel {
             return Ok(());
         }
 
-        let mut feishu = self.connect_dedicated_mcp("feishu").await?;
+        let mut channel_mcp = self.connect_dedicated_mcp(&request.channel).await?;
+        let send_text_tool = format!("mcp_{}_send_text_message", request.channel);
         self.call_dedicated_mcp_json(
-            &mut feishu,
-            "mcp_feishu_send_text_message",
+            &mut channel_mcp,
+            &send_text_tool,
             serde_json::json!({
                 "receive_id": request.receive_id,
                 "receive_id_type": request.receive_id_type,
