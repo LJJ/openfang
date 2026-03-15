@@ -2342,9 +2342,10 @@ impl OpenFangKernel {
             }
             WorldEngineScenario::ScheduledTick => {
                 use serde_json::json as j;
-                let (life_res, inner_res) = tokio::join!(
+                let (life_res, inner_res, peek_res) = tokio::join!(
                     self.execute_world_engine_tool_json(agent_id, manifest, "pf_tick_life", "mcp_toolbox_get_life_status", j!({})),
                     self.execute_world_engine_tool_json(agent_id, manifest, "pf_tick_inner", "mcp_toolbox_get_inner_state", j!({"include_scores": true})),
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_tick_narrative", "mcp_toolbox_peek_turn_state", j!({})),
                 );
 
                 let today_str = life_res.as_ref().ok()
@@ -2369,9 +2370,19 @@ impl OpenFangKernel {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
+                // Extract last_turn_narrative from peek result (read-only, not consumed)
+                let narrative_text = peek_res.as_ref().ok()
+                    .and_then(|v| v.get("context_cache"))
+                    .and_then(|v| v.get("last_turn_narrative"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
                 let mut parts = vec!["[预取状态]".to_string()];
                 parts.push(format_tool_result("生活状态", &life_res));
                 parts.push(format_tool_result("内在状态（含分数）", &inner_res));
+                if !narrative_text.is_empty() {
+                    parts.push(format!("[上轮叙事]\n{}", narrative_text));
+                }
                 if !tomorrow.is_empty() {
                     parts.push(format_tool_result(&format!("明天日程 ({})", tomorrow), &sched_tomorrow));
                 }
