@@ -1696,6 +1696,19 @@ pub async fn run_agent_loop(
                 // or this agent is configured to finish immediately after successful
                 // tool execution, exit silently — no need for another LLM round.
                 if response_already_delivered || should_silent_after_tools {
+                    // Text delivery is a code guarantee: if the LLM produced
+                    // text alongside tool calls, auto-wrap it into Turn Script
+                    // so the kernel delivers it to the user.
+                    if should_silent_after_tools {
+                        let companion_text = response.text();
+                        if !companion_text.trim().is_empty() {
+                            debug!(agent = %manifest.name, "Auto-wrapping text into Turn Script alongside tool calls");
+                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                                warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script");
+                            }
+                        }
+                    }
+
                     let reason = if response_already_delivered {
                         "response delivered via side-channel"
                     } else {
@@ -2762,6 +2775,19 @@ pub async fn run_agent_loop_streaming(
                 // or this agent is configured to finish immediately after successful
                 // tool execution, exit silently — no need for another LLM round.
                 if response_already_delivered || should_silent_after_tools {
+                    // Text delivery is a code guarantee: if the LLM produced
+                    // text alongside tool calls, auto-wrap it into Turn Script
+                    // so the kernel delivers it to the user.
+                    if should_silent_after_tools {
+                        let companion_text = response.text();
+                        if !companion_text.trim().is_empty() {
+                            debug!(agent = %manifest.name, "Auto-wrapping text into Turn Script alongside tool calls (streaming)");
+                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                                warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script (streaming)");
+                            }
+                        }
+                    }
+
                     let reason = if response_already_delivered {
                         "response delivered via side-channel"
                     } else {
