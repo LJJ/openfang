@@ -352,6 +352,47 @@ fn current_interaction_mode(config: &KernelConfig) -> String {
         .unwrap_or_else(|| "remote".to_string())
 }
 
+/// Build mode-specific expression guidance for roleplay agents.
+/// Each mode sees only its own reality — no mention of the other mode.
+fn roleplay_mode_prompt(mode: &str) -> &'static str {
+    match mode {
+        "in_person" => concat!(
+            "━━━━━ 你此刻和公子在一起 ━━━━━\n",
+            "\n",
+            "你和公子面对面，就在身边。\n",
+            "\n",
+            "你的表达方式：\n",
+            "- 说话、动作 → reply，格式：(宋玉的动作/心理/生理) 开口说的话\n",
+            "  括号里宋玉写\"宋玉\"，公子写\"你\"\n",
+            "- 留下此刻的画面 → this_moment（从公子视角定格这一瞬）\n",
+            "- 留住眼前这一幕 → this_scene（从公子视角留下流动的片段）\n",
+            "- 去换一身衣服 → change_clothes\n",
+            "- 记住一件事 → remember\n",
+            "- 心里有了打算 → settle_plan\n",
+            "\n",
+            "说话和留下画面可以一起——你说着话，这一刻也值得被记住。",
+        ),
+        // remote (default)
+        _ => concat!(
+            "━━━━━ 你此刻在远处 ━━━━━\n",
+            "\n",
+            "你和公子不在一起，你们通过手机联系。\n",
+            "\n",
+            "你的表达方式：\n",
+            "- 说话 → reply（打字发消息）\n",
+            "- 拍自拍给公子看 → take_photo\n",
+            "- 录一小段视频给公子看 → take_video\n",
+            "- 发语音 → send_voice\n",
+            "- 去换一身衣服 → change_clothes\n",
+            "- 记住一件事 → remember\n",
+            "- 心里有了打算 → settle_plan\n",
+            "- 放下手边的事去找公子 → go_find_him\n",
+            "\n",
+            "拍照、录视频和说话可以一起——\"你等下哈\" + 拍一张，完全自然。",
+        ),
+    }
+}
+
 fn strip_remote_stage_directions(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut ascii_depth = 0u32;
@@ -2648,14 +2689,44 @@ impl OpenFangKernel {
                         continue;
                     };
                     let params = intent.get("params").and_then(|value| value.as_object());
-                    let description = params
-                        .and_then(|params| params.get("description"))
-                        .and_then(|value| value.as_str())
+                    // selfie_video uses "description"; scene_video uses "my_state" + "dialogue" + "partner_position"
+                    let description_owned: String;
+                    let description = if let Some(d) = params
+                        .and_then(|p| p.get("description"))
+                        .and_then(|v| v.as_str())
                         .map(str::trim)
-                        .unwrap_or("");
-                    if description.is_empty() {
-                        continue;
-                    }
+                        .filter(|s| !s.is_empty())
+                    {
+                        d
+                    } else {
+                        let my_state = params
+                            .and_then(|p| p.get("my_state"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .unwrap_or("");
+                        let dialogue = params
+                            .and_then(|p| p.get("dialogue"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .unwrap_or("");
+                        let partner_position = params
+                            .and_then(|p| p.get("partner_position"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .unwrap_or("");
+                        if my_state.is_empty() {
+                            continue;
+                        }
+                        let mut parts = vec![my_state.to_string()];
+                        if !dialogue.is_empty() {
+                            parts.push(format!("说：\"{}\"", dialogue));
+                        }
+                        if !partner_position.is_empty() {
+                            parts.push(format!("对方{}", partner_position));
+                        }
+                        description_owned = parts.join("。");
+                        &description_owned
+                    };
 
                     let life = self
                         .execute_world_engine_tool_json(
@@ -2841,14 +2912,36 @@ impl OpenFangKernel {
                         continue;
                     };
                     let params = intent.get("params").and_then(|value| value.as_object());
-                    let description = params
-                        .and_then(|params| params.get("description"))
-                        .and_then(|value| value.as_str())
+                    // selfie uses "description"; visual_moment uses "my_state" + "partner_position"
+                    let description_owned: String;
+                    let description = if let Some(d) = params
+                        .and_then(|p| p.get("description"))
+                        .and_then(|v| v.as_str())
                         .map(str::trim)
-                        .unwrap_or("");
-                    if description.is_empty() {
-                        continue;
-                    }
+                        .filter(|s| !s.is_empty())
+                    {
+                        d
+                    } else {
+                        let my_state = params
+                            .and_then(|p| p.get("my_state"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .unwrap_or("");
+                        let partner_position = params
+                            .and_then(|p| p.get("partner_position"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .unwrap_or("");
+                        if my_state.is_empty() {
+                            continue;
+                        }
+                        description_owned = if partner_position.is_empty() {
+                            my_state.to_string()
+                        } else {
+                            format!("{}。对方{}",  my_state, partner_position)
+                        };
+                        &description_owned
+                    };
                     let expression = params
                         .and_then(|params| params.get("expression"))
                         .and_then(|value| value.as_str())
@@ -3193,6 +3286,16 @@ impl OpenFangKernel {
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
+        }
+
+        // Inject interaction-mode-specific expression guidance for roleplay agents
+        if manifest.agent_class == AgentClass::Roleplay {
+            let mode = current_interaction_mode(&self.config);
+            let mode_prompt = roleplay_mode_prompt(&mode);
+            if !mode_prompt.is_empty() {
+                manifest.model.system_prompt =
+                    format!("{}\n\n{}", manifest.model.system_prompt, mode_prompt);
+            }
         }
 
         let is_stable = self.config.mode == openfang_types::config::KernelMode::Stable;
