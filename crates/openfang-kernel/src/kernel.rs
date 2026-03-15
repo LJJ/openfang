@@ -2342,22 +2342,12 @@ impl OpenFangKernel {
                         continue;
                     }
 
-                    let inner_state = self
-                        .execute_world_engine_tool_json(
-                            agent_id,
-                            manifest,
-                            &format!("world_engine_voice_state_{index}"),
-                            "mcp_toolbox_get_inner_state",
-                            serde_json::json!({}),
-                        )
-                        .await
-                        .ok();
-
-                    let emotion = inner_state
-                        .as_ref()
-                        .and_then(|value| value.get("voice_hint"))
-                        .and_then(|value| value.get("emotion"))
-                        .and_then(|value| value.as_str());
+                    // Emotion is chosen by the role-playing agent, not computed from formulas.
+                    let emotion = params
+                        .and_then(|params| params.get("emotion"))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
 
                     let speaker = manifest
                         .metadata
