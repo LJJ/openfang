@@ -1696,6 +1696,21 @@ pub async fn run_agent_loop(
                 // or this agent is configured to finish immediately after successful
                 // tool execution, exit silently — no need for another LLM round.
                 if response_already_delivered || should_silent_after_tools {
+                    // If the LLM produced text alongside tool calls and didn't
+                    // explicitly call reply, auto-wrap the text into Turn Script
+                    // so it still gets delivered to the user.
+                    if should_silent_after_tools
+                        && !successful_tools_this_turn.contains("mcp_toolbox_reply")
+                    {
+                        let companion_text = response.text();
+                        if !companion_text.trim().is_empty() {
+                            debug!(agent = %manifest.name, "Auto-wrapping companion text into Turn Script alongside tool calls");
+                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                                warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap companion text into Turn Script");
+                            }
+                        }
+                    }
+
                     let reason = if response_already_delivered {
                         "response delivered via side-channel"
                     } else {
@@ -2762,6 +2777,21 @@ pub async fn run_agent_loop_streaming(
                 // or this agent is configured to finish immediately after successful
                 // tool execution, exit silently — no need for another LLM round.
                 if response_already_delivered || should_silent_after_tools {
+                    // If the LLM produced text alongside tool calls and didn't
+                    // explicitly call reply, auto-wrap the text into Turn Script
+                    // so it still gets delivered to the user.
+                    if should_silent_after_tools
+                        && !successful_tools_this_turn.contains("mcp_toolbox_reply")
+                    {
+                        let companion_text = response.text();
+                        if !companion_text.trim().is_empty() {
+                            debug!(agent = %manifest.name, "Auto-wrapping companion text into Turn Script alongside tool calls (streaming)");
+                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                                warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap companion text into Turn Script (streaming)");
+                            }
+                        }
+                    }
+
                     let reason = if response_already_delivered {
                         "response delivered via side-channel"
                     } else {
