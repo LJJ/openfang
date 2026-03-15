@@ -279,6 +279,27 @@ fn read_turn_script_intents(config: &KernelConfig) -> Vec<serde_json::Value> {
     serde_json::from_str::<Vec<serde_json::Value>>(&contents).unwrap_or_default()
 }
 
+/// Extract the first image file path from the `[Image attachments]` block
+/// that the Feishu/Discord gateway appends to the message string.
+fn extract_first_image_path(message: &str) -> Option<String> {
+    let marker = "[Image attachments]";
+    let start = message.find(marker)?;
+    for line in message[start..].lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('[') {
+            break;
+        }
+        // Format: "image_0: /tmp/openfang_uploads/abc.png  (image/png)"
+        if let Some(rest) = line.split_once(':').map(|(_, v)| v.trim()) {
+            let path = rest.split_whitespace().next()?;
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn write_turn_script_intents(
     config: &KernelConfig,
     intents: &[serde_json::Value],
@@ -2918,6 +2939,12 @@ impl OpenFangKernel {
                     });
                     if !tags.is_empty() {
                         add_input["tags"] = serde_json::Value::Array(tags);
+                    }
+                    // Auto-attach the current turn's image as reference for
+                    // base photo generation (works for both direct sends and
+                    // quoted images — the gateway always re-downloads).
+                    if let Some(ref_path) = extract_first_image_path(message) {
+                        add_input["reference_image"] = serde_json::Value::String(ref_path);
                     }
 
                     let async_request = kernel_handle::AsyncMediaRequest {
