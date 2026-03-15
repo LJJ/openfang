@@ -865,6 +865,20 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
+        ModelCatalogEntry {
+            id: "gpt-5.4".into(),
+            display_name: "GPT-5.4".into(),
+            provider: "openai".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 2.0,
+            output_cost_per_m: 16.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
         // ══════════════════════════════════════════════════════════════
         // Google Gemini (10)
         // ══════════════════════════════════════════════════════════════

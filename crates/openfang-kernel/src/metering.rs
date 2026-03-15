@@ -249,6 +249,9 @@ fn estimate_cost_rates(model: &str) -> (f64, f64) {
     }
 
     // ── OpenAI ─────────────────────────────────────────────────
+    if model.contains("gpt-5.4") {
+        return (2.0, 16.0);
+    }
     if model.contains("gpt-5.2-pro") {
         return (1.75, 14.0);
     }

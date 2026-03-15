@@ -81,12 +81,23 @@ tokio::task_local! {
     static AGENT_CALL_DEPTH: std::cell::Cell<u32>;
     /// Canvas max HTML size in bytes (set from kernel config at loop start).
     pub static CANVAS_MAX_BYTES: usize;
+    /// Pre-processed user message to inject into agent_send calls.
+    /// Set by the kernel when dispatching to world-engine; read by tool_agent_send.
+    pub static USER_MESSAGE_INJECTION: Option<String>;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
 /// Returns 0 if called outside an agent task.
 pub fn current_agent_depth() -> u32 {
     AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0)
+}
+
+/// Read the user message injection context, if any.
+pub fn user_message_injection() -> Option<String> {
+    USER_MESSAGE_INJECTION
+        .try_with(|v| v.clone())
+        .ok()
+        .flatten()
 }
 
 /// Execute a tool by name with the given input, returning a ToolResult.
@@ -1473,9 +1484,16 @@ async fn tool_agent_send(
         ));
     }
 
+    // Inject pre-processed user message if available (world-engine → assistant)
+    let final_message = if let Some(injection) = user_message_injection() {
+        format!("{message}\n\n{injection}")
+    } else {
+        message.to_string()
+    };
+
     AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
-            kh.send_to_agent(agent_id, message).await
+            kh.send_to_agent(agent_id, &final_message).await
         })
         .await
 }

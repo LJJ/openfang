@@ -398,6 +398,9 @@ pub struct ModelConfig {
     pub api_key_env: Option<String>,
     /// Optional base URL override for the provider.
     pub base_url: Option<String>,
+    /// Optional context window size override (tokens).
+    /// When set, takes priority over the model catalog lookup.
+    pub context_window: Option<u64>,
 }
 
 impl Default for ModelConfig {
@@ -410,6 +413,7 @@ impl Default for ModelConfig {
             system_prompt: "You are a helpful AI agent.".to_string(),
             api_key_env: None,
             base_url: None,
+            context_window: None,
         }
     }
 }

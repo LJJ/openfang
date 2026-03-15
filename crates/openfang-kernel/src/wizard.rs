@@ -163,6 +163,7 @@ impl SetupWizard {
                 system_prompt,
                 api_key_env: None,
                 base_url: None,
+                context_window: None,
             },
             resources: ResourceQuota::default(),
             priority: Priority::default(),

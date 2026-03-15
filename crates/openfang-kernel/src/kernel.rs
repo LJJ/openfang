@@ -159,17 +159,92 @@ fn parse_channel_context_value(message: &str, key: &str) -> Option<String> {
     None
 }
 
-fn parse_feishu_delivery_target(message: &str) -> Option<(String, String)> {
-    if parse_channel_context_value(message, "channel")?.as_str() != "feishu" {
+fn parse_channel_delivery_target(message: &str) -> Option<(String, String, String)> {
+    let channel = parse_channel_context_value(message, "channel")?;
+
+    match channel.as_str() {
+        "feishu" => {
+            if let Some(chat_id) = parse_channel_context_value(message, "chat_id") {
+                return Some((channel, chat_id, "chat_id".to_string()));
+            }
+            parse_channel_context_value(message, "sender_open_id")
+                .map(|open_id| (channel, open_id, "open_id".to_string()))
+        }
+        "discord" => {
+            parse_channel_context_value(message, "chat_id")
+                .map(|chat_id| (channel, chat_id, "chat_id".to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Extract user's raw text from a gateway message, replace sentence-initial "我"
+/// with the configured user_name, and return a formatted block for kernel-side
+/// injection.
+///
+/// Only "我" at the very start of the text or immediately after a sentence-ending
+/// punctuation mark (，。！？…；、\n) is replaced.  Mid-word occurrences like
+/// "给我" or "我们" are left untouched.
+fn build_user_message_injection(message: &str, user_name: &str) -> Option<String> {
+    // User text appears after "对方说：\n"
+    let marker = "对方说：\n";
+    let idx = message.find(marker)?;
+    let raw_text = &message[idx + marker.len()..];
+    // Stop at the next section marker if any
+    let user_text = if let Some(end) = raw_text.find("\n[") {
+        &raw_text[..end]
+    } else {
+        raw_text.trim_end()
+    };
+    if user_text.is_empty() {
         return None;
     }
+    let replaced = replace_sentence_initial_wo(user_text, user_name);
+    Some(format!("[{user_name}]\n{replaced}"))
+}
 
-    if let Some(chat_id) = parse_channel_context_value(message, "chat_id") {
-        return Some((chat_id, "chat_id".to_string()));
+/// Replace "我" only when it appears at the start of a sentence.
+///
+/// A "sentence start" is defined as:
+/// - The very beginning of the string, or
+/// - Immediately after one of the sentence-ending punctuation characters:
+///   ，。！？…；、 or a newline (\n)
+/// - Optional whitespace between the punctuation and "我" is allowed.
+///
+/// This avoids replacing "我" inside words like "我们", "给我", "自我" etc.
+fn replace_sentence_initial_wo(text: &str, replacement: &str) -> String {
+    const SENTENCE_DELIMITERS: &[char] = &['，', '。', '！', '？', '…', '；', '、', '\n'];
+
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    let mut at_sentence_start = true;
+
+    while let Some((_i, ch)) = chars.next() {
+        if ch == '我' && at_sentence_start {
+            // Check the next char is NOT a Chinese character that forms a compound
+            // word with 我 (e.g. 我们, 我的 are common but 我的 should be replaced
+            // since 我 is the subject; only skip 我们 as it's a different pronoun)
+            let next_char = chars.peek().map(|&(_, c)| c);
+            if next_char == Some('们') {
+                // "我们" — don't replace, push as-is
+                result.push(ch);
+                at_sentence_start = false;
+            } else {
+                result.push_str(replacement);
+                at_sentence_start = false;
+            }
+        } else {
+            result.push(ch);
+            if SENTENCE_DELIMITERS.contains(&ch) {
+                at_sentence_start = true;
+            } else if ch.is_whitespace() {
+                // whitespace preserves sentence-start state
+            } else {
+                at_sentence_start = false;
+            }
+        }
     }
-
-    parse_channel_context_value(message, "sender_open_id")
-        .map(|open_id| (open_id, "open_id".to_string()))
+    result
 }
 
 fn state_agent_name() -> String {
@@ -238,12 +313,25 @@ fn store_last_turn_narrative(config: &KernelConfig, narrative: &str) -> Result<(
     std::fs::write(&cache_path, payload).map_err(|e| format!("write context cache failed: {e}"))
 }
 
-fn owner_delivery_target(message: &str) -> Option<(String, String)> {
-    parse_feishu_delivery_target(message).or_else(|| {
-        std::env::var("FEISHU_OWNER_OPEN_ID")
+fn owner_delivery_target(message: &str) -> Option<(String, String, String)> {
+    parse_channel_delivery_target(message).or_else(|| {
+        // Fallback for SCHEDULED TICK or messages without [Channel context].
+        // DEFAULT_DELIVERY_CHANNEL controls which platform receives proactive messages.
+        let default_channel = std::env::var("DEFAULT_DELIVERY_CHANNEL")
             .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|open_id| (open_id, "open_id".to_string()))
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "feishu".to_string());
+
+        match default_channel.as_str() {
+            "discord" => std::env::var("DISCORD_OWNER_DM_CHANNEL_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|chat_id| ("discord".to_string(), chat_id, "chat_id".to_string())),
+            _ => std::env::var("FEISHU_OWNER_OPEN_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|open_id| ("feishu".to_string(), open_id, "open_id".to_string())),
+        }
     })
 }
 
@@ -333,6 +421,10 @@ fn world_engine_execution_tools() -> Vec<String> {
         "mcp_feishu_send_image_message",
         "mcp_feishu_send_video_message",
         "mcp_feishu_send_audio_message",
+        "mcp_discord_send_text_message",
+        "mcp_discord_send_image_message",
+        "mcp_discord_send_video_message",
+        "mcp_discord_send_audio_message",
         "mcp_toolbox_get_inner_state",
         "mcp_toolbox_set_interaction_mode",
         "mcp_toolbox_list_wardrobe",
@@ -2199,7 +2291,7 @@ impl OpenFangKernel {
 
             match intent_type {
                 "text" => {
-                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                    let Some((ref channel, ref receive_id, ref receive_id_type)) = delivery_target else {
                         warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for text intent");
                         continue;
                     };
@@ -2220,7 +2312,7 @@ impl OpenFangKernel {
                             agent_id,
                             manifest,
                             &format!("world_engine_text_{index}"),
-                            "mcp_feishu_send_text_message",
+                            &format!("mcp_{channel}_send_text_message"),
                             serde_json::json!({
                                 "receive_id": receive_id,
                                 "receive_id_type": receive_id_type,
@@ -2236,7 +2328,7 @@ impl OpenFangKernel {
                     }
                 }
                 "voice" => {
-                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                    let Some((ref channel, ref receive_id, ref receive_id_type)) = delivery_target else {
                         warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for voice intent");
                         continue;
                     };
@@ -2290,7 +2382,7 @@ impl OpenFangKernel {
                             agent_id,
                             manifest,
                             &format!("world_engine_voice_{index}"),
-                            "mcp_feishu_send_audio_message",
+                            &format!("mcp_{channel}_send_audio_message"),
                             payload,
                         )
                         .await
@@ -2344,14 +2436,14 @@ impl OpenFangKernel {
                             serde_json::json!({ "mode": "in_person" }),
                         )
                         .await;
-                    if let Some((receive_id, receive_id_type)) = delivery_target.clone() {
+                    if let Some((ref channel, ref receive_id, ref receive_id_type)) = delivery_target {
                         let transition_text = "她放下了手边的事，走过来了。";
                         match self
                             .execute_world_engine_tool(
                                 agent_id,
                                 manifest,
                                 &format!("world_engine_transition_{index}"),
-                                "mcp_feishu_send_text_message",
+                                &format!("mcp_{channel}_send_text_message"),
                                 serde_json::json!({
                                     "receive_id": receive_id,
                                     "receive_id_type": receive_id_type,
@@ -2454,7 +2546,7 @@ impl OpenFangKernel {
                     }
                 }
                 "wardrobe_add" => {
-                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                    let Some((ref channel, ref receive_id, ref receive_id_type)) = delivery_target else {
                         warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for wardrobe_add intent");
                         continue;
                     };
@@ -2488,12 +2580,13 @@ impl OpenFangKernel {
 
                     let async_request = kernel_handle::AsyncMediaRequest {
                         caller_agent_id: agent_id.to_string(),
+                        channel: channel.clone(),
                         tool_name: "mcp_toolbox_add_to_wardrobe".to_string(),
                         tool_input: add_input,
-                        receive_id,
-                        receive_id_type,
+                        receive_id: receive_id.clone(),
+                        receive_id_type: receive_id_type.clone(),
                         result_path_key: "preview_path".to_string(),
-                        send_tool_name: "mcp_feishu_send_image_message".to_string(),
+                        send_tool_name: format!("mcp_{channel}_send_image_message"),
                         send_path_key: "image_path".to_string(),
                         file_name: None,
                         failure_notice: "我刚才已经在试这件了，但定妆照这一下没出成。你先别等空，我现在重新拍一版，拍好就发你看。".to_string(),
@@ -2560,7 +2653,7 @@ impl OpenFangKernel {
                     }
                 }
                 "selfie_video" | "scene_video" => {
-                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                    let Some((ref channel, ref receive_id, ref receive_id_type)) = delivery_target else {
                         warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for video intent");
                         continue;
                     };
@@ -2694,12 +2787,13 @@ impl OpenFangKernel {
 
                     let async_request = kernel_handle::AsyncMediaRequest {
                         caller_agent_id: agent_id.to_string(),
+                        channel: channel.clone(),
                         tool_name: "mcp_toolbox_generate_video".to_string(),
                         tool_input: payload,
-                        receive_id,
-                        receive_id_type,
+                        receive_id: receive_id.clone(),
+                        receive_id_type: receive_id_type.clone(),
                         result_path_key: "video_path".to_string(),
-                        send_tool_name: "mcp_feishu_send_video_message".to_string(),
+                        send_tool_name: format!("mcp_{channel}_send_video_message"),
                         send_path_key: "video_path".to_string(),
                         file_name: Some(if intent_type == "selfie_video" { "宋玉-自拍视频.mp4" } else { "这一幕.mp4" }.to_string()),
                         failure_notice: if intent_type == "selfie_video" {
@@ -2752,7 +2846,7 @@ impl OpenFangKernel {
                     }
                 }
                 "selfie" | "visual_moment" => {
-                    let Some((receive_id, receive_id_type)) = delivery_target.clone() else {
+                    let Some((ref channel, ref receive_id, ref receive_id_type)) = delivery_target else {
                         warn!(agent = %entry.name, agent_id = %agent_id, index, "Missing delivery target for image intent");
                         continue;
                     };
@@ -2887,7 +2981,7 @@ impl OpenFangKernel {
                                         agent_id,
                                         manifest,
                                         &format!("world_engine_send_image_{index}"),
-                                        "mcp_feishu_send_image_message",
+                                        &format!("mcp_{channel}_send_image_message"),
                                         serde_json::json!({
                                             "receive_id": receive_id,
                                             "receive_id_type": receive_id_type,
@@ -3149,11 +3243,17 @@ impl OpenFangKernel {
 
         let driver = self.resolve_driver(&manifest)?;
 
-        // Look up model's actual context window from the catalog
-        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&manifest.model.model)
-                .map(|m| m.context_window as usize)
-        });
+        // Look up model's context window: agent config > catalog > default
+        let ctx_window = manifest
+            .model
+            .context_window
+            .map(|cw| cw as usize)
+            .or_else(|| {
+                self.model_catalog.read().ok().and_then(|cat| {
+                    cat.find_model(&manifest.model.model)
+                        .map(|m| m.context_window as usize)
+                })
+            });
 
         // Snapshot skill registry before async call (RwLockReadGuard is !Send)
         let mut skill_snapshot = self
@@ -3181,39 +3281,62 @@ impl OpenFangKernel {
             message.to_string()
         };
 
-        let mut result = run_agent_loop(
-            &manifest,
-            &message_with_links,
-            &mut session,
-            &self.memory,
-            driver,
-            &tools,
-            kernel_handle,
-            Some(&skill_snapshot),
-            Some(&self.mcp_connections),
-            Some(&self.web_ctx),
-            Some(&self.browser_ctx),
-            self.embedding_driver.as_deref(),
-            manifest.workspace.as_deref(),
-            None, // on_phase callback
-            Some(&self.media_engine),
-            if self.config.tts.enabled {
-                Some(&self.tts_engine)
-            } else {
+        // For world-engine: pre-process user message in code (我→user_name)
+        // so agent_send injects it directly without LLM rewriting.
+        let user_injection = if entry.name == "world-engine" {
+            let user_name = self
+                .memory
+                .structured_get(shared_memory_agent_id(), "user_name")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            if user_name.is_empty() {
                 None
-            },
-            if self.config.docker.enabled {
-                Some(&self.config.docker)
             } else {
-                None
-            },
-            Some(&self.hooks),
-            ctx_window,
-            Some(&self.process_manager),
-            media_blocks,
-        )
-        .await
-        .map_err(KernelError::OpenFang)?;
+                build_user_message_injection(message, &user_name)
+            }
+        } else {
+            None
+        };
+
+        let mut result = openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
+            .scope(user_injection, async {
+                run_agent_loop(
+                    &manifest,
+                    &message_with_links,
+                    &mut session,
+                    &self.memory,
+                    driver,
+                    &tools,
+                    kernel_handle,
+                    Some(&skill_snapshot),
+                    Some(&self.mcp_connections),
+                    Some(&self.web_ctx),
+                    Some(&self.browser_ctx),
+                    self.embedding_driver.as_deref(),
+                    manifest.workspace.as_deref(),
+                    None, // on_phase callback
+                    Some(&self.media_engine),
+                    if self.config.tts.enabled {
+                        Some(&self.tts_engine)
+                    } else {
+                        None
+                    },
+                    if self.config.docker.enabled {
+                        Some(&self.config.docker)
+                    } else {
+                        None
+                    },
+                    Some(&self.hooks),
+                    ctx_window,
+                    Some(&self.process_manager),
+                    media_blocks,
+                )
+                .await
+            })
+            .await
+            .map_err(KernelError::OpenFang)?;
 
         // World Engine is an orchestrator, not a user-facing agent.
         // Its response must NEVER reach the user — the Turn Script executor
@@ -3849,6 +3972,7 @@ impl OpenFangKernel {
                 system_prompt: def.agent.system_prompt.clone(),
                 api_key_env: def.agent.api_key_env.clone(),
                 base_url: def.agent.base_url.clone(),
+                context_window: None,
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),
@@ -4684,7 +4808,7 @@ impl OpenFangKernel {
             })?
             .to_string();
 
-        let mut channel_mcp = self.connect_dedicated_mcp(&request.channel).await?;
+        let mut delivery_mcp = self.connect_dedicated_mcp(&request.channel).await?;
         let mut send_input = serde_json::Map::new();
         send_input.insert(
             "receive_id".to_string(),
@@ -4705,7 +4829,7 @@ impl OpenFangKernel {
             );
         }
         self.call_dedicated_mcp_json(
-            &mut channel_mcp,
+            &mut delivery_mcp,
             &request.send_tool_name,
             serde_json::Value::Object(send_input),
         )
@@ -4749,11 +4873,10 @@ impl OpenFangKernel {
             return Ok(());
         }
 
-        let mut channel_mcp = self.connect_dedicated_mcp(&request.channel).await?;
-        let send_text_tool = format!("mcp_{}_send_text_message", request.channel);
+        let mut delivery_mcp = self.connect_dedicated_mcp(&request.channel).await?;
         self.call_dedicated_mcp_json(
-            &mut channel_mcp,
-            &send_text_tool,
+            &mut delivery_mcp,
+            &format!("mcp_{}_send_text_message", request.channel),
             serde_json::json!({
                 "receive_id": request.receive_id,
                 "receive_id_type": request.receive_id_type,
