@@ -6540,12 +6540,12 @@ impl KernelHandle for OpenFangKernel {
     async fn task_post(
         &self,
         title: &str,
-        description: &str,
+        payload: &str,
         assigned_to: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<String, String> {
         self.memory
-            .task_post(title, description, assigned_to, created_by)
+            .task_post(title, payload, assigned_to, created_by)
             .await
             .map_err(|e| format!("Task post failed: {e}"))
     }

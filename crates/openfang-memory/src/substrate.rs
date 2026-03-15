@@ -402,13 +402,13 @@ impl MemorySubstrate {
     pub async fn task_post(
         &self,
         title: &str,
-        description: &str,
+        payload: &str,
         assigned_to: Option<&str>,
         created_by: Option<&str>,
     ) -> OpenFangResult<String> {
         let conn = Arc::clone(&self.conn);
         let title = title.to_string();
-        let description = description.to_string();
+        let payload = payload.to_string();
         let assigned_to = assigned_to.unwrap_or("").to_string();
         let created_by = created_by.unwrap_or("").to_string();
 
@@ -419,7 +419,7 @@ impl MemorySubstrate {
             db.execute(
                 "INSERT INTO task_queue (id, agent_id, task_type, payload, status, priority, created_at, title, description, assigned_to, created_by)
                  VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![id, &created_by, &title, b"", now, title, description, assigned_to, created_by],
+                rusqlite::params![id, &created_by, &title, payload.as_bytes(), now, title, "", assigned_to, created_by],
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
             Ok(id)
@@ -437,7 +437,7 @@ impl MemorySubstrate {
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
             // Find first pending task assigned to this agent, or any unassigned pending task
             let mut stmt = db.prepare(
-                "SELECT id, title, description, assigned_to, created_by, created_at
+                "SELECT id, title, payload, assigned_to, created_by, created_at
                  FROM task_queue
                  WHERE status = 'pending' AND (assigned_to = ?1 OR assigned_to = '')
                  ORDER BY priority DESC, created_at ASC
@@ -448,7 +448,7 @@ impl MemorySubstrate {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
@@ -456,7 +456,8 @@ impl MemorySubstrate {
             });
 
             match result {
-                Ok((id, title, description, assigned, created_by, created_at)) => {
+                Ok((id, title, payload_bytes, assigned, created_by, created_at)) => {
+                    let payload = String::from_utf8(payload_bytes).unwrap_or_default();
                     // Update status to in_progress
                     db.execute(
                         "UPDATE task_queue SET status = 'in_progress', assigned_to = ?2 WHERE id = ?1",
@@ -466,7 +467,7 @@ impl MemorySubstrate {
                     Ok(Some(serde_json::json!({
                         "id": id,
                         "title": title,
-                        "description": description,
+                        "description": payload,
                         "status": "in_progress",
                         "assigned_to": if assigned.is_empty() { &agent_id } else { &assigned },
                         "created_by": created_by,

@@ -375,6 +375,9 @@ fn persistent_turn_placeholder(tool_calls: &[ToolCall]) -> String {
             "mcp_toolbox_change_clothes" => {
                 parts.push("[你换了身衣服]".to_string());
             }
+            "mcp_toolbox_try_on" | "mcp_toolbox_confirm_outfit" => {
+                parts.push("[你试穿了新衣服]".to_string());
+            }
             "mcp_toolbox_go_find_him" => {
                 parts.push("[你走过来了]".to_string());
             }

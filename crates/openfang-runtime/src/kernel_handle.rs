@@ -78,7 +78,7 @@ pub trait KernelHandle: Send + Sync {
     async fn task_post(
         &self,
         title: &str,
-        description: &str,
+        payload: &str,
         assigned_to: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<String, String>;
