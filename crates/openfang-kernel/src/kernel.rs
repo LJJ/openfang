@@ -388,6 +388,7 @@ fn roleplay_mode_prompt(mode: &str) -> &'static str {
             "- 留下此刻的画面 → this_moment（从公子视角定格这一瞬）\n",
             "- 留住眼前这一幕 → this_scene（从公子视角留下流动的片段）\n",
             "- 去换一身衣服 → change_clothes\n",
+            "- 收下公子给的衣服并穿上 → try_on\n",
             "- 记住一件事 → remember\n",
             "- 心里有了打算 → settle_plan\n",
             "\n",
@@ -405,6 +406,7 @@ fn roleplay_mode_prompt(mode: &str) -> &'static str {
             "- 录一小段视频给公子看 → take_video\n",
             "- 发语音 → send_voice\n",
             "- 去换一身衣服 → change_clothes\n",
+            "- 收下公子给的衣服并穿上 → try_on\n",
             "- 记住一件事 → remember\n",
             "- 心里有了打算 → settle_plan\n",
             "- 放下手边的事去找公子 → go_find_him\n",
@@ -2308,11 +2310,12 @@ impl OpenFangKernel {
             WorldEngineScenario::PrivateChat => {
                 use serde_json::json as j;
                 // Parallel fetch batch 1
-                let (life_res, inner_res, narrative_res, digest_res) = tokio::join!(
+                let (life_res, inner_res, narrative_res, digest_res, outfit_res) = tokio::join!(
                     self.execute_world_engine_tool_json(agent_id, manifest, "pf_life", "mcp_toolbox_get_life_status", j!({})),
                     self.execute_world_engine_tool_json(agent_id, manifest, "pf_inner", "mcp_toolbox_get_inner_state", j!({})),
                     self.execute_world_engine_tool_json(agent_id, manifest, "pf_narrative", "mcp_toolbox_consume_last_turn_narrative", j!({})),
                     self.execute_world_engine_tool_json(agent_id, manifest, "pf_digest", "mcp_toolbox_get_group_digest", j!({})),
+                    self.execute_world_engine_tool_json(agent_id, manifest, "pf_outfit", "mcp_toolbox_get_current_outfit", j!({})),
                 );
 
                 // Extract date for schedule fetches
@@ -2338,6 +2341,7 @@ impl OpenFangKernel {
                 let mut parts = vec!["[预取状态]".to_string()];
                 parts.push(format_tool_result("生活状态", &life_res));
                 parts.push(format_tool_result("内在状态", &inner_res));
+                parts.push(format_tool_result("当前衣着", &outfit_res));
                 let narrative_text = narrative_res.as_ref().ok()
                     .and_then(|v| v.get("narrative").or_else(|| v.get("last_turn_narrative")))
                     .and_then(|v| v.as_str())
