@@ -9,6 +9,26 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// UTF-8 safe character truncation: returns the first `max_chars` characters.
+pub fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    text.char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| &text[..idx])
+        .unwrap_or(text)
+}
+
+/// UTF-8 safe tail extraction: returns the last `max_chars` characters.
+pub fn tail_chars(text: &str, max_chars: usize) -> &str {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text;
+    }
+    text.char_indices()
+        .nth(char_count - max_chars)
+        .map(|(idx, _)| &text[idx..])
+        .unwrap_or(text)
+}
+
 /// A conversation session with message history.
 #[derive(Debug, Clone)]
 pub struct Session {

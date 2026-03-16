@@ -360,6 +360,56 @@ impl ToolProfile {
     }
 }
 
+/// Agent lifecycle classification.
+///
+/// Determines session management behavior and template resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentClass {
+    /// General-purpose utility agent (default).
+    Utility,
+    /// Template-backed persona agent (e.g., role-play character).
+    Roleplay,
+    /// Template-backed orchestrator (e.g., world-engine).
+    Orchestrator,
+}
+
+impl Default for AgentClass {
+    fn default() -> Self {
+        Self::Utility
+    }
+}
+
+impl AgentClass {
+    /// Whether this agent class uses template-backed manifest resolution.
+    pub fn is_template_backed(&self) -> bool {
+        matches!(self, Self::Roleplay | Self::Orchestrator)
+    }
+}
+
+/// Post-turn hook configuration — called after agent loop completes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PostTurn {
+    /// MCP tool to invoke after the agent loop.
+    pub tool: String,
+    /// Pass the agent's LLM response text as a parameter.
+    #[serde(default)]
+    pub pass_response: bool,
+    /// Clear the response after successful tool execution (prevents Gateway double-delivery).
+    #[serde(default)]
+    pub clear_response: bool,
+}
+
+/// Pre-turn hook configuration — called before agent loop starts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PreTurn {
+    /// MCP tool to invoke before the agent loop.
+    pub tool: String,
+    /// Pass the original user message as a parameter.
+    #[serde(default)]
+    pub pass_message: bool,
+}
+
 /// LLM model configuration for an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -379,6 +429,9 @@ pub struct ModelConfig {
     pub api_key_env: Option<String>,
     /// Optional base URL override for the provider.
     pub base_url: Option<String>,
+    /// Optional context window override (tokens). Takes precedence over model catalog.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 impl Default for ModelConfig {
@@ -391,6 +444,7 @@ impl Default for ModelConfig {
             system_prompt: "You are a helpful AI agent.".to_string(),
             api_key_env: None,
             base_url: None,
+            context_window: None,
         }
     }
 }
@@ -484,6 +538,15 @@ pub struct AgentManifest {
     /// Tool blocklist — these tools are excluded (applied after allowlist).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub tool_blocklist: Vec<String>,
+    /// Agent lifecycle classification (utility, roleplay, orchestrator).
+    #[serde(default)]
+    pub agent_class: AgentClass,
+    /// Post-turn hook — MCP tool called after agent loop completes.
+    #[serde(default)]
+    pub post_turn: Option<PostTurn>,
+    /// Pre-turn hook — MCP tool called before agent loop starts.
+    #[serde(default)]
+    pub pre_turn: Option<PreTurn>,
 }
 
 fn default_true() -> bool {
@@ -518,6 +581,9 @@ impl Default for AgentManifest {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            agent_class: AgentClass::default(),
+            post_turn: None,
+            pre_turn: None,
         }
     }
 }

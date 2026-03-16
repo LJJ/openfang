@@ -8,7 +8,7 @@
 
 use openfang_types::tool::ToolDefinition;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info};
@@ -30,10 +30,60 @@ pub struct McpServerConfig {
     /// Environment variables to pass through to the subprocess (sandboxed).
     #[serde(default)]
     pub env: Vec<String>,
+    /// Extra environment variables to inject into the MCP subprocess.
+    /// These are set explicitly (not just passed through from the host).
+    #[serde(default)]
+    pub extra_env: BTreeMap<String, String>,
 }
 
 fn default_timeout() -> u64 {
     60
+}
+
+/// Default environment variables passed through to all MCP subprocesses.
+///
+/// These ensure MCP tools can locate the OpenFang runtime, state files,
+/// and commonly needed system paths.
+pub const MCP_DEFAULT_ENV_PASSTHROUGH: &[&str] = &[
+    "HOME",
+    "PATH",
+    "LANG",
+    "TERM",
+    "OPENFANG_HOME",
+    "OPENFANG_STATE_AGENT",
+    "OPENFANG_AGENTS_DIR",
+    "OPENFANG_DATA_DIR",
+    "NODE_PATH",
+    "XDG_RUNTIME_DIR",
+];
+
+/// Collect environment variables for an MCP stdio subprocess.
+///
+/// Deduplicates names from the default passthrough list, per-server `env` list,
+/// and any `extra_env` explicit values.
+pub fn collect_stdio_env(
+    server_env: &[String],
+    extra_env: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut names = BTreeSet::new();
+    for name in MCP_DEFAULT_ENV_PASSTHROUGH {
+        names.insert((*name).to_string());
+    }
+    for name in server_env {
+        names.insert(name.clone());
+    }
+
+    let mut result: Vec<(String, String)> = Vec::new();
+    for name in &names {
+        if let Ok(val) = std::env::var(name) {
+            result.push((name.clone(), val));
+        }
+    }
+    // Extra env takes precedence (explicit values, not passthrough)
+    for (k, v) in extra_env {
+        result.push((k.clone(), v.clone()));
+    }
+    result
 }
 
 /// Transport type for MCP server connections.

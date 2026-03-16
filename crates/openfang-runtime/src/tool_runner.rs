@@ -18,6 +18,24 @@ use tracing::{debug, warn};
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
 
+tokio::task_local! {
+    /// Injection text to prepend to user messages in `agent_send` calls.
+    /// Set by the pre-turn hook to propagate context from orchestrator to downstream agents.
+    pub static USER_MESSAGE_INJECTION: Option<String>;
+}
+
+/// Read the current USER_MESSAGE_INJECTION value (if set).
+pub fn user_message_injection() -> Option<String> {
+    USER_MESSAGE_INJECTION
+        .try_with(|v| v.clone())
+        .ok()
+        .flatten()
+}
+
+// Note: response delivery detection uses ToolResult.response_delivered field
+// (set by MCP tools themselves), not a hardcoded tool name list.
+// This keeps the kernel agnostic to specific MCP tool names.
+
 /// Check if a shell command should be blocked by taint tracking.
 ///
 /// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)

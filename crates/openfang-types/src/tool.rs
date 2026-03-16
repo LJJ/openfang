@@ -33,6 +33,11 @@ pub struct ToolResult {
     pub content: String,
     /// Whether the tool execution resulted in an error.
     pub is_error: bool,
+    /// Whether this tool already delivered the response via a side-channel
+    /// (e.g., audio message, image post). When true, the agent loop can
+    /// exit without injecting a ToolMessage for another LLM round-trip.
+    #[serde(default)]
+    pub response_delivered: bool,
 }
 
 /// Normalize a JSON Schema for cross-provider compatibility.

@@ -75,6 +75,8 @@ pub struct MediaConfig {
     pub image_provider: Option<String>,
     /// Preferred audio transcription provider (auto-detect if None).
     pub audio_provider: Option<String>,
+    /// Custom prompt for image description. Uses a generic default if None.
+    pub image_description_prompt: Option<String>,
 }
 
 impl Default for MediaConfig {
@@ -86,6 +88,7 @@ impl Default for MediaConfig {
             max_concurrency: 2,
             image_provider: None,
             audio_provider: None,
+            image_description_prompt: None,
         }
     }
 }

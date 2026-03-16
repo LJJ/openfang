@@ -23,8 +23,8 @@ use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
-use openfang_types::tool::{ToolCall, ToolDefinition};
-use std::collections::HashMap;
+use openfang_types::tool::{ToolCall, ToolDefinition, ToolResult};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,9 +40,16 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (milliseconds).
 const BASE_RETRY_DELAY_MS: u64 = 1000;
 
-/// Timeout for individual tool executions (seconds).
+/// Default timeout for individual tool executions (seconds).
 /// Raised from 60s to 120s for browser automation and long-running builds.
 const TOOL_TIMEOUT_SECS: u64 = 120;
+
+/// Per-tool timeout selection. Currently returns the default for all tools.
+/// Future: read from agent.toml `metadata.turn_behavior.tool_timeouts`.
+#[allow(dead_code)] // Wired in Phase 2 when per-tool timeouts are configured
+fn tool_timeout_secs(_tool_name: &str) -> u64 {
+    TOOL_TIMEOUT_SECS
+}
 
 /// Maximum consecutive MaxTokens continuations before returning partial response.
 /// Raised from 3 to 5 to allow longer-form generation.
@@ -69,6 +76,86 @@ pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
 
 /// Default context window size (tokens) for token-based trimming.
 const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
+
+/// Read the `silent_after_tools` list from agent manifest metadata.
+///
+/// When an agent calls a tool in this list, the agent loop exits after all
+/// tool calls are executed, without starting another LLM round-trip.
+#[allow(dead_code)] // Wired in Phase 2 when config is set up
+fn manifest_silent_after_tools(manifest: &AgentManifest) -> std::collections::HashSet<String> {
+    manifest
+        .metadata
+        .get("turn_behavior")
+        .and_then(|value| value.get("silent_after_tools"))
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+/// Compact session messages by projecting out execution trace.
+///
+/// After an agent turn completes, this removes tool-use/tool-result blocks and
+/// internal trace text, keeping only durable dialogue for future turns.
+#[allow(dead_code)] // Wired in Phase 2 when session projection is activated
+fn compact_session_execution_trace(session: &mut Session, extra_trace_filters: &[String]) {
+    let compacted =
+        crate::session_projection::project_for_persistent_dialogue(&session.messages, extra_trace_filters);
+    session.messages = crate::session_repair::validate_and_repair(&compacted);
+}
+
+/// Save session with projection compaction applied.
+#[allow(dead_code)] // Wired in Phase 2 when session projection is activated
+fn save_projected_session(
+    memory: &MemorySubstrate,
+    session: &mut Session,
+    extra_trace_filters: &[String],
+) -> OpenFangResult<()> {
+    compact_session_execution_trace(session, extra_trace_filters);
+    memory
+        .save_session(session)
+        .map_err(|e| OpenFangError::Memory(e.to_string()))
+}
+
+/// Best-effort session save with compaction. Logs warning on failure.
+#[allow(dead_code)] // Wired in Phase 2 when session projection is activated
+fn save_projected_session_best_effort(
+    memory: &MemorySubstrate,
+    session: &mut Session,
+    extra_trace_filters: &[String],
+    context: &str,
+) {
+    if let Err(e) = save_projected_session(memory, session, extra_trace_filters) {
+        warn!("{context}: {e}");
+    }
+}
+
+/// Read tool placeholder text from agent manifest metadata.
+///
+/// Returns the placeholder for a tool name, or a generic fallback.
+/// Config path: `metadata.turn_behavior.tool_placeholders` (flat map).
+#[allow(dead_code)] // Wired in Phase 2 when tool placeholders are configured
+fn persistent_turn_placeholder_text(manifest: &AgentManifest, tool_name: &str) -> Option<String> {
+    const FALLBACK: &str = "处理中…";
+
+    let placeholders = manifest
+        .metadata
+        .get("turn_behavior")
+        .and_then(|v| v.get("tool_placeholders"))
+        .and_then(|v| v.as_object());
+
+    match placeholders {
+        Some(map) => {
+            let text = map
+                .get(tool_name)
+                .and_then(|v| v.as_str())
+                .unwrap_or(FALLBACK);
+            Some(text.to_string())
+        }
+        None => None, // No placeholders configured
+    }
+}
 
 /// Agent lifecycle phase within the execution loop.
 /// Used for UX indicators (typing, reactions) without coupling to channel types.

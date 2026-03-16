@@ -40,6 +40,81 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
 
+// ---------------------------------------------------------------------------
+// Generic mechanism helpers (agent-name-agnostic)
+// ---------------------------------------------------------------------------
+
+/// UTF-8 safe character truncation.
+#[allow(dead_code)] // Used when template reconciliation is wired in
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    text.char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| &text[..idx])
+        .unwrap_or(text)
+}
+
+/// Check whether an agent manifest marks it as a stateless orchestrator.
+#[allow(dead_code)] // Used when agent class routing is wired in
+fn stateless_orchestrator(manifest: &AgentManifest) -> bool {
+    manifest.agent_class == AgentClass::Orchestrator
+}
+
+/// Create a fresh empty session for stateless agents (e.g., orchestrators).
+#[allow(dead_code)] // Used when agent class routing is wired in
+fn fresh_agent_session(
+    agent_id: AgentId,
+    session_id: SessionId,
+) -> openfang_memory::session::Session {
+    openfang_memory::session::Session {
+        id: session_id,
+        agent_id,
+        messages: Vec::new(),
+        context_window_tokens: 0,
+        label: None,
+    }
+}
+
+/// Resolve the template manifest path for a template-backed agent.
+///
+/// Template agents (Roleplay, Orchestrator) have a template file on disk
+/// that provides default configuration. The persisted manifest in the registry
+/// is merged with the template on startup.
+#[allow(dead_code)] // Used when template reconciliation is wired in
+fn template_manifest_path(agents_dir: &Path, agent_name: &str) -> PathBuf {
+    agents_dir.join(agent_name).join("agent.toml")
+}
+
+/// Load a template manifest from the agents directory.
+#[allow(dead_code)] // Used when template reconciliation is wired in
+fn load_template_manifest(agents_dir: &Path, agent_name: &str) -> Option<AgentManifest> {
+    let path = template_manifest_path(agents_dir, agent_name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let manifest: AgentManifest = toml::from_str(&content).ok()?;
+    Some(manifest)
+}
+
+/// Reconcile a persisted manifest with its on-disk template.
+///
+/// The template provides defaults; the persisted manifest provides runtime overrides
+/// (pinned model, workspace path, etc.). Template fields take precedence for
+/// system_prompt, capabilities, and metadata.
+#[allow(dead_code)] // Used when template reconciliation is wired in
+fn reconcile_template_backed_manifest(
+    persisted: &AgentManifest,
+    template: &AgentManifest,
+) -> AgentManifest {
+    let mut merged = template.clone();
+    // Preserve runtime-specific fields from persisted manifest
+    merged.name = persisted.name.clone();
+    if persisted.pinned_model.is_some() {
+        merged.pinned_model = persisted.pinned_model.clone();
+    }
+    if persisted.workspace.is_some() {
+        merged.workspace = persisted.workspace.clone();
+    }
+    merged
+}
+
 /// The main OpenFang kernel — coordinates all subsystems.
 /// Stub LLM driver used when no providers are configured.
 /// Returns a helpful error so the dashboard still boots and users can configure providers.
@@ -1444,25 +1519,110 @@ impl OpenFangKernel {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
 
+        // --- Pre-turn hook: call MCP tool before agent loop starts ---
+        let mut effective_message = message.to_string();
+        let mut user_message_injection: Option<String> = None;
+
+        if let Some(ref pre_turn) = entry.manifest.pre_turn {
+            let mut args = serde_json::json!({});
+            if pre_turn.pass_message {
+                args["message"] = serde_json::Value::String(message.to_string());
+            }
+            match self.call_mcp_tool(&pre_turn.tool, &args).await {
+                Ok(result_text) => {
+                    // Parse structured JSON response
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result_text) {
+                        if let Some(append) = parsed.get("append_to_message").and_then(|v| v.as_str()) {
+                            if !append.is_empty() {
+                                effective_message.push('\n');
+                                effective_message.push_str(append);
+                            }
+                        }
+                        if let Some(injection) = parsed.get("agent_send_injection").and_then(|v| v.as_str()) {
+                            if !injection.is_empty() {
+                                user_message_injection = Some(injection.to_string());
+                            }
+                        }
+                    } else {
+                        warn!(
+                            agent_id = %agent_id,
+                            tool = %pre_turn.tool,
+                            "Pre-turn hook returned non-JSON — skipping"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        agent_id = %agent_id,
+                        tool = %pre_turn.tool,
+                        error = %e,
+                        "Pre-turn hook failed — using original message"
+                    );
+                }
+            }
+        }
+
         // Dispatch based on module type
-        let result = if entry.manifest.module.starts_with("wasm:") {
-            self.execute_wasm_agent(&entry, message, kernel_handle)
-                .await
-        } else if entry.manifest.module.starts_with("python:") {
-            self.execute_python_agent(&entry, agent_id, message).await
-        } else {
-            // Default: LLM agent loop (builtin:chat or any unrecognized module)
-            self.execute_llm_agent(&entry, agent_id, message, kernel_handle, content_blocks)
-                .await
+        // Wrap in USER_MESSAGE_INJECTION scope if pre-turn hook provided injection
+        let result = {
+            let msg = effective_message.as_str();
+            if entry.manifest.module.starts_with("wasm:") {
+                self.execute_wasm_agent(&entry, msg, kernel_handle)
+                    .await
+            } else if entry.manifest.module.starts_with("python:") {
+                self.execute_python_agent(&entry, agent_id, msg).await
+            } else {
+                // Default: LLM agent loop (builtin:chat or any unrecognized module)
+                let injection = user_message_injection.clone();
+                openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
+                    .scope(injection, async {
+                        self.execute_llm_agent(
+                            &entry,
+                            agent_id,
+                            msg,
+                            kernel_handle,
+                            content_blocks,
+                        )
+                        .await
+                    })
+                    .await
+            }
         };
 
         match result {
-            Ok(result) => {
+            Ok(mut result) => {
                 // Record token usage for quota tracking
                 self.scheduler.record_usage(agent_id, &result.total_usage);
 
                 // Update last active time
                 let _ = self.registry.set_state(agent_id, AgentState::Running);
+
+                // --- Post-turn hook: call MCP tool after agent loop completes ---
+                if let Some(ref post_turn) = entry.manifest.post_turn {
+                    let mut args = serde_json::json!({});
+                    if post_turn.pass_response {
+                        args["agent_response"] =
+                            serde_json::Value::String(result.response.clone());
+                    }
+                    // Call the configured MCP tool
+                    let tool_result = self.call_mcp_tool(&post_turn.tool, &args).await;
+                    match tool_result {
+                        Ok(_) => {
+                            if post_turn.clear_response {
+                                result.response.clear();
+                            }
+                        }
+                        Err(e) => {
+                            // Hook failure: log error, do NOT clear response (keep as fallback)
+                            warn!(
+                                agent_id = %agent_id,
+                                tool = %post_turn.tool,
+                                error = %e,
+                                "Post-turn hook failed — response preserved as fallback"
+                            );
+                        }
+                    }
+                }
 
                 // SECURITY: Record successful message in audit trail
                 self.audit_log.record(
@@ -2051,6 +2211,51 @@ impl OpenFangKernel {
             silent: false,
             directives: Default::default(),
         })
+    }
+
+    /// Call an MCP tool by name, returning the text content of the result.
+    ///
+    /// Used by pre-turn and post-turn hooks to invoke configured MCP tools.
+    /// The tool must be available in one of the kernel's connected MCP servers.
+    async fn call_mcp_tool(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> KernelResult<String> {
+        let mut connections = self.mcp_connections.lock().await;
+        for conn in connections.iter_mut() {
+            if conn.tools().iter().any(|t| t.name == tool_name) {
+                let result = conn
+                    .call_tool(tool_name, args)
+                    .await
+                    .map_err(|e| {
+                        KernelError::OpenFang(OpenFangError::Internal(format!(
+                            "MCP tool {tool_name} failed: {e}"
+                        )))
+                    })?;
+                return Ok(result);
+            }
+        }
+
+        Err(KernelError::OpenFang(OpenFangError::Internal(format!(
+            "MCP tool '{tool_name}' not found in any connected server"
+        ))))
+    }
+
+    /// Build extra environment variables for MCP subprocess spawning.
+    ///
+    /// Includes kernel-level paths (OPENFANG_HOME, data dirs, etc.)
+    /// that MCP tools need to access runtime state.
+    #[allow(dead_code)] // Used when MCP extra_env is wired into connection setup
+    fn mcp_extra_env(&self) -> std::collections::BTreeMap<String, String> {
+        let mut env = std::collections::BTreeMap::new();
+        if let Some(home) = self.config.home_dir.as_ref() {
+            env.insert("OPENFANG_HOME".to_string(), home.display().to_string());
+        }
+        if let Some(data) = self.config.data_dir.as_ref() {
+            env.insert("OPENFANG_DATA_DIR".to_string(), data.display().to_string());
+        }
+        env
     }
 
     /// Execute the default LLM-based agent loop.
