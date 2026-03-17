@@ -262,7 +262,7 @@ fn save_llm_request_log(
         return;
     }
 
-    // Build a human-readable JSON log entry
+    // Build a complete JSON log entry with full text content
     let messages_log: Vec<serde_json::Value> = messages
         .iter()
         .enumerate()
@@ -270,8 +270,7 @@ fn save_llm_request_log(
             serde_json::json!({
                 "index": i,
                 "role": format!("{:?}", msg.role),
-                "content_preview": msg.content.text_content().chars().take(500).collect::<String>(),
-                "content_length": msg.content.text_length(),
+                "content": msg.content.text_content(),
             })
         })
         .collect();
@@ -281,7 +280,7 @@ fn save_llm_request_log(
         "agent": agent_name,
         "model": model,
         "iteration": iteration,
-        "system_prompt_length": system_prompt.len(),
+        "system_prompt": system_prompt,
         "message_count": messages.len(),
         "messages": messages_log,
     });
@@ -503,7 +502,10 @@ fn persistent_turn_placeholder(tool_calls: &[ToolCall]) -> String {
                 parts.push("（录了段视频发过去）".to_string());
             }
             "mcp_toolbox_this_moment" => {
-                parts.push("（拍了眼前的画面发过去）".to_string());
+                parts.push("（心里印下了这一幕）".to_string());
+            }
+            "mcp_toolbox_this_scene" => {
+                parts.push("（心里留住了这一幕）".to_string());
             }
             "mcp_toolbox_change_clothes" => {
                 parts.push("（换了身衣服）".to_string());

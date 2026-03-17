@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const ASYNC_MEDIA_TASK_TITLE: &str = "async_media";
 const ASYNC_MEDIA_WORKER_ID: &str = "__async_media_worker";
@@ -464,9 +464,10 @@ fn build_user_injection_for_timeline(
     match scenario {
         WorldEngineScenario::NonOwnerFallback => None,
         WorldEngineScenario::ScheduledTick => {
-            // TICK: fixed prompt with time + location
-            let (time_str, location) = read_life_state_for_timeline(config);
-            Some(format!("[{time_str}，{location}] 你看了眼时钟。"))
+            // TICK: minimal user message trigger. The actual TICK action
+            // ("[时间，地点] 我看了眼时间。") is appended to the world state
+            // by world-engine and injected as assistant role via DynamicInjection.
+            Some("[续]".to_string())
         }
         WorldEngineScenario::PrivateChat | WorldEngineScenario::GroupChat => {
             // Extract raw user message from gateway payload ("对方说：" marker)
@@ -2724,6 +2725,15 @@ impl OpenFangKernel {
         let mut executed_any = false;
         let mut narrative_fragments: Vec<String> = Vec::new();
 
+        info!(
+            agent = %entry.name,
+            agent_id = %agent_id,
+            intents_count = intents.len(),
+            delivery_target = ?delivery_target.as_ref().map(|(ch, id, _)| format!("{ch}:{id}")),
+            interaction_mode = %interaction_mode,
+            "Turn Script: processing intents"
+        );
+
         for (index, intent) in intents.iter().enumerate() {
             let Some(intent_type) = intent.get("type").and_then(|value| value.as_str()) else {
                 warn!(
@@ -2734,6 +2744,14 @@ impl OpenFangKernel {
                 );
                 continue;
             };
+
+            info!(
+                agent = %entry.name,
+                agent_id = %agent_id,
+                index,
+                intent_type,
+                "Turn Script: processing intent"
+            );
 
             match intent_type {
                 "text" => {
@@ -3452,6 +3470,24 @@ impl OpenFangKernel {
                         input_images.push(avatar_path.to_string());
                     }
 
+                    let image_size = preferred_image_size(description);
+                    info!(
+                        agent = %entry.name,
+                        agent_id = %agent_id,
+                        index,
+                        intent_type,
+                        image_size,
+                        input_images_count = input_images.len(),
+                        prompt_len = prompt.len(),
+                        "Turn Script: generating image"
+                    );
+
+                    let failure_notice = if intent_type == "selfie" {
+                        "刚才拍了，但没出来……我再试一次。"
+                    } else {
+                        "刚才想留住这一刻的画面，但没出来……"
+                    };
+
                     match self
                         .execute_world_engine_tool_json(
                             agent_id,
@@ -3461,7 +3497,7 @@ impl OpenFangKernel {
                             serde_json::json!({
                                 "prompt": prompt,
                                 "input_images": input_images,
-                                "size": preferred_image_size(description),
+                                "size": image_size,
                             }),
                         )
                         .await
@@ -3470,6 +3506,13 @@ impl OpenFangKernel {
                             if let Some(image_path) =
                                 image.get("image_path").and_then(|value| value.as_str())
                             {
+                                info!(
+                                    agent = %entry.name,
+                                    agent_id = %agent_id,
+                                    index,
+                                    image_path,
+                                    "Turn Script: image generated, delivering"
+                                );
                                 match self
                                     .execute_world_engine_tool(
                                         agent_id,
@@ -3511,15 +3554,65 @@ impl OpenFangKernel {
                                                 description
                                             ));
                                         }
+                                        info!(
+                                            agent = %entry.name,
+                                            agent_id = %agent_id,
+                                            index,
+                                            intent_type,
+                                            "Turn Script: image delivered successfully"
+                                        );
                                     }
                                     Err(error) => {
-                                        warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine image delivery failed")
+                                        error!(agent = %entry.name, agent_id = %agent_id, index, %error, "Turn Script: image delivery failed");
+                                        // Notify user about the failure
+                                        let _ = self
+                                            .execute_world_engine_tool(
+                                                agent_id,
+                                                manifest,
+                                                &format!("world_engine_image_fail_notice_{index}"),
+                                                &format!("mcp_{channel}_send_text_message"),
+                                                serde_json::json!({
+                                                    "receive_id": receive_id,
+                                                    "receive_id_type": receive_id_type,
+                                                    "text": failure_notice,
+                                                }),
+                                            )
+                                            .await;
                                     }
                                 }
+                            } else {
+                                error!(agent = %entry.name, agent_id = %agent_id, index, "Turn Script: image generation returned no image_path");
+                                let _ = self
+                                    .execute_world_engine_tool(
+                                        agent_id,
+                                        manifest,
+                                        &format!("world_engine_image_fail_notice_{index}"),
+                                        &format!("mcp_{channel}_send_text_message"),
+                                        serde_json::json!({
+                                            "receive_id": receive_id,
+                                            "receive_id_type": receive_id_type,
+                                            "text": failure_notice,
+                                        }),
+                                    )
+                                    .await;
                             }
                         }
                         Err(error) => {
-                            warn!(agent = %entry.name, agent_id = %agent_id, index, %error, "World-engine image generation failed")
+                            error!(agent = %entry.name, agent_id = %agent_id, index, %error, "Turn Script: image generation failed");
+                            // Notify user about the failure
+                            let _ = self
+                                .execute_world_engine_tool(
+                                    agent_id,
+                                    manifest,
+                                    &format!("world_engine_image_fail_notice_{index}"),
+                                    &format!("mcp_{channel}_send_text_message"),
+                                    serde_json::json!({
+                                        "receive_id": receive_id,
+                                        "receive_id_type": receive_id_type,
+                                        "text": failure_notice,
+                                    }),
+                                )
+                                .await;
                         }
                     }
                 }
@@ -3555,6 +3648,15 @@ impl OpenFangKernel {
                 "World-engine failed to clear Turn Script after deterministic execution"
             );
         }
+
+        info!(
+            agent = %entry.name,
+            agent_id = %agent_id,
+            intents_count = intents.len(),
+            executed_any,
+            narrative_fragments_count = narrative_fragments.len(),
+            "Turn Script: completed"
+        );
 
         Ok(executed_any)
     }
