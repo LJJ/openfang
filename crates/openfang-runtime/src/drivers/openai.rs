@@ -132,6 +132,15 @@ struct OaiUsage {
 #[async_trait]
 impl LlmDriver for OpenAIDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        // Delegate to streaming implementation with a dummy channel.
+        // This ensures all requests use stream:true, which some API proxies require.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+        // Spawn a task to drain the channel so the stream method doesn't block.
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        return self.stream(request, tx).await;
+
+        // --- Original non-streaming implementation below (kept for reference) ---
+        #[allow(unreachable_code)]
         let mut oai_messages: Vec<OaiMessage> = Vec::new();
 
         // Add system message if present

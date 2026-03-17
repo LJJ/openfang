@@ -344,6 +344,70 @@ fn detect_world_engine_scenario(message: &str) -> WorldEngineScenario {
     WorldEngineScenario::PrivateChat
 }
 
+/// Extract the user message from the gateway payload, apply first-person
+/// replacement ("我" → "公子" inside parentheses), and format as a labeled
+/// block for auto-injection into `agent_send` calls.
+fn extract_user_message_for_injection(message: &str, _config: &KernelConfig) -> Option<String> {
+    let scenario = detect_world_engine_scenario(message);
+    if scenario == WorldEngineScenario::ScheduledTick || scenario == WorldEngineScenario::NonOwnerFallback {
+        return None;
+    }
+
+    // Find "对方说：" marker and extract everything after it
+    let patterns = ["对方说：\n", "对方说:\n", "对方说：", "对方说:"];
+    let raw = patterns.iter().find_map(|pat| {
+        message.find(pat).map(|idx| message[idx + pat.len()..].trim())
+    })?;
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Replace first-person "我" with "公子" only inside parentheses (行为描写)
+    let user_name = "公子";
+    let processed = replace_first_person_in_parens(raw, user_name);
+
+    if scenario == WorldEngineScenario::GroupChat {
+        // Group chat: include sender name and privacy warning
+        let sender_name = parse_channel_context_value(message, "sender_name")
+            .unwrap_or_else(|| "someone".to_string());
+        Some(format!(
+            "[群聊消息]\n{sender_name}说：\n{processed}\n\n\
+             [⚠️ 隐私警告 ⚠️]\n\
+             这是群聊消息！绝对不要提及你和公子的私人关系、当前位置、任何亲密细节。\n\
+             保持专业、冷静、有边界感。不用亲昵称呼，不撒娇。\n\
+             不确定要不要回复，可以不回复。"
+        ))
+    } else {
+        // Private chat
+        Some(format!("[公子]\n{processed}"))
+    }
+}
+
+/// Replace "我" with `name` only inside parentheses (Chinese or ASCII).
+/// Parenthesized text represents action descriptions; quoted speech is left as-is.
+fn replace_first_person_in_parens(text: &str, name: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_paren = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '(' | '\u{FF08}' => { // （
+                in_paren = true;
+                result.push(ch);
+            }
+            ')' | '\u{FF09}' => { // ）
+                in_paren = false;
+                result.push(ch);
+            }
+            '我' if in_paren => {
+                result.push_str(name);
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
 /// Format a tool result value for injection into world-engine context.
 fn format_tool_result(label: &str, result: &Result<serde_json::Value, String>) -> String {
     match result {
@@ -3616,6 +3680,14 @@ impl OpenFangKernel {
             message.to_string()
         };
 
+        // Extract user message BEFORE pre-fetch appends [预取状态] to the message.
+        // Otherwise the raw JSON state would be captured as part of the user message.
+        let user_injection: Option<String> = if entry.name == "world-engine" {
+            extract_user_message_for_injection(&message_with_links, &self.config)
+        } else {
+            None
+        };
+
         // For world-engine: pre-fetch state and inject into user message.
         // This eliminates the first LLM round where the LLM calls read-only tools.
         let message_with_links = if entry.name == "world-engine" {
@@ -3624,12 +3696,6 @@ impl OpenFangKernel {
         } else {
             message_with_links
         };
-
-        // User message injection removed: prepare_world_context (MCP pre-turn hook)
-        // already extracts the user message with correct nickname ("公子") and
-        // world-engine copies it into agent_send. The kernel-side injection was
-        // causing duplication ([公子] + [卢吉骥] both appearing).
-        let user_injection: Option<String> = None;
 
         let mut result = openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
             .scope(user_injection, async {
