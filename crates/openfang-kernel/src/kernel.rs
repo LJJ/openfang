@@ -178,75 +178,6 @@ fn parse_channel_delivery_target(message: &str) -> Option<(String, String, Strin
     }
 }
 
-/// Extract user's raw text from a gateway message, replace sentence-initial "我"
-/// with the configured user_name, and return a formatted block for kernel-side
-/// injection.
-///
-/// Only "我" at the very start of the text or immediately after a sentence-ending
-/// punctuation mark (，。！？…；、\n) is replaced.  Mid-word occurrences like
-/// "给我" or "我们" are left untouched.
-fn build_user_message_injection(message: &str, user_name: &str) -> Option<String> {
-    // User text appears after "对方说：\n"
-    let marker = "对方说：\n";
-    let idx = message.find(marker)?;
-    let raw_text = &message[idx + marker.len()..];
-    // Stop at the next section marker if any
-    let user_text = if let Some(end) = raw_text.find("\n[") {
-        &raw_text[..end]
-    } else {
-        raw_text.trim_end()
-    };
-    if user_text.is_empty() {
-        return None;
-    }
-    let replaced = replace_sentence_initial_wo(user_text, user_name);
-    Some(format!("[{user_name}]\n{replaced}"))
-}
-
-/// Replace "我" only when it appears at the start of a sentence.
-///
-/// A "sentence start" is defined as:
-/// - The very beginning of the string, or
-/// - Immediately after one of the sentence-ending punctuation characters:
-///   ，。！？…；、 or a newline (\n)
-/// - Optional whitespace between the punctuation and "我" is allowed.
-///
-/// This avoids replacing "我" inside words like "我们", "给我", "自我" etc.
-fn replace_sentence_initial_wo(text: &str, replacement: &str) -> String {
-    const SENTENCE_DELIMITERS: &[char] = &['，', '。', '！', '？', '…', '；', '、', '\n'];
-
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.char_indices().peekable();
-    let mut at_sentence_start = true;
-
-    while let Some((_i, ch)) = chars.next() {
-        if ch == '我' && at_sentence_start {
-            // Check the next char is NOT a Chinese character that forms a compound
-            // word with 我 (e.g. 我们, 我的 are common but 我的 should be replaced
-            // since 我 is the subject; only skip 我们 as it's a different pronoun)
-            let next_char = chars.peek().map(|&(_, c)| c);
-            if next_char == Some('们') {
-                // "我们" — don't replace, push as-is
-                result.push(ch);
-                at_sentence_start = false;
-            } else {
-                result.push_str(replacement);
-                at_sentence_start = false;
-            }
-        } else {
-            result.push(ch);
-            if SENTENCE_DELIMITERS.contains(&ch) {
-                at_sentence_start = true;
-            } else if ch.is_whitespace() {
-                // whitespace preserves sentence-start state
-            } else {
-                at_sentence_start = false;
-            }
-        }
-    }
-    result
-}
-
 fn state_agent_name() -> String {
     std::env::var("OPENFANG_STATE_AGENT")
         .ok()
@@ -3694,24 +3625,11 @@ impl OpenFangKernel {
             message_with_links
         };
 
-        // For world-engine: pre-process user message in code (我→user_name)
-        // so agent_send injects it directly without LLM rewriting.
-        let user_injection = if entry.name == "world-engine" {
-            let user_name = self
-                .memory
-                .structured_get(shared_memory_agent_id(), "user_name")
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default();
-            if user_name.is_empty() {
-                None
-            } else {
-                build_user_message_injection(message, &user_name)
-            }
-        } else {
-            None
-        };
+        // User message injection removed: prepare_world_context (MCP pre-turn hook)
+        // already extracts the user message with correct nickname ("公子") and
+        // world-engine copies it into agent_send. The kernel-side injection was
+        // causing duplication ([公子] + [卢吉骥] both appearing).
+        let user_injection: Option<String> = None;
 
         let mut result = openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
             .scope(user_injection, async {
