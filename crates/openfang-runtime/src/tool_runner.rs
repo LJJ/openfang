@@ -9,6 +9,7 @@ use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +17,26 @@ use tracing::{debug, warn};
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
+
+// ── Dynamic injection mechanism ─────────────────────────────────────
+
+/// Content to inject into the LLM messages at call time, without persisting to session.
+#[derive(Debug, Clone)]
+pub struct DynamicInjection {
+    /// The content to inject.
+    pub content: String,
+    /// Where to inject it.
+    pub position: InjectionPosition,
+}
+
+/// Where to insert a dynamic injection in the messages list.
+#[derive(Debug, Clone)]
+pub enum InjectionPosition {
+    /// Insert an independent Assistant message before the message at `offset_from_last`
+    /// positions from the end.
+    /// offset_from_last=0 → insert before the last message (i.e. penultimate position).
+    InsertAssistant { offset_from_last: usize },
+}
 
 /// Check if a shell command should be blocked by taint tracking.
 ///
@@ -84,6 +105,9 @@ tokio::task_local! {
     /// Pre-processed user message to inject into agent_send calls.
     /// Set by the kernel when dispatching to world-engine; read by tool_agent_send.
     pub static USER_MESSAGE_INJECTION: Option<String>;
+    /// Accumulated dynamic injections for the current agent turn.
+    /// Written by tool_agent_send (world state), consumed by run_agent_loop before LLM call.
+    pub static DYNAMIC_INJECTIONS: RefCell<Vec<DynamicInjection>>;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
@@ -98,6 +122,21 @@ pub fn user_message_injection() -> Option<String> {
         .try_with(|v| v.clone())
         .ok()
         .flatten()
+}
+
+/// Push a dynamic injection into the current task-local accumulator.
+pub fn push_dynamic_injection(injection: DynamicInjection) {
+    let _ = DYNAMIC_INJECTIONS.try_with(|cell| {
+        cell.borrow_mut().push(injection);
+    });
+}
+
+/// Take all accumulated dynamic injections, leaving the accumulator empty.
+/// Returns an empty Vec if called outside a DYNAMIC_INJECTIONS scope.
+pub fn take_dynamic_injections() -> Vec<DynamicInjection> {
+    DYNAMIC_INJECTIONS
+        .try_with(|cell| cell.borrow_mut().drain(..).collect())
+        .unwrap_or_default()
 }
 
 /// Execute a tool by name with the given input, returning a ToolResult.
@@ -1484,9 +1523,21 @@ async fn tool_agent_send(
         ));
     }
 
-    // Inject pre-processed user message if available (world-engine → assistant)
-    let final_message = if let Some(injection) = user_message_injection() {
-        format!("{message}\n\n{injection}")
+    // Split: world state → dynamic injection, user message → session message.
+    // When USER_MESSAGE_INJECTION is set (normal message / TICK via world-engine),
+    // the agent_send `message` is world state — push it as a DynamicInjection,
+    // and send the pre-built timeline entry as the session user message.
+    let final_message = if let Some(user_msg) = user_message_injection() {
+        // World state becomes a dynamic injection (assistant role, before last user msg)
+        push_dynamic_injection(DynamicInjection {
+            content: message.to_string(),
+            position: InjectionPosition::InsertAssistant { offset_from_last: 0 },
+        });
+        if user_msg.is_empty() {
+            warn!("USER_MESSAGE_INJECTION is empty — assistant will receive no user message");
+        }
+        // The timeline entry (or TICK prompt) becomes the session user message
+        user_msg
     } else {
         message.to_string()
     };

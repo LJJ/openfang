@@ -344,68 +344,173 @@ fn detect_world_engine_scenario(message: &str) -> WorldEngineScenario {
     WorldEngineScenario::PrivateChat
 }
 
-/// Extract the user message from the gateway payload, apply first-person
-/// replacement ("我" → "公子" inside parentheses), and format as a labeled
-/// block for auto-injection into `agent_send` calls.
-fn extract_user_message_for_injection(message: &str, _config: &KernelConfig) -> Option<String> {
-    let scenario = detect_world_engine_scenario(message);
-    if scenario == WorldEngineScenario::ScheduledTick || scenario == WorldEngineScenario::NonOwnerFallback {
-        return None;
-    }
+// extract_user_message_for_injection() — removed: replaced by build_user_injection_for_timeline()
+// replace_first_person_in_parens() — removed: user messages are now passed through unmodified
 
-    // Find "对方说：" marker and extract everything after it
-    let patterns = ["对方说：\n", "对方说:\n", "对方说：", "对方说:"];
-    let raw = patterns.iter().find_map(|pat| {
-        message.find(pat).map(|idx| message[idx + pat.len()..].trim())
-    })?;
-    if raw.is_empty() {
-        return None;
-    }
+// ── Timeline entry construction (消息协议重构) ─────────────────────
 
-    // Replace first-person "我" with "公子" only inside parentheses (行为描写)
-    let user_name = "公子";
-    let processed = replace_first_person_in_parens(raw, user_name);
+/// How the sender is interacting with the character.
+#[derive(Debug, Clone, Copy)]
+enum ActionType {
+    /// 面对面（in_person）→ "行为"
+    InPerson,
+    /// 远程消息（remote）→ "发的消息"
+    Remote,
+    /// 群聊消息 → "发的群消息"
+    Group,
+}
 
-    if scenario == WorldEngineScenario::GroupChat {
-        // Group chat: include sender name and privacy warning
-        let sender_name = parse_channel_context_value(message, "sender_name")
-            .unwrap_or_else(|| "someone".to_string());
-        Some(format!(
-            "[群聊消息]\n{sender_name}说：\n{processed}\n\n\
-             [⚠️ 隐私警告 ⚠️]\n\
-             这是群聊消息！绝对不要提及你和公子的私人关系、当前位置、任何亲密细节。\n\
-             保持专业、冷静、有边界感。不用亲昵称呼，不撒娇。\n\
-             不确定要不要回复，可以不回复。"
-        ))
-    } else {
-        // Private chat
-        Some(format!("[公子]\n{processed}"))
+impl ActionType {
+    /// Returns the action type suffix including the connecting particle.
+    /// InPerson: "的行为", Remote: "发的消息", Group: "发的群消息"
+    fn suffix(&self) -> &'static str {
+        match self {
+            ActionType::InPerson => "的行为",
+            ActionType::Remote => "发的消息",
+            ActionType::Group => "发的群消息",
+        }
     }
 }
 
-/// Replace "我" with `name` only inside parentheses (Chinese or ASCII).
-/// Parenthesized text represents action descriptions; quoted speech is left as-is.
-fn replace_first_person_in_parens(text: &str, name: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut in_paren = false;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '(' | '\u{FF08}' => { // （
-                in_paren = true;
-                result.push(ch);
+/// Build a unified timeline entry for an external message.
+///
+/// Format: `[{time}，{location}] {name}{suffix}：\n{content}`
+/// where suffix = "的行为" / "发的消息" / "发的群消息"
+///
+/// For group messages, a privacy warning is appended after the content.
+fn build_timeline_entry(
+    content: &str,
+    name: &str,
+    action_type: ActionType,
+    time_str: &str,
+    location: &str,
+) -> String {
+    let suffix = action_type.suffix();
+    let mut entry = format!("[{time_str}，{location}] {name}{suffix}：\n{content}");
+
+    if matches!(action_type, ActionType::Group) {
+        entry.push_str(
+            "\n\n⚠️ 隐私警告 ⚠️\n\
+             这是群聊消息！绝对不要提及你和公子的私人关系、当前位置、任何亲密细节。\n\
+             保持专业、冷静、有边界感。不用亲昵称呼，不撒娇。\n\
+             不确定要不要回复，可以不回复。",
+        );
+    }
+
+    entry
+}
+
+/// Read life state from the filesystem and return (time_str, location, interaction_mode).
+///
+/// time_str is formatted as HH:MM in the character's home timezone.
+fn read_life_state_for_timeline(config: &KernelConfig) -> (String, String) {
+    let state_path = turn_state_agent_dir(config).join("life").join("state.json");
+    let state: serde_json::Value = std::fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let tz_name = state
+        .get("home_timezone")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Asia/Shanghai");
+
+    // Compute current time in the character's timezone
+    let time_str = {
+        use chrono::Utc;
+        let now = Utc::now();
+        // Use chrono-tz if available, fallback to UTC offset calculation
+        let formatted = chrono_tz_format_time(now, tz_name);
+        formatted
+    };
+
+    let location = state
+        .get("location")
+        .and_then(|v| v.as_str())
+        .unwrap_or("家")
+        .to_string();
+
+    (time_str, location)
+}
+
+/// Format a UTC timestamp into HH:MM in the given IANA timezone.
+fn chrono_tz_format_time(now: chrono::DateTime<chrono::Utc>, tz_name: &str) -> String {
+    use chrono::Timelike;
+    // Parse timezone offset from IANA name — simplified for common Chinese timezones.
+    // Asia/Shanghai is UTC+8, the only timezone used in practice.
+    let offset_hours: i32 = match tz_name {
+        "Asia/Shanghai" | "Asia/Chongqing" | "Asia/Hong_Kong" | "Asia/Taipei" => 8,
+        "Asia/Tokyo" => 9,
+        "Asia/Seoul" => 9,
+        "America/New_York" => -5,
+        "America/Los_Angeles" => -8,
+        "Europe/London" => 0,
+        _ => 8, // default to CST
+    };
+    let local = now + chrono::Duration::hours(offset_hours as i64);
+    format!("{:02}:{:02}", local.hour(), local.minute())
+}
+
+/// Build the user message injection for the new timeline protocol.
+///
+/// Returns Some(timeline_entry) for private/group messages, Some(tick_prompt) for TICK.
+fn build_user_injection_for_timeline(
+    message: &str,
+    config: &KernelConfig,
+    user_name: &str,
+) -> Option<String> {
+    let scenario = detect_world_engine_scenario(message);
+
+    match scenario {
+        WorldEngineScenario::NonOwnerFallback => None,
+        WorldEngineScenario::ScheduledTick => {
+            // TICK: fixed prompt with time + location
+            let (time_str, location) = read_life_state_for_timeline(config);
+            Some(format!("[{time_str}，{location}] 你看了眼时钟。"))
+        }
+        WorldEngineScenario::PrivateChat | WorldEngineScenario::GroupChat => {
+            // Extract raw user message from gateway payload ("对方说：" marker)
+            let patterns = ["对方说：\n", "对方说:\n", "对方说：", "对方说:"];
+            let raw = patterns.iter().find_map(|pat| {
+                message.find(pat).map(|idx| message[idx + pat.len()..].trim())
+            })?;
+            if raw.is_empty() {
+                return None;
             }
-            ')' | '\u{FF09}' => { // ）
-                in_paren = false;
-                result.push(ch);
+
+            let (time_str, location) = read_life_state_for_timeline(config);
+            let mode = current_interaction_mode(config);
+
+            match scenario {
+                WorldEngineScenario::GroupChat => {
+                    let sender_name = parse_channel_context_value(message, "sender_name")
+                        .unwrap_or_else(|| "someone".to_string());
+                    Some(build_timeline_entry(
+                        raw,
+                        &sender_name,
+                        ActionType::Group,
+                        &time_str,
+                        &location,
+                    ))
+                }
+                _ => {
+                    // Private chat: action_type depends on interaction_mode
+                    let action_type = if mode == "in_person" {
+                        ActionType::InPerson
+                    } else {
+                        ActionType::Remote
+                    };
+                    Some(build_timeline_entry(
+                        raw,
+                        user_name,
+                        action_type,
+                        &time_str,
+                        &location,
+                    ))
+                }
             }
-            '我' if in_paren => {
-                result.push_str(name);
-            }
-            _ => result.push(ch),
         }
     }
-    result
 }
 
 /// Format a tool result value for injection into world-engine context.
@@ -3680,10 +3785,23 @@ impl OpenFangKernel {
             message.to_string()
         };
 
-        // Extract user message BEFORE pre-fetch appends [预取状态] to the message.
-        // Otherwise the raw JSON state would be captured as part of the user message.
+        // Build timeline entry BEFORE pre-fetch appends [预取状态] to the message.
+        // For external messages: [时间，地点] {name}的{action_type}：\n{content}
+        // For TICK: fixed prompt (e.g. "你看了眼时钟。")
         let user_injection: Option<String> = if entry.name == "world-engine" {
-            extract_user_message_for_injection(&message_with_links, &self.config)
+            let shared_id = shared_memory_agent_id();
+            let user_name_for_timeline = self
+                .memory
+                .structured_get(shared_id, "user_name")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "公子".to_string());
+            build_user_injection_for_timeline(
+                &message_with_links,
+                &self.config,
+                &user_name_for_timeline,
+            )
         } else {
             None
         };
@@ -3697,8 +3815,17 @@ impl OpenFangKernel {
             message_with_links
         };
 
+        // Wrap with USER_MESSAGE_INJECTION (timeline entry or TICK prompt) and
+        // DYNAMIC_INJECTIONS scope.
+        //
+        // When called from tool_agent_send (world-engine → assistant), injections
+        // were already pushed into the OUTER scope. Take them here and seed the
+        // inner scope so the target agent's run_agent_loop can consume them.
+        let inherited_injections = openfang_runtime::tool_runner::take_dynamic_injections();
         let mut result = openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
             .scope(user_injection, async {
+                openfang_runtime::tool_runner::DYNAMIC_INJECTIONS
+                    .scope(std::cell::RefCell::new(inherited_injections), async {
                 run_agent_loop(
                     &manifest,
                     &message_with_links,
@@ -3731,6 +3858,8 @@ impl OpenFangKernel {
                     media_blocks,
                 )
                 .await
+                    })
+                    .await
             })
             .await
             .map_err(KernelError::OpenFang)?;
@@ -7296,5 +7425,68 @@ tools = ["file_read"]
             "Media generation result missing preview_path"
         ));
         assert!(!is_retryable_async_media_error("衣服不存在：abc123"));
+    }
+
+    // ── Timeline entry tests ─────────────────────────────────────
+
+    #[test]
+    fn test_build_timeline_entry_in_person() {
+        let entry = build_timeline_entry(
+            "（走过来坐下）你好啊",
+            "公子",
+            ActionType::InPerson,
+            "14:23",
+            "家",
+        );
+        assert_eq!(entry, "[14:23，家] 公子的行为：\n（走过来坐下）你好啊");
+    }
+
+    #[test]
+    fn test_build_timeline_entry_remote() {
+        let entry = build_timeline_entry(
+            "你好啊，在干嘛？",
+            "公子",
+            ActionType::Remote,
+            "14:23",
+            "家",
+        );
+        assert_eq!(entry, "[14:23，家] 公子发的消息：\n你好啊，在干嘛？");
+    }
+
+    #[test]
+    fn test_build_timeline_entry_group() {
+        let entry = build_timeline_entry(
+            "大家好啊",
+            "小明",
+            ActionType::Group,
+            "14:23",
+            "家",
+        );
+        assert!(entry.starts_with("[14:23，家] 小明发的群消息：\n大家好啊"));
+        assert!(entry.contains("⚠️ 隐私警告 ⚠️"));
+        assert!(entry.contains("绝对不要提及你和公子的私人关系"));
+    }
+
+    #[test]
+    fn test_build_timeline_entry_preserves_raw_message() {
+        // User message with "我" should NOT be replaced
+        let entry = build_timeline_entry(
+            "（我走过来坐下）你好啊",
+            "公子",
+            ActionType::InPerson,
+            "14:23",
+            "家",
+        );
+        assert!(
+            entry.contains("我走过来坐下"),
+            "Raw message should be preserved without person replacement"
+        );
+    }
+
+    #[test]
+    fn test_action_type_suffixes() {
+        assert_eq!(ActionType::InPerson.suffix(), "的行为");
+        assert_eq!(ActionType::Remote.suffix(), "发的消息");
+        assert_eq!(ActionType::Group.suffix(), "发的群消息");
     }
 }

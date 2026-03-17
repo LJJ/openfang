@@ -176,6 +176,139 @@ fn manifest_silent_after_tools(manifest: &AgentManifest) -> HashSet<String> {
         .collect()
 }
 
+/// Apply dynamic injections to a messages list (clone, not in-place).
+///
+/// For each `DynamicInjection`, inserts content at the specified position.
+/// After insertion, merges adjacent assistant messages into multi-content-block
+/// messages to satisfy the LLM API's alternating-role constraint.
+fn apply_dynamic_injections(messages: &mut Vec<Message>) {
+    let injections = crate::tool_runner::take_dynamic_injections();
+    if injections.is_empty() {
+        return;
+    }
+
+    for injection in injections {
+        match injection.position {
+            crate::tool_runner::InjectionPosition::InsertAssistant { offset_from_last } => {
+                // Insert position: before the message at `offset_from_last` from the end.
+                let insert_idx = if messages.len() > offset_from_last {
+                    messages.len() - offset_from_last
+                } else {
+                    0
+                };
+                // Shift back by one more so we insert *before* that message
+                let insert_idx = insert_idx.saturating_sub(1);
+                messages.insert(insert_idx, Message::assistant(&injection.content));
+            }
+        }
+    }
+
+    // Note: injected assistant messages are kept as separate messages (not merged).
+    // The world state is logically independent from the character's previous reply.
+    // Most LLM APIs handle consecutive same-role messages gracefully.
+}
+
+/// Merge adjacent assistant messages into a single message with multiple
+/// text content blocks.  This preserves logical separation while satisfying
+/// the LLM API's alternating user/assistant requirement.
+fn merge_consecutive_assistant_messages(messages: &mut Vec<Message>) {
+    let mut i = 0;
+    while i + 1 < messages.len() {
+        if messages[i].role == Role::Assistant && messages[i + 1].role == Role::Assistant {
+            // Collect text blocks from both messages
+            let blocks_a = content_to_blocks(messages[i].content.clone());
+            let blocks_b = content_to_blocks(messages[i + 1].content.clone());
+            let mut merged = blocks_a;
+            merged.extend(blocks_b);
+            messages[i] = Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(merged),
+            };
+            messages.remove(i + 1);
+            // Don't increment i — check if the next message is also assistant
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Convert MessageContent to a Vec<ContentBlock>.
+fn content_to_blocks(content: MessageContent) -> Vec<ContentBlock> {
+    match content {
+        MessageContent::Text(text) => vec![ContentBlock::Text { text }],
+        MessageContent::Blocks(blocks) => blocks,
+    }
+}
+
+// ── LLM request logging ──────────────────────────────────────────────
+
+/// Persist the final LLM request (messages + system prompt) to a rotating log
+/// under the agent's workspace.  Keeps at most `MAX_REQUEST_LOGS` files so
+/// the directory stays small.  Best-effort — failures are silently ignored.
+const MAX_REQUEST_LOGS: usize = 10;
+
+fn save_llm_request_log(
+    workspace: Option<&Path>,
+    agent_name: &str,
+    messages: &[Message],
+    system_prompt: &str,
+    model: &str,
+    iteration: u32,
+) {
+    let Some(ws) = workspace else { return };
+    let dir = ws.join("llm_requests");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        debug!("Failed to create llm_requests dir: {e}");
+        return;
+    }
+
+    // Build a human-readable JSON log entry
+    let messages_log: Vec<serde_json::Value> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            serde_json::json!({
+                "index": i,
+                "role": format!("{:?}", msg.role),
+                "content_preview": msg.content.text_content().chars().take(500).collect::<String>(),
+                "content_length": msg.content.text_length(),
+            })
+        })
+        .collect();
+
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "agent": agent_name,
+        "model": model,
+        "iteration": iteration,
+        "system_prompt_length": system_prompt.len(),
+        "message_count": messages.len(),
+        "messages": messages_log,
+    });
+
+    let now = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+    let filename = format!("{agent_name}_{now}.json");
+    let filepath = dir.join(&filename);
+    if let Err(e) = std::fs::write(&filepath, serde_json::to_string_pretty(&log_entry).unwrap_or_default()) {
+        debug!("Failed to write LLM request log: {e}");
+        return;
+    }
+
+    // Rotate: keep only the most recent MAX_REQUEST_LOGS files
+    if let Ok(mut entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+            .collect();
+        if files.len() > MAX_REQUEST_LOGS {
+            files.sort_by_key(|e| e.file_name());
+            for old in &files[..files.len() - MAX_REQUEST_LOGS] {
+                let _ = std::fs::remove_file(old.path());
+            }
+        }
+    }
+}
+
 /// When a tool-only agent (configured with `silent_after_tools`) produces text
 /// without calling any tools, auto-append the text into the Turn Script as a
 /// `text` intent.  This enforces "delivery is a code concern" — the kernel's
@@ -359,37 +492,37 @@ fn persistent_turn_placeholder(tool_calls: &[ToolCall]) -> String {
                 if let Some(text) = tc.input.get("content").and_then(|v| v.as_str()) {
                     let text = text.trim();
                     if !text.is_empty() {
-                        parts.push(format!("[语音回复] {text}"));
+                        parts.push(format!("（发了条语音）{text}"));
                     }
                 }
             }
             "mcp_toolbox_take_photo" => {
-                parts.push("[发来一张照片]".to_string());
+                parts.push("（拍了张照片发过去）".to_string());
             }
             "mcp_toolbox_take_video" => {
-                parts.push("[发来一段视频]".to_string());
+                parts.push("（录了段视频发过去）".to_string());
             }
             "mcp_toolbox_this_moment" => {
-                parts.push("[分享了眼前的画面]".to_string());
+                parts.push("（拍了眼前的画面发过去）".to_string());
             }
             "mcp_toolbox_change_clothes" => {
-                parts.push("[你换了身衣服]".to_string());
+                parts.push("（换了身衣服）".to_string());
             }
             "mcp_toolbox_try_on" | "mcp_toolbox_confirm_outfit" => {
-                parts.push("[你试穿了新衣服]".to_string());
+                parts.push("（试穿了新衣服）".to_string());
             }
             "mcp_toolbox_go_find_him" => {
-                parts.push("[你走过来了]".to_string());
+                parts.push("（走了过来）".to_string());
             }
             "mcp_toolbox_remember" => {
-                parts.push("[你把这件事记下了]".to_string());
+                parts.push("（默默记下了这件事）".to_string());
             }
             _ => {}
         }
     }
 
     if parts.is_empty() {
-        "[进行了非文字互动]".to_string()
+        "（做了些事情）".to_string()
     } else {
         parts.join("\n")
     }
@@ -1254,9 +1387,24 @@ pub async fn run_agent_loop(
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
+        // Apply dynamic injections (world state) — only affects the LLM request copy,
+        // not the session messages. Injections are drained on first call.
+        let mut llm_messages = messages.clone();
+        apply_dynamic_injections(&mut llm_messages);
+
+        // Persist final LLM request for debugging (best-effort, rotates at 10 files)
+        save_llm_request_log(
+            manifest.workspace.as_deref(),
+            &manifest.name,
+            &llm_messages,
+            &system_prompt,
+            &manifest.model.model,
+            iteration,
+        );
+
         let request = CompletionRequest {
             model: manifest.model.model.clone(),
-            messages: messages.clone(),
+            messages: llm_messages,
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
@@ -1732,7 +1880,7 @@ pub async fn run_agent_loop(
                         if delivered_text.is_empty() {
                             persistent_turn_placeholder(&response.tool_calls)
                         } else {
-                            format!("[语音回复] {delivered_text}")
+                            format!("（发了条语音）{delivered_text}")
                         }
                     } else {
                         persistent_turn_placeholder(&response.tool_calls)
@@ -2291,9 +2439,24 @@ pub async fn run_agent_loop_streaming(
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
+        // Apply dynamic injections (world state) — only affects the LLM request copy,
+        // not the session messages. Injections are drained on first call.
+        let mut llm_messages = messages.clone();
+        apply_dynamic_injections(&mut llm_messages);
+
+        // Persist final LLM request for debugging (best-effort, rotates at 10 files)
+        save_llm_request_log(
+            manifest.workspace.as_deref(),
+            &manifest.name,
+            &llm_messages,
+            &system_prompt,
+            &manifest.model.model,
+            iteration,
+        );
+
         let request = CompletionRequest {
             model: manifest.model.model.clone(),
-            messages: messages.clone(),
+            messages: llm_messages,
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
@@ -2810,7 +2973,7 @@ pub async fn run_agent_loop_streaming(
                         if delivered_text.is_empty() {
                             persistent_turn_placeholder(&response.tool_calls)
                         } else {
-                            format!("[语音回复] {delivered_text}")
+                            format!("（发了条语音）{delivered_text}")
                         }
                     } else {
                         persistent_turn_placeholder(&response.tool_calls)
@@ -3690,6 +3853,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3743,6 +3907,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3796,6 +3961,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3842,6 +4008,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -3897,6 +4064,7 @@ mod tests {
             None,
             None,
             None,
+            vec![], // media_blocks
         )
         .await
         .expect_err("Streaming loop should return the simulated LLM failure");
@@ -3962,6 +4130,7 @@ mod tests {
             None,
             None,
             None,
+            vec![], // media_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -4084,6 +4253,7 @@ mod tests {
             None,
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Loop should recover via retry");
@@ -4130,6 +4300,7 @@ mod tests {
             None,
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Loop should complete with fallback");
@@ -4184,6 +4355,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4556,6 +4728,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Agent loop should complete");
@@ -4622,6 +4795,7 @@ mod tests {
             None,
             None,
             None,
+            vec![], // media_blocks
         )
         .await
         .expect("Normal loop should complete");
@@ -4684,6 +4858,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            vec![], // media_blocks
         )
         .await
         .expect("Streaming loop should complete");
@@ -4708,5 +4883,308 @@ mod tests {
         assert!(!events.is_empty(), "Should have received stream events");
         assert_no_execution_trace(&session.messages);
         assert_persisted_session_has_no_execution_trace(&memory, session.id);
+    }
+
+    // ── Dynamic injection tests ─────────────────────────────────────
+
+    /// Mock LLM driver that captures the CompletionRequest for inspection.
+    struct RequestCapturingDriver {
+        captured: std::sync::Mutex<Vec<CompletionRequest>>,
+    }
+
+    impl RequestCapturingDriver {
+        fn new() -> Self {
+            Self {
+                captured: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn captured_requests(&self) -> Vec<CompletionRequest> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmDriver for RequestCapturingDriver {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            self.captured.lock().unwrap().push(request);
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "OK".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_injection_inserts_assistant_message() {
+        use crate::tool_runner::{DynamicInjection, InjectionPosition, DYNAMIC_INJECTIONS};
+
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = AgentId::new();
+        let mut session = Session {
+            id: SessionId::new(),
+            agent_id,
+            messages: vec![
+                Message::user("previous question"),
+                Message::assistant("previous answer"),
+            ],
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let capturing = Arc::new(RequestCapturingDriver::new());
+        let driver: Arc<dyn LlmDriver> = capturing.clone();
+
+        // Run with a dynamic injection set
+        let _result = DYNAMIC_INJECTIONS
+            .scope(
+                std::cell::RefCell::new(vec![DynamicInjection {
+                    content: "[此刻的世界]\n窗外天色暗下来。".to_string(),
+                    position: InjectionPosition::InsertAssistant { offset_from_last: 0 },
+                }]),
+                async {
+                    run_agent_loop(
+                        &manifest,
+                        "hello",
+                        &mut session,
+                        &memory,
+                        driver,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .await
+                },
+            )
+            .await
+            .expect("Loop should complete");
+
+        let requests = capturing.captured_requests();
+        assert!(!requests.is_empty(), "Should have at least one LLM call");
+        let msgs = &requests[0].messages;
+
+        // The injected assistant message should be the penultimate message
+        // (before the last user message "hello")
+        assert!(msgs.len() >= 3, "Should have at least 3 messages, got {}", msgs.len());
+        let last = &msgs[msgs.len() - 1];
+        assert_eq!(last.role, Role::User);
+        assert!(last.content.text_content().contains("hello"));
+
+        // The injected world state should be in the preceding assistant message(s)
+        // (may be merged with previous assistant message)
+        let second_to_last = &msgs[msgs.len() - 2];
+        assert_eq!(second_to_last.role, Role::Assistant);
+        let text = second_to_last.content.text_content();
+        assert!(
+            text.contains("[此刻的世界]"),
+            "Injected content should be in assistant message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_injection_leaves_messages_unchanged() {
+        use crate::tool_runner::DYNAMIC_INJECTIONS;
+
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = AgentId::new();
+        let mut session = Session {
+            id: SessionId::new(),
+            agent_id,
+            messages: vec![],
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let capturing = Arc::new(RequestCapturingDriver::new());
+        let driver: Arc<dyn LlmDriver> = capturing.clone();
+
+        // Run with empty DYNAMIC_INJECTIONS
+        let _result = DYNAMIC_INJECTIONS
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                run_agent_loop(
+                    &manifest,
+                    "hello",
+                    &mut session,
+                    &memory,
+                    driver,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+            })
+            .await
+            .expect("Loop should complete");
+
+        let requests = capturing.captured_requests();
+        assert!(!requests.is_empty());
+        let msgs = &requests[0].messages;
+
+        // Should just be: user("hello")
+        assert_eq!(msgs.len(), 1, "Should have exactly 1 message, got {}", msgs.len());
+        assert_eq!(msgs[0].role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_assistant_messages_merged() {
+        use crate::tool_runner::{DynamicInjection, InjectionPosition, DYNAMIC_INJECTIONS};
+
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = AgentId::new();
+        let mut session = Session {
+            id: SessionId::new(),
+            agent_id,
+            messages: vec![
+                Message::user("question"),
+                Message::assistant("previous reply"),
+            ],
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let capturing = Arc::new(RequestCapturingDriver::new());
+        let driver: Arc<dyn LlmDriver> = capturing.clone();
+
+        // Inject world state — this will be consecutive with "previous reply" assistant msg
+        let _result = DYNAMIC_INJECTIONS
+            .scope(
+                std::cell::RefCell::new(vec![DynamicInjection {
+                    content: "[此刻的世界]\nworld state here".to_string(),
+                    position: InjectionPosition::InsertAssistant { offset_from_last: 0 },
+                }]),
+                async {
+                    run_agent_loop(
+                        &manifest,
+                        "new question",
+                        &mut session,
+                        &memory,
+                        driver,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .await
+                },
+            )
+            .await
+            .expect("Loop should complete");
+
+        let requests = capturing.captured_requests();
+        let msgs = &requests[0].messages;
+
+        // Verify no consecutive assistant messages (they should be merged)
+        for i in 0..msgs.len().saturating_sub(1) {
+            if msgs[i].role == Role::Assistant && msgs[i + 1].role == Role::Assistant {
+                panic!(
+                    "Found consecutive assistant messages at indices {} and {} — should have been merged",
+                    i, i + 1
+                );
+            }
+        }
+
+        // The merged assistant message should contain both parts
+        let assistant_msg = msgs.iter().rev().find(|m| m.role == Role::Assistant).unwrap();
+        let text = assistant_msg.content.text_content();
+        assert!(
+            text.contains("previous reply") && text.contains("[此刻的世界]"),
+            "Merged assistant message should contain both parts, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_apply_dynamic_injections_basic() {
+        use crate::tool_runner::{DynamicInjection, InjectionPosition, DYNAMIC_INJECTIONS};
+
+        let mut messages = vec![
+            Message::user("hello"),
+            Message::assistant("hi"),
+            Message::user("world"),
+        ];
+
+        // Manually set up injections via task-local
+        DYNAMIC_INJECTIONS.sync_scope(std::cell::RefCell::new(vec![
+            DynamicInjection {
+                content: "injected".to_string(),
+                position: InjectionPosition::InsertAssistant { offset_from_last: 0 },
+            },
+        ]), || {
+            apply_dynamic_injections(&mut messages);
+        });
+
+        // After injection and merge:
+        // user("hello"), assistant("hi" + "injected" merged), user("world")
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[2].role, Role::User);
+        let merged_text = messages[1].content.text_content();
+        assert!(merged_text.contains("hi"), "Should contain original: {merged_text}");
+        assert!(merged_text.contains("injected"), "Should contain injection: {merged_text}");
+    }
+
+    #[test]
+    fn test_apply_dynamic_injections_empty() {
+        use crate::tool_runner::DYNAMIC_INJECTIONS;
+
+        let mut messages = vec![
+            Message::user("hello"),
+            Message::assistant("hi"),
+        ];
+        let original_len = messages.len();
+
+        DYNAMIC_INJECTIONS.sync_scope(std::cell::RefCell::new(Vec::new()), || {
+            apply_dynamic_injections(&mut messages);
+        });
+
+        assert_eq!(messages.len(), original_len, "No change when injections empty");
     }
 }
