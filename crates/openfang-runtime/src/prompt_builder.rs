@@ -64,44 +64,9 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     // Section 1 — Agent Identity (always present)
     sections.push(build_identity_section(ctx));
 
-    // Section 2 — Tool Call Behavior (skip for subagents)
-    if !ctx.is_subagent {
-        sections.push(TOOL_CALL_BEHAVIOR.to_string());
-    }
-
-    // Section 2.5 — Agent Behavioral Guidelines (skip for subagents)
-    if !ctx.is_subagent {
-        if let Some(ref agents) = ctx.agents_md {
-            if !agents.trim().is_empty() {
-                sections.push(cap_str(agents, 2000));
-            }
-        }
-    }
-
-    // Section 3 — Available Tools (always present if tools exist)
-    let tools_section = build_tools_section(&ctx.granted_tools);
-    if !tools_section.is_empty() {
-        sections.push(tools_section);
-    }
-
-    // Section 4 — Memory Protocol (always present)
-    let mem_section = build_memory_section(&ctx.recalled_memories);
-    sections.push(mem_section);
-
-    // Section 5 — Skills (only if skills available)
-    if !ctx.skill_summary.is_empty() || !ctx.skill_prompt_context.is_empty() {
-        sections.push(build_skills_section(
-            &ctx.skill_summary,
-            &ctx.skill_prompt_context,
-        ));
-    }
-
-    // Section 6 — MCP Servers (only if summary present)
-    if !ctx.mcp_summary.is_empty() {
-        sections.push(build_mcp_section(&ctx.mcp_summary));
-    }
-
-    // Section 7 — Persona / Identity files (skip for subagents)
+    // Section 2 — Persona / Identity files (skip for subagents)
+    // Placed right after identity — this is the most important context after
+    // the base system prompt.
     if !ctx.is_subagent {
         let persona = build_persona_section(
             ctx.identity_md.as_deref(),
@@ -113,6 +78,43 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if !persona.is_empty() {
             sections.push(persona);
         }
+    }
+
+    // Section 3 — Tool Call Behavior (skip for subagents)
+    if !ctx.is_subagent {
+        sections.push(TOOL_CALL_BEHAVIOR.to_string());
+    }
+
+    // Section 3.5 — Agent Behavioral Guidelines (skip for subagents)
+    if !ctx.is_subagent {
+        if let Some(ref agents) = ctx.agents_md {
+            if !agents.trim().is_empty() {
+                sections.push(cap_str(agents, 2000));
+            }
+        }
+    }
+
+    // Section 4 — Available Tools (always present if tools exist)
+    let tools_section = build_tools_section(&ctx.granted_tools);
+    if !tools_section.is_empty() {
+        sections.push(tools_section);
+    }
+
+    // Section 5 — Memory Protocol (always present)
+    let mem_section = build_memory_section(&ctx.recalled_memories);
+    sections.push(mem_section);
+
+    // Section 6 — Skills (only if skills available)
+    if !ctx.skill_summary.is_empty() || !ctx.skill_prompt_context.is_empty() {
+        sections.push(build_skills_section(
+            &ctx.skill_summary,
+            &ctx.skill_prompt_context,
+        ));
+    }
+
+    // Section 7 — MCP Servers (only if summary present)
+    if !ctx.mcp_summary.is_empty() {
+        sections.push(build_mcp_section(&ctx.mcp_summary));
     }
 
     // Section 7.5 — Heartbeat checklist (only for autonomous agents)
@@ -566,13 +568,17 @@ mod tests {
 
     #[test]
     fn test_section_ordering() {
-        let prompt = build_system_prompt(&basic_ctx());
+        let mut ctx = basic_ctx();
+        ctx.soul_md = Some("Test soul.".to_string());
+        let prompt = build_system_prompt(&ctx);
+        let persona_pos = prompt.find("## 你是谁").unwrap();
         let tool_behavior_pos = prompt.find("## 行事习惯").unwrap();
         let tools_pos = prompt.find("## 你能做的事").unwrap();
         let memory_pos = prompt.find("## 记忆").unwrap();
         let safety_pos = prompt.find("## 底线").unwrap();
         let guidelines_pos = prompt.find("## 做事的分寸").unwrap();
 
+        assert!(persona_pos < tool_behavior_pos);
         assert!(tool_behavior_pos < tools_pos);
         assert!(tools_pos < memory_pos);
         assert!(memory_pos < safety_pos);
