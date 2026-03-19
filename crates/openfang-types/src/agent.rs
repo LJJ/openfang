@@ -436,6 +436,29 @@ pub struct ToolConfig {
     pub params: HashMap<String, serde_json::Value>,
 }
 
+/// Pre-turn hook — call an MCP tool before the LLM processes the message.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PreTurnHook {
+    /// MCP tool name to call.
+    pub tool: String,
+    /// If true, pass the raw incoming message as `{"message": "..."}` to the tool.
+    #[serde(default)]
+    pub pass_message: bool,
+}
+
+/// Post-turn hook — call an MCP tool after the LLM response is received.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PostTurnHook {
+    /// MCP tool name to call.
+    pub tool: String,
+    /// If true, pass the LLM response as `{"agent_response": "..."}` to the tool.
+    #[serde(default)]
+    pub pass_response: bool,
+    /// If true, clear `result.response` after a successful hook call.
+    #[serde(default)]
+    pub clear_response: bool,
+}
+
 /// Complete agent manifest — defines everything about an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -503,6 +526,12 @@ pub struct AgentManifest {
     /// Per-agent exec policy override. If None, uses global exec_policy.
     #[serde(default)]
     pub exec_policy: Option<crate::config::ExecPolicy>,
+    /// Pre-turn hook: call an MCP tool before the agent loop.
+    #[serde(default)]
+    pub pre_turn: Option<PreTurnHook>,
+    /// Post-turn hook: call an MCP tool after the agent loop.
+    #[serde(default)]
+    pub post_turn: Option<PostTurnHook>,
 }
 
 fn default_true() -> bool {
@@ -536,6 +565,8 @@ impl Default for AgentManifest {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            pre_turn: None,
+            post_turn: None,
         }
     }
 }

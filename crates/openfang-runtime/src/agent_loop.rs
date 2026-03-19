@@ -190,22 +190,31 @@ fn apply_dynamic_injections(messages: &mut Vec<Message>) {
     for injection in injections {
         match injection.position {
             crate::tool_runner::InjectionPosition::InsertAssistant { offset_from_last } => {
-                // Insert position: before the message at `offset_from_last` from the end.
-                let insert_idx = if messages.len() > offset_from_last {
-                    messages.len() - offset_from_last
+                // Target: the last User message (offset 0 = last msg, which should be User).
+                let target_idx = if messages.len() > offset_from_last {
+                    messages.len() - 1 - offset_from_last
                 } else {
                     0
                 };
-                // Shift back by one more so we insert *before* that message
-                let insert_idx = insert_idx.saturating_sub(1);
-                messages.insert(insert_idx, Message::assistant(&injection.content));
+
+                // Prepend world state into the target User message to avoid
+                // consecutive same-role messages (Anthropic API rejects those).
+                if target_idx < messages.len()
+                    && messages[target_idx].role == Role::User
+                {
+                    let existing = messages[target_idx].content.text_content();
+                    messages[target_idx] = Message::user(format!(
+                        "{}\n\n{}",
+                        injection.content, existing
+                    ));
+                } else {
+                    // Fallback: insert as user message before the end
+                    let insert_idx = target_idx.saturating_sub(1);
+                    messages.insert(insert_idx, Message::user(&injection.content));
+                }
             }
         }
     }
-
-    // Note: injected assistant messages are kept as separate messages (not merged).
-    // The world state is logically independent from the character's previous reply.
-    // Most LLM APIs handle consecutive same-role messages gracefully.
 }
 
 /// Merge adjacent assistant messages into a single message with multiple
@@ -1351,6 +1360,10 @@ pub async fn run_agent_loop(
             "Trimming old messages to prevent context overflow"
         );
         messages.drain(..trim_count);
+        // Ensure first message is User — Claude API rejects requests starting with Assistant.
+        if !messages.is_empty() && messages[0].role == Role::Assistant {
+            messages.remove(0);
+        }
     }
 
     // Use autonomous config max_iterations if set, else default
@@ -2387,6 +2400,10 @@ pub async fn run_agent_loop_streaming(
             "Trimming old messages to prevent context overflow (streaming)"
         );
         messages.drain(..trim_count);
+        // Ensure first message is User — Claude API rejects requests starting with Assistant.
+        if !messages.is_empty() && messages[0].role == Role::Assistant {
+            messages.remove(0);
+        }
     }
 
     // Use autonomous config max_iterations if set, else default
@@ -5123,22 +5140,22 @@ mod tests {
         let requests = capturing.captured_requests();
         let msgs = &requests[0].messages;
 
-        // Verify no consecutive assistant messages (they should be merged)
+        // Verify no consecutive same-role messages
         for i in 0..msgs.len().saturating_sub(1) {
-            if msgs[i].role == Role::Assistant && msgs[i + 1].role == Role::Assistant {
+            if msgs[i].role == msgs[i + 1].role {
                 panic!(
-                    "Found consecutive assistant messages at indices {} and {} — should have been merged",
-                    i, i + 1
+                    "Found consecutive {:?} messages at indices {} and {}",
+                    msgs[i].role, i, i + 1
                 );
             }
         }
 
-        // The merged assistant message should contain both parts
-        let assistant_msg = msgs.iter().rev().find(|m| m.role == Role::Assistant).unwrap();
-        let text = assistant_msg.content.text_content();
+        // The world state should be prepended to the last user message
+        let last_user = msgs.iter().rev().find(|m| m.role == Role::User).unwrap();
+        let text = last_user.content.text_content();
         assert!(
-            text.contains("previous reply") && text.contains("[此刻的世界]"),
-            "Merged assistant message should contain both parts, got: {text}"
+            text.contains("[此刻的世界]"),
+            "Last user message should contain prepended world state, got: {text}"
         );
     }
 
@@ -5162,15 +5179,15 @@ mod tests {
             apply_dynamic_injections(&mut messages);
         });
 
-        // After injection and merge:
-        // user("hello"), assistant("hi" + "injected" merged), user("world")
+        // After injection: world state is prepended to the last user message.
+        // user("hello"), assistant("hi"), user("injected\n\nworld")
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, Role::User);
         assert_eq!(messages[1].role, Role::Assistant);
         assert_eq!(messages[2].role, Role::User);
-        let merged_text = messages[1].content.text_content();
-        assert!(merged_text.contains("hi"), "Should contain original: {merged_text}");
-        assert!(merged_text.contains("injected"), "Should contain injection: {merged_text}");
+        let user_text = messages[2].content.text_content();
+        assert!(user_text.contains("injected"), "Should contain injection: {user_text}");
+        assert!(user_text.contains("world"), "Should contain original: {user_text}");
     }
 
     #[test]

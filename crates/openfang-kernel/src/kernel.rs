@@ -464,10 +464,11 @@ fn build_user_injection_for_timeline(
     match scenario {
         WorldEngineScenario::NonOwnerFallback => None,
         WorldEngineScenario::ScheduledTick => {
-            // TICK: minimal user message trigger. The actual TICK action
-            // ("[时间，地点] 我看了眼时间。") is appended to the world state
-            // by world-engine and injected as assistant role via DynamicInjection.
-            Some("[续]".to_string())
+            // TICK goes to world-engine only; assistant is triggered via
+            // agent_send when simulation produces an expression step.
+            // No user injection needed for TICK — world-engine builds
+            // the narrative context and sends it directly.
+            None
         }
         WorldEngineScenario::PrivateChat | WorldEngineScenario::GroupChat => {
             // Extract raw user message from gateway payload ("对方说：" marker)
@@ -1989,7 +1990,8 @@ impl OpenFangKernel {
                 skill_summary: self.build_skill_summary(&manifest.skills),
                 skill_prompt_context: self.collect_prompt_context(&manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
-                    self.build_mcp_summary(&manifest.mcp_servers)
+                    let granted: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+                    self.build_mcp_summary(&manifest.mcp_servers, &granted)
                 } else {
                     String::new()
                 },
@@ -2569,6 +2571,52 @@ impl OpenFangKernel {
         })
     }
 
+    /// Call a single MCP tool on behalf of an agent (for pre/post-turn hooks).
+    async fn execute_hook_tool(
+        &self,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        let caller_agent_id = agent_id.to_string();
+        let allowed = vec![tool_name.to_string()];
+        let tool_result = openfang_runtime::tool_runner::execute_tool(
+            &format!("hook_{tool_name}"),
+            tool_name,
+            &input,
+            None,
+            Some(&allowed),
+            Some(&caller_agent_id),
+            None,
+            Some(&self.mcp_connections),
+            Some(&self.web_ctx),
+            Some(&self.browser_ctx),
+            None,
+            manifest.workspace.as_deref(),
+            Some(&self.media_engine),
+            None,
+            if self.config.tts.enabled {
+                Some(&self.tts_engine)
+            } else {
+                None
+            },
+            if self.config.docker.enabled {
+                Some(&self.config.docker)
+            } else {
+                None
+            },
+            Some(&self.process_manager),
+        )
+        .await;
+
+        if tool_result.is_error {
+            Err(tool_result.content)
+        } else {
+            Ok(tool_result.content)
+        }
+    }
+
     /// Handle pending plans after Turn Script execution.
     /// Reads pending_plan.json (written by settle_plan), consumes it, and if
     /// non-empty, makes a lightweight LLM call to translate plans into schedule
@@ -2725,6 +2773,24 @@ impl OpenFangKernel {
         let mut executed_any = false;
         let mut narrative_fragments: Vec<String> = Vec::new();
 
+        // Reorder: process fast intents (text, voice, memory, wardrobe, mode) first,
+        // then slow intents (selfie, visual_moment, selfie_video, scene_video) second.
+        // This prevents slow image/video generation from blocking text delivery.
+        let mut ordered_intents: Vec<(usize, &serde_json::Value)> = Vec::new();
+        let mut deferred_intents: Vec<(usize, &serde_json::Value)> = Vec::new();
+        for (index, intent) in intents.iter().enumerate() {
+            let intent_type = intent.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match intent_type {
+                "selfie" | "visual_moment" | "selfie_video" | "scene_video" => {
+                    deferred_intents.push((index, intent));
+                }
+                _ => {
+                    ordered_intents.push((index, intent));
+                }
+            }
+        }
+        ordered_intents.extend(deferred_intents);
+
         info!(
             agent = %entry.name,
             agent_id = %agent_id,
@@ -2734,7 +2800,7 @@ impl OpenFangKernel {
             "Turn Script: processing intents"
         );
 
-        for (index, intent) in intents.iter().enumerate() {
+        for (index, intent) in ordered_intents {
             let Some(intent_type) = intent.get("type").and_then(|value| value.as_str()) else {
                 warn!(
                     agent = %entry.name,
@@ -3488,20 +3554,36 @@ impl OpenFangKernel {
                         "刚才想留住这一刻的画面，但没出来……"
                     };
 
-                    match self
-                        .execute_world_engine_tool_json(
-                            agent_id,
-                            manifest,
-                            &format!("world_engine_image_{index}"),
-                            "mcp_toolbox_generate_image",
-                            serde_json::json!({
-                                "prompt": prompt,
-                                "input_images": input_images,
-                                "size": image_size,
-                            }),
-                        )
-                        .await
-                    {
+                    let image_gen_result = self.execute_world_engine_tool_json(
+                        agent_id,
+                        manifest,
+                        &format!("world_engine_image_{index}"),
+                        "mcp_toolbox_generate_image",
+                        serde_json::json!({
+                            "prompt": prompt,
+                            "input_images": input_images,
+                            "size": image_size,
+                        }),
+                    )
+                    .await;
+
+                    match image_gen_result {
+                        Err(error) => {
+                            error!(agent = %entry.name, agent_id = %agent_id, index, %error, "Turn Script: image generation failed");
+                            let _ = self
+                                .execute_world_engine_tool(
+                                    agent_id,
+                                    manifest,
+                                    &format!("world_engine_image_fail_notice_{index}"),
+                                    &format!("mcp_{channel}_send_text_message"),
+                                    serde_json::json!({
+                                        "receive_id": receive_id,
+                                        "receive_id_type": receive_id_type,
+                                        "text": failure_notice,
+                                    }),
+                                )
+                                .await;
+                        }
                         Ok(image) => {
                             if let Some(image_path) =
                                 image.get("image_path").and_then(|value| value.as_str())
@@ -3564,7 +3646,6 @@ impl OpenFangKernel {
                                     }
                                     Err(error) => {
                                         error!(agent = %entry.name, agent_id = %agent_id, index, %error, "Turn Script: image delivery failed");
-                                        // Notify user about the failure
                                         let _ = self
                                             .execute_world_engine_tool(
                                                 agent_id,
@@ -3596,23 +3677,6 @@ impl OpenFangKernel {
                                     )
                                     .await;
                             }
-                        }
-                        Err(error) => {
-                            error!(agent = %entry.name, agent_id = %agent_id, index, %error, "Turn Script: image generation failed");
-                            // Notify user about the failure
-                            let _ = self
-                                .execute_world_engine_tool(
-                                    agent_id,
-                                    manifest,
-                                    &format!("world_engine_image_fail_notice_{index}"),
-                                    &format!("mcp_{channel}_send_text_message"),
-                                    serde_json::json!({
-                                        "receive_id": receive_id,
-                                        "receive_id_type": receive_id_type,
-                                        "text": failure_notice,
-                                    }),
-                                )
-                                .await;
                         }
                     }
                 }
@@ -3738,7 +3802,8 @@ impl OpenFangKernel {
                 skill_summary: self.build_skill_summary(&manifest.skills),
                 skill_prompt_context: self.collect_prompt_context(&manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
-                    self.build_mcp_summary(&manifest.mcp_servers)
+                    let granted: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+                    self.build_mcp_summary(&manifest.mcp_servers, &granted)
                 } else {
                     String::new()
                 },
@@ -3909,14 +3974,64 @@ impl OpenFangKernel {
         };
 
         // For world-engine: pre-fetch state and inject into user message.
-        // This eliminates the first LLM round where the LLM calls read-only tools.
-        let message_with_links = if entry.name == "world-engine" {
+        // Skip when [pre_turn] hook is configured — the hook handles all pre-fetching.
+        let message_with_links = if entry.name == "world-engine" && manifest.pre_turn.is_none() {
             let prefetched = self.pre_fetch_world_engine_state(agent_id, &manifest, &message_with_links).await;
             format!("{message_with_links}\n\n{prefetched}")
         } else {
             message_with_links
         };
 
+        // Generic pre-turn hook: call MCP tool and optionally append to message.
+        // When the hook returns `skip_llm: true`, skip the LLM call entirely and
+        // jump straight to the post-turn hook with a synthetic silent result.
+        let (message_with_links, skip_llm) = if let Some(ref pre_turn) = manifest.pre_turn {
+            let input = if pre_turn.pass_message {
+                serde_json::json!({ "message": &message_with_links })
+            } else {
+                serde_json::json!({})
+            };
+            match self.execute_hook_tool(agent_id, &manifest, &pre_turn.tool, input).await {
+                Ok(content) => {
+                    match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(json) => {
+                            let skip = json.get("skip_llm").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let mut msg = message_with_links;
+                            if let Some(append) = json.get("append_to_message").and_then(|v| v.as_str()) {
+                                if !append.is_empty() {
+                                    msg = format!("{msg}\n\n{append}");
+                                }
+                            }
+                            (msg, skip)
+                        }
+                        Err(e) => {
+                            warn!(agent = %entry.name, tool = %pre_turn.tool, "pre_turn hook returned non-JSON: {e}");
+                            (message_with_links, false)
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(agent = %entry.name, tool = %pre_turn.tool, "pre_turn hook failed: {e}");
+                    (message_with_links, false)
+                }
+            }
+        } else {
+            (message_with_links, false)
+        };
+
+        // skip_llm: pre-turn hook handled everything, produce a synthetic silent result
+        // and jump straight to post-turn hook processing.
+        let mut result = if skip_llm {
+            info!(agent = %entry.name, "pre_turn hook requested skip_llm — skipping LLM call");
+            AgentLoopResult {
+                response: String::new(),
+                total_usage: openfang_types::message::TokenUsage::default(),
+                iterations: 0,
+                cost_usd: None,
+                silent: true,
+                directives: Default::default(),
+            }
+        } else {
         // Wrap with USER_MESSAGE_INJECTION (timeline entry or TICK prompt) and
         // DYNAMIC_INJECTIONS scope.
         //
@@ -3924,7 +4039,7 @@ impl OpenFangKernel {
         // were already pushed into the OUTER scope. Take them here and seed the
         // inner scope so the target agent's run_agent_loop can consume them.
         let inherited_injections = openfang_runtime::tool_runner::take_dynamic_injections();
-        let mut result = openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
+        openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
             .scope(user_injection, async {
                 openfang_runtime::tool_runner::DYNAMIC_INJECTIONS
                     .scope(std::cell::RefCell::new(inherited_injections), async {
@@ -3964,16 +4079,39 @@ impl OpenFangKernel {
                     .await
             })
             .await
-            .map_err(KernelError::OpenFang)?;
+            .map_err(KernelError::OpenFang)?
+        };
+
+        // Generic post-turn hook: call MCP tool with optional response, then optionally clear.
+        if let Some(ref post_turn) = manifest.post_turn {
+            let input = if post_turn.pass_response {
+                serde_json::json!({ "agent_response": &result.response })
+            } else {
+                serde_json::json!({})
+            };
+            match self.execute_hook_tool(agent_id, &manifest, &post_turn.tool, input).await {
+                Ok(_) => {
+                    if post_turn.clear_response {
+                        result.response.clear();
+                    }
+                }
+                Err(e) => {
+                    warn!(agent = %entry.name, tool = %post_turn.tool, "post_turn hook failed: {e}");
+                }
+            }
+        }
 
         // World Engine is an orchestrator, not a user-facing agent.
         // Its response must NEVER reach the user — the Turn Script executor
         // handles all delivery.  Clear unconditionally to prevent any LLM
         // output from leaking through the Gateway.
+        // Skip hardcoded Turn Script when [post_turn] hook handles it.
         if entry.name == "world-engine" {
-            let _ = self
-                .execute_world_engine_turn_script(entry, agent_id, &manifest, message)
-                .await;
+            if manifest.post_turn.is_none() {
+                let _ = self
+                    .execute_world_engine_turn_script(entry, agent_id, &manifest, message)
+                    .await;
+            }
 
             // Handle pending plans in code — previously done by world-engine LLM
             // calling consume_pending_plan. Now the kernel reads the file directly
@@ -6382,7 +6520,7 @@ impl OpenFangKernel {
 
     /// Build a compact MCP server/tool summary for the system prompt so the
     /// agent knows what external tool servers are connected.
-    fn build_mcp_summary(&self, mcp_allowlist: &[String]) -> String {
+    fn build_mcp_summary(&self, mcp_allowlist: &[String], granted_tools: &[String]) -> String {
         let tools = match self.mcp_tools.lock() {
             Ok(t) => t.clone(),
             Err(_) => return String::new(),
@@ -6397,11 +6535,19 @@ impl OpenFangKernel {
             .map(|s| openfang_runtime::mcp::normalize_name(s))
             .collect();
 
+        // Collect granted MCP tool names for capability-level filtering
+        let granted_set: std::collections::HashSet<&str> =
+            granted_tools.iter().map(|s| s.as_str()).collect();
+
         // Group tools by MCP server prefix (mcp_{server}_{tool})
         let mut servers: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         let mut tool_count = 0usize;
         for tool in &tools {
+            // Skip tools not granted by capabilities
+            if !granted_set.is_empty() && !granted_set.contains(tool.name.as_str()) {
+                continue;
+            }
             let parts: Vec<&str> = tool.name.splitn(3, '_').collect();
             if parts.len() >= 3 && parts[0] == "mcp" {
                 let server = parts[1].to_string();
