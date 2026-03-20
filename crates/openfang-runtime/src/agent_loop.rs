@@ -344,6 +344,20 @@ fn auto_wrap_text_to_turn_script(text: &str) -> Result<(), String> {
         Vec::new()
     };
 
+    // Dedup: skip if an existing text intent already contains this text
+    // (or this text contains an existing one — handles retry producing
+    // a superset of the previous attempt's text).
+    let dominated = intents.iter().any(|i| {
+        if i.get("type").and_then(|v| v.as_str()) != Some("text") {
+            return false;
+        }
+        let existing = i.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        existing.contains(text) || text.contains(existing)
+    });
+    if dominated {
+        return Ok(());
+    }
+
     intents.push(serde_json::json!({
         "type": "text",
         "content": text,
@@ -1858,6 +1872,17 @@ pub async fn run_agent_loop(
                         .iter()
                         .any(|tool_name| silent_after_tools.contains(tool_name));
 
+                // Preserve companion text when tools fail and we're about to retry.
+                if had_tool_errors && !silent_after_tools.is_empty() {
+                    let companion_text = response.text();
+                    if !companion_text.trim().is_empty() {
+                        debug!(agent = %manifest.name, "Preserving companion text from failed tool iteration");
+                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                            warn!(agent = %manifest.name, error = %e, "Failed to preserve companion text");
+                        }
+                    }
+                }
+
                 // If a tool already delivered the response (e.g. voice message via MCP),
                 // or this agent is configured to finish immediately after successful
                 // tool execution, exit silently — no need for another LLM round.
@@ -2955,6 +2980,17 @@ pub async fn run_agent_loop_streaming(
                     && successful_tools_this_turn
                         .iter()
                         .any(|tool_name| silent_after_tools.contains(tool_name));
+
+                // Preserve companion text when tools fail and we're about to retry.
+                if had_tool_errors && !silent_after_tools.is_empty() {
+                    let companion_text = response.text();
+                    if !companion_text.trim().is_empty() {
+                        debug!(agent = %manifest.name, "Preserving companion text from failed tool iteration");
+                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                            warn!(agent = %manifest.name, error = %e, "Failed to preserve companion text");
+                        }
+                    }
+                }
 
                 // If a tool already delivered the response (e.g. voice message via MCP),
                 // or this agent is configured to finish immediately after successful
