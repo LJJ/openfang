@@ -205,6 +205,18 @@ fn current_interaction_mode(config: &KernelConfig) -> String {
         .unwrap_or_else(|| "remote".to_string())
 }
 
+/// Load mode-specific expression guidance for roleplay agents from runtime config.
+/// Reads `.openfang/agents/{agent_name}/mode-{mode}.md`. Returns empty if missing.
+fn load_roleplay_mode_prompt(config: &KernelConfig, agent_name: &str, mode: &str) -> String {
+    let filename = format!("mode-{mode}.md");
+    let path = config.home_dir.join("agents").join(agent_name).join(&filename);
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
 fn strip_remote_stage_directions(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut ascii_depth = 0u32;
@@ -2070,7 +2082,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
-        media_blocks: Vec<openfang_types::message::ContentBlock>,
+        mut media_blocks: Vec<openfang_types::message::ContentBlock>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
@@ -2311,6 +2323,14 @@ impl OpenFangKernel {
                                     agent = %entry.name,
                                     hook_tool = %tool_name,
                                     "Pre-turn hook returned skip_llm=true, skipping LLM call"
+                                );
+                            }
+                            if parsed.get("strip_media").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                media_blocks.clear();
+                                info!(
+                                    agent = %entry.name,
+                                    hook_tool = %tool_name,
+                                    "Pre-turn hook returned strip_media=true, clearing media blocks"
                                 );
                             }
                             parsed.get("message")
