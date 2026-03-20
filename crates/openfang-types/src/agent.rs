@@ -436,27 +436,29 @@ pub struct ToolConfig {
     pub params: HashMap<String, serde_json::Value>,
 }
 
-/// Pre-turn hook — call an MCP tool before the LLM processes the message.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PreTurnHook {
-    /// MCP tool name to call.
-    pub tool: String,
-    /// If true, pass the raw incoming message as `{"message": "..."}` to the tool.
+/// Configuration for a pre-turn or post-turn hook.
+///
+/// Hooks allow agents to run MCP tools before or after the LLM turn,
+/// enabling message transformation, response post-processing, and
+/// orchestration logic without hardcoding business rules in the kernel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurnHookConfig {
+    /// MCP tool to invoke (e.g., "mcp_toolbox_prepare_world_context").
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// If true, pass the current message as tool input (pre-turn).
     #[serde(default)]
     pub pass_message: bool,
-}
-
-/// Post-turn hook — call an MCP tool after the LLM response is received.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PostTurnHook {
-    /// MCP tool name to call.
-    pub tool: String,
-    /// If true, pass the LLM response as `{"agent_response": "..."}` to the tool.
+    /// If true, pass the LLM response as tool input (post-turn).
     #[serde(default)]
     pub pass_response: bool,
-    /// If true, clear `result.response` after a successful hook call.
+    /// If true, clear the LLM response after hook execution (post-turn).
     #[serde(default)]
     pub clear_response: bool,
+    /// Skill names whose GUIDE.md content should be available to the hook.
+    #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
+    pub skills: Vec<String>,
 }
 
 /// Complete agent manifest — defines everything about an agent.
@@ -526,12 +528,12 @@ pub struct AgentManifest {
     /// Per-agent exec policy override. If None, uses global exec_policy.
     #[serde(default)]
     pub exec_policy: Option<crate::config::ExecPolicy>,
-    /// Pre-turn hook: call an MCP tool before the agent loop.
+    /// Pre-turn hook：LLM 运行前调用指定 MCP 工具，可替换消息或跳过 LLM。
     #[serde(default)]
-    pub pre_turn: Option<PreTurnHook>,
-    /// Post-turn hook: call an MCP tool after the agent loop.
+    pub pre_turn: Option<TurnHookConfig>,
+    /// Post-turn hook：LLM 运行后调用指定 MCP 工具，可清除响应或执行后处理。
     #[serde(default)]
-    pub post_turn: Option<PostTurnHook>,
+    pub post_turn: Option<TurnHookConfig>,
 }
 
 fn default_true() -> bool {
