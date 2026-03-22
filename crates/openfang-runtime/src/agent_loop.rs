@@ -378,6 +378,38 @@ fn auto_wrap_text_to_turn_script(text: &str) -> Result<(), String> {
 fn compact_session_execution_trace(session: &mut Session) {
     let compacted = crate::session_projection::project_for_persistent_dialogue(&session.messages);
     session.messages = crate::session_repair::validate_and_repair(&compacted);
+    strip_think_tags_from_session(&mut session.messages);
+}
+
+/// Strip `<think>...</think>` blocks from assistant messages before persisting.
+/// Models like DeepSeek/MiniMax embed reasoning in these tags; they should not
+/// accumulate in the session history as they waste context and leak internal reasoning.
+fn strip_think_tags_from_session(messages: &mut [openfang_types::message::Message]) {
+    use openfang_types::message::{Role, MessageContent, ContentBlock};
+    let re = regex_lite::Regex::new(r"(?s)<think>.*?</think>\s*").unwrap();
+    for msg in messages.iter_mut() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        match &mut msg.content {
+            MessageContent::Text(ref mut text) => {
+                let cleaned = re.replace_all(text, "").to_string();
+                if cleaned.len() != text.len() {
+                    *text = cleaned;
+                }
+            }
+            MessageContent::Blocks(ref mut blocks) => {
+                for block in blocks.iter_mut() {
+                    if let ContentBlock::Text { ref mut text } = block {
+                        let cleaned = re.replace_all(text, "").to_string();
+                        if cleaned.len() != text.len() {
+                            *text = cleaned;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn save_projected_session(memory: &MemorySubstrate, session: &mut Session) -> OpenFangResult<()> {
@@ -533,7 +565,7 @@ fn persistent_turn_placeholder(tool_calls: &[ToolCall]) -> String {
             "mcp_toolbox_change_clothes" => {
                 parts.push("（换了身衣服）".to_string());
             }
-            "mcp_toolbox_try_on" | "mcp_toolbox_confirm_outfit" => {
+            "mcp_toolbox_try_on" => {
                 parts.push("（试穿了新衣服）".to_string());
             }
             "mcp_toolbox_go_find_him" => {
@@ -946,10 +978,6 @@ fn selfie_context_guard_message(
     if !successful_tools_this_turn.contains("mcp_toolbox_get_life_status") {
         missing.push("mcp_toolbox_get_life_status");
     }
-    if !successful_tools_this_turn.contains("mcp_toolbox_get_inner_state") {
-        missing.push("mcp_toolbox_get_inner_state");
-    }
-
     let has_outfit_reference = tool_call
         .input
         .get("element_list")
@@ -997,7 +1025,7 @@ fn selfie_context_guard_message(
     }
 
     Some(format!(
-        "Selfie context guard: before {}, call {} in this turn. Time, location, and current activity must come from get_life_status; appearance must come from current outfit/avatar; mood can come from get_inner_state; only the shot intent may be expanded from chat history. Do not invent a scene or guess morning vs evening from the user's wording.",
+        "Selfie context guard: before {}, call {} in this turn. Time, location, current activity, and mood must come from get_life_status; appearance must come from current outfit/avatar; only the shot intent may be expanded from chat history. Do not invent a scene or guess morning vs evening from the user's wording.",
         tool_call.name,
         missing.join(", ")
     ))
@@ -1463,6 +1491,18 @@ pub async fn run_agent_loop(
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
+
+        info!(
+            agent = %manifest.name,
+            iteration,
+            text_len = response.text().len(),
+            tool_calls = response.tool_calls.len(),
+            stop_reason = ?response.stop_reason,
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            text_preview = %response.text().chars().take(120).collect::<String>(),
+            "LLM response received"
+        );
 
         // Recover tool calls output as text by models that don't use the tool_calls API field
         // (e.g. Groq/Llama, DeepSeek emit `<function=name>{json}</function>` in text)
@@ -3373,7 +3413,6 @@ mod tests {
         let message = selfie_context_guard_message(&manifest, message, &tool_call, &HashSet::new())
             .expect("guard should block");
         assert!(message.contains("mcp_toolbox_get_life_status"));
-        assert!(message.contains("mcp_toolbox_get_inner_state"));
         assert!(message.contains("mcp_toolbox_get_avatar"));
     }
 
@@ -3575,7 +3614,6 @@ mod tests {
         };
         let mut successful_tools = HashSet::new();
         successful_tools.insert("mcp_toolbox_get_life_status".to_string());
-        successful_tools.insert("mcp_toolbox_get_inner_state".to_string());
         successful_tools.insert("mcp_toolbox_get_avatar".to_string());
 
         assert!(
