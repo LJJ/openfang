@@ -381,16 +381,8 @@ const SAFETY_SECTION: &str = "\
 - 守边界也要像身处现场的人说话，别把自己讲成隔着聊天框、只能陪人说话的东西。
 - 拿不准的时候，问。";
 
-/// Static operational guidelines (replaces STABILITY_GUIDELINES).
-const OPERATIONAL_GUIDELINES: &str = "\
-## 做事的分寸
-- 一个办法不行，换个办法，不要用同样的方式反复试。
-- 出错了先看看错在哪，别急着重来。
-- 做事要精准，不要大而化之。
-- 动手之前先想清楚要怎么做。
-- 试了几次还是不行，就跟对方说清楚哪里卡住了，不要一直转。
-- 同一件事不要重复做超过三次。
-- 不需要回复的消息（简单确认、表情、不是对你说的话），回 NO_REPLY。";
+/// Static operational guidelines — intentionally empty for roleplay agents.
+const OPERATIONAL_GUIDELINES: &str = "";
 
 // ---------------------------------------------------------------------------
 // Tool metadata helpers

@@ -29,8 +29,9 @@ fn is_internal_trace_text(role: Role, text: &str) -> bool {
         return true;
     }
 
+    // Only filter out system messages and known internal placeholders
     let lower = trimmed.to_lowercase();
-    let exact_tokens = ["no_reply", "[no reply needed]", "ok. no_reply"];
+    let exact_tokens = ["no_reply", "ok. no_reply"];
     if role == Role::Assistant && exact_tokens.iter().any(|token| lower == *token) {
         return true;
     }
@@ -39,27 +40,16 @@ fn is_internal_trace_text(role: Role, text: &str) -> bool {
         "[task completed",
         "[the model returned an empty response",
         "[no response]",
-        "看起来 turn script 文件路径不对",
-        "让我尝试读取环境变量来获取正确的路径",
-        "既然 `pending.json` 为空",
-        "根据职责 a 第 8 条",
-        "因此，我将输出 no_reply",
-        "给公子回了消息",
-        "给他回了消息",
-        "给公子发了消息",
     ];
-
-    let user_prefixes = ["[system] please output your turn script directly"];
 
     match role {
         Role::Assistant => {
             assistant_prefixes
                 .iter()
                 .any(|prefix| lower.starts_with(prefix))
-                || (lower.starts_with("拍了张") && (lower.contains("发给公子") || lower.contains("发给他")))
         }
-        Role::User => user_prefixes.iter().any(|prefix| lower.starts_with(prefix)),
         Role::System => true,
+        _ => false,
     }
 }
 
@@ -230,8 +220,13 @@ mod tests {
         ];
 
         let projected = project_for_persistent_dialogue(&messages);
-        assert_eq!(projected.len(), 2);
-        assert_eq!(projected[0].content.text_content(), "拍了张照片给你看");
-        assert_eq!(projected[1].content.text_content(), "正常回复");
+        // "给公子回了消息" is now kept (no longer filtered as internal trace)
+        assert_eq!(projected.len(), 3);
+        assert_eq!(
+            projected[0].content.text_content(),
+            "给公子回了消息，问他怎么了。"
+        );
+        assert_eq!(projected[1].content.text_content(), "拍了张照片给你看");
+        assert_eq!(projected[2].content.text_content(), "正常回复");
     }
 }

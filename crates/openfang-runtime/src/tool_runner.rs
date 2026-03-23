@@ -108,12 +108,23 @@ tokio::task_local! {
     /// Accumulated dynamic injections for the current agent turn.
     /// Written by tool_agent_send (world state), consumed by run_agent_loop before LLM call.
     pub static DYNAMIC_INJECTIONS: RefCell<Vec<DynamicInjection>>;
+    /// Ephemeral context injected by pre-turn hook.
+    /// Prepended to the last user message for LLM calls but NOT stored in session history.
+    pub static EPHEMERAL_CONTEXT: Option<String>;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
 /// Returns 0 if called outside an agent task.
 pub fn current_agent_depth() -> u32 {
     AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0)
+}
+
+/// Read the ephemeral context set by pre-turn hook, if any.
+pub fn ephemeral_context() -> Option<String> {
+    EPHEMERAL_CONTEXT
+        .try_with(|v| v.clone())
+        .ok()
+        .flatten()
 }
 
 /// Read the user message injection context, if any.

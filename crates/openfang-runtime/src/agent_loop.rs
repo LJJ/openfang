@@ -1387,6 +1387,22 @@ pub async fn run_agent_loop(
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
+
+    // Inject ephemeral context (from pre-turn hook) into the last user message.
+    // This context is visible to the LLM for this turn but NOT stored in session history.
+    if let Some(ephemeral) = crate::tool_runner::ephemeral_context() {
+        if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == Role::User) {
+            match &mut last_user.content {
+                MessageContent::Text(text) => {
+                    *text = format!("{ephemeral}\n\n{text}");
+                }
+                MessageContent::Blocks(blocks) => {
+                    blocks.insert(0, ContentBlock::Text { text: ephemeral });
+                }
+            }
+        }
+    }
+
     let mut total_usage = TokenUsage::default();
     let final_response;
 
@@ -2452,6 +2468,22 @@ pub async fn run_agent_loop_streaming(
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
+
+    // Inject ephemeral context (from pre-turn hook) into the last user message.
+    // This context is visible to the LLM for this turn but NOT stored in session history.
+    if let Some(ephemeral) = crate::tool_runner::ephemeral_context() {
+        if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == Role::User) {
+            match &mut last_user.content {
+                MessageContent::Text(text) => {
+                    *text = format!("{ephemeral}\n\n{text}");
+                }
+                MessageContent::Blocks(blocks) => {
+                    blocks.insert(0, ContentBlock::Text { text: ephemeral });
+                }
+            }
+        }
+    }
+
     let mut total_usage = TokenUsage::default();
     let final_response;
 

@@ -2306,7 +2306,9 @@ impl OpenFangKernel {
         // ── Pre-turn hook ──
         // 通用机制：如果 manifest 配置了 pre_turn hook，调用指定 MCP 工具。
         // 返回值替换原始消息；返回 skip_llm=true 时跳过 LLM 调用。
+        // hook 可返回 ephemeral_context：仅注入本轮 LLM 调用，不存入 session。
         let mut skip_llm = false;
+        let mut ephemeral_ctx: Option<String> = None;
         let message_with_links = if let Some(ref hook) = manifest.pre_turn {
             if let Some(ref tool_name) = hook.tool {
                 let input = if hook.pass_message {
@@ -2332,6 +2334,18 @@ impl OpenFangKernel {
                                     hook_tool = %tool_name,
                                     "Pre-turn hook returned strip_media=true, clearing media blocks"
                                 );
+                            }
+                            // Extract ephemeral_context — injected into LLM call but not persisted
+                            if let Some(eph) = parsed.get("ephemeral_context").and_then(|v| v.as_str()) {
+                                if !eph.is_empty() {
+                                    ephemeral_ctx = Some(eph.to_string());
+                                    info!(
+                                        agent = %entry.name,
+                                        hook_tool = %tool_name,
+                                        len = eph.len(),
+                                        "Pre-turn hook returned ephemeral_context"
+                                    );
+                                }
                             }
                             parsed.get("message")
                                 .and_then(|v| v.as_str())
@@ -2372,6 +2386,8 @@ impl OpenFangKernel {
         } else {
         // Inherit DYNAMIC_INJECTIONS from outer scope (e.g. tool_agent_send).
         let inherited_injections = openfang_runtime::tool_runner::take_dynamic_injections();
+        openfang_runtime::tool_runner::EPHEMERAL_CONTEXT
+            .scope(ephemeral_ctx, async {
         openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
             .scope(None, async {
                 openfang_runtime::tool_runner::DYNAMIC_INJECTIONS
@@ -2410,6 +2426,8 @@ impl OpenFangKernel {
                 .await
                     })
                     .await
+            })
+            .await
             })
             .await
             .map_err(KernelError::OpenFang)?
