@@ -2312,9 +2312,9 @@ impl OpenFangKernel {
         let message_with_links = if let Some(ref hook) = manifest.pre_turn {
             if let Some(ref tool_name) = hook.tool {
                 let input = if hook.pass_message {
-                    serde_json::json!({ "message": &message_with_links })
+                    serde_json::json!({ "message": &message_with_links, "agent_name": &entry.name })
                 } else {
-                    serde_json::json!({})
+                    serde_json::json!({ "agent_name": &entry.name })
                 };
                 match self.execute_hook_tool(agent_id, &manifest, tool_name, input).await {
                     Ok(content) => {
