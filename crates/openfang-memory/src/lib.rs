@@ -13,6 +13,7 @@ pub mod migration;
 pub mod semantic;
 pub mod session;
 pub mod structured;
+pub mod trace_store;
 pub mod usage;
 
 mod substrate;

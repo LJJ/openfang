@@ -51,6 +51,8 @@ pub struct PromptContext {
     pub identity_md: Option<String>,
     /// HEARTBEAT.md content (autonomous agent checklist).
     pub heartbeat_md: Option<String>,
+    /// Extra content appended to the end of system prompt (from system-prompt.d/).
+    pub prompt_suffix: Option<String>,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -173,6 +175,16 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if let Some(ref ws_ctx) = ctx.workspace_context {
             if !ws_ctx.trim().is_empty() {
                 sections.push(cap_str(ws_ctx, 1000));
+            }
+        }
+    }
+
+    // Section 15 — Prompt Suffix (skip for subagents)
+    // Generic injection point: content from {home}/system-prompt.d/*.md
+    if !ctx.is_subagent {
+        if let Some(ref suffix) = ctx.prompt_suffix {
+            if !suffix.trim().is_empty() {
+                sections.push(suffix.clone());
             }
         }
     }

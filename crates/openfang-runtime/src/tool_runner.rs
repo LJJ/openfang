@@ -111,12 +111,33 @@ tokio::task_local! {
     /// Ephemeral context injected by pre-turn hook.
     /// Prepended to the last user message for LLM calls but NOT stored in session history.
     pub static EPHEMERAL_CONTEXT: Option<String>;
+    /// Trace context for distributed tracing — carries trace_id and span recorder.
+    pub static TRACE_CONTEXT: Option<TraceContextRef>;
+    /// Trigger type for the current request (user, tick, cron, webhook).
+    pub static TRIGGER_TYPE: Option<String>;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
 /// Returns 0 if called outside an agent task.
 pub fn current_agent_depth() -> u32 {
     AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0)
+}
+
+/// Trace context reference carried via task-local.
+#[derive(Clone)]
+pub struct TraceContextRef {
+    pub trace_id: String,
+    pub collector: std::sync::Arc<dyn openfang_memory::trace_store::TraceRecorder>,
+}
+
+/// Read the trace context from the task-local, if any.
+pub fn trace_context() -> Option<TraceContextRef> {
+    TRACE_CONTEXT.try_with(|v| v.clone()).ok().flatten()
+}
+
+/// Read the trigger type from the task-local, if any.
+pub fn trigger_type() -> Option<String> {
+    TRIGGER_TYPE.try_with(|v| v.clone()).ok().flatten()
 }
 
 /// Read the ephemeral context set by pre-turn hook, if any.
@@ -1555,7 +1576,11 @@ async fn tool_agent_send(
 
     let result = AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
-            kh.send_to_agent(agent_id, &final_message).await
+            TRIGGER_TYPE
+                .scope(Some("agent".to_string()), async {
+                    kh.send_to_agent(agent_id, &final_message).await
+                })
+                .await
         })
         .await;
 

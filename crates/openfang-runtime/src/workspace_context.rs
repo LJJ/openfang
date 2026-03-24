@@ -144,6 +144,9 @@ impl WorkspaceContext {
         let file_names: Vec<String> = self.cache.keys().cloned().collect();
         for name in file_names {
             if let Some(content) = self.get_file(&name) {
+                if content.trim().is_empty() {
+                    continue;
+                }
                 // Take first 200 chars as preview
                 let preview = if content.len() > 200 {
                     format!("{}...", crate::str_utils::safe_truncate_str(content, 200))

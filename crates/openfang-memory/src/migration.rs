@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -37,6 +37,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 7 {
         migrate_v7(conn)?;
+    }
+
+    if current_version < 8 {
+        migrate_v8(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -294,6 +298,52 @@ fn migrate_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (7, datetime('now'), 'Add paired_devices table for device pairing');
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 8: Add traces and trace_spans tables for distributed tracing.
+fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS traces (
+            id TEXT PRIMARY KEY,
+            trigger_type TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'running',
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            total_duration_ms INTEGER,
+            total_input_tokens INTEGER NOT NULL DEFAULT 0,
+            total_output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_llm_calls INTEGER NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_traces_started ON traces(started_at);
+        CREATE INDEX IF NOT EXISTS idx_traces_agent ON traces(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(status);
+
+        CREATE TABLE IF NOT EXISTS trace_spans (
+            id TEXT PRIMARY KEY,
+            trace_id TEXT NOT NULL,
+            parent_span_id TEXT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            duration_ms INTEGER,
+            input TEXT,
+            output TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            token_input INTEGER,
+            token_output INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_spans_trace ON trace_spans(trace_id);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (8, datetime('now'), 'Add traces and trace_spans tables for distributed tracing');
         ",
     )?;
     Ok(())

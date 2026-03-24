@@ -522,10 +522,12 @@ pub async fn send_message(
     );
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match state
-        .kernel
-        .send_message_with_handle_and_media(agent_id, &message, Some(kernel_handle), media_blocks)
-        .await
+    match openfang_runtime::tool_runner::TRIGGER_TYPE.scope(Some("user".to_string()), async {
+        state
+            .kernel
+            .send_message_with_handle_and_media(agent_id, &message, Some(kernel_handle), media_blocks)
+            .await
+    }).await
     {
         Ok(result) => {
             // Guard: ensure we never return an empty response to the client
@@ -8953,4 +8955,408 @@ fn validate_webhook_token(headers: &axum::http::HeaderMap, token_env: &str) -> b
         return false;
     }
     provided.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
+// ---------------------------------------------------------------------------
+// Trace endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/traces — List traces with pagination and optional filters.
+pub async fn list_traces(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(200);
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let agent_filter = params.get("agent").map(|s| s.as_str());
+    let trigger_filter = params.get("trigger").map(|s| s.as_str());
+
+    match state
+        .kernel
+        .trace_collector
+        .store()
+        .list_traces(limit, offset, agent_filter, trigger_filter)
+    {
+        Ok((traces, total)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "traces": traces,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// GET /api/traces/{id} — Get trace detail with all spans.
+pub async fn get_trace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.trace_collector.store().get_trace(&id) {
+        Ok(Some(detail)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "trace": detail.trace,
+                "spans": detail.spans,
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Trace not found"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// POST /api/traces/{trace_id}/spans — Report an external span (from MCP hooks).
+pub async fn report_span(
+    State(state): State<Arc<AppState>>,
+    Path(trace_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let span = openfang_memory::trace_store::TraceSpan {
+        id: body
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        trace_id: trace_id.clone(),
+        parent_span_id: body.get("parent_span_id").and_then(|v| v.as_str()).map(String::from),
+        name: body
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        kind: openfang_memory::trace_store::SpanKind::from_str(
+            body.get("kind").and_then(|v| v.as_str()).unwrap_or("custom"),
+        ),
+        started_at: body
+            .get("started_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        ended_at: body.get("ended_at").and_then(|v| v.as_str()).map(String::from),
+        duration_ms: body.get("duration_ms").and_then(|v| v.as_i64()),
+        input: body.get("input").and_then(|v| v.as_str()).map(String::from),
+        output: body.get("output").and_then(|v| v.as_str()).map(String::from),
+        metadata_json: body
+            .get("metadata_json")
+            .map(|v| {
+                if v.is_string() {
+                    v.as_str().unwrap_or("{}").to_string()
+                } else {
+                    v.to_string()
+                }
+            })
+            .unwrap_or_else(|| "{}".to_string()),
+        token_input: body.get("token_input").and_then(|v| v.as_u64()),
+        token_output: body.get("token_output").and_then(|v| v.as_u64()),
+    };
+
+    state.kernel.trace_collector.record_span_data(span);
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+}
+
+/// DELETE /api/traces/cleanup — Manually trigger trace cleanup.
+pub async fn cleanup_traces(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let removed = state.kernel.trace_collector.cleanup(100, 86400);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"removed": removed})),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Character status endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/characters — List all characters with their full live state.
+pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let home = &state.kernel.config.home_dir;
+    let chars_dir = home.join("characters");
+    let agents_dir = home.join("agents");
+
+    // Read character registry
+    let registry_path = chars_dir.join("registry.toml");
+    let registry_str = match std::fs::read_to_string(&registry_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Cannot read registry: {e}")})),
+            );
+        }
+    };
+    let registry: toml::Value = match registry_str.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Cannot parse registry: {e}")})),
+            );
+        }
+    };
+
+    let mut characters = Vec::new();
+
+    if let Some(table) = registry.as_table() {
+        for (char_id, entry) in table {
+            let display_name = entry
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(char_id)
+                .to_string();
+            let agent_id = entry
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let is_agent = entry
+                .get("is_agent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let is_owner = entry
+                .get("is_owner")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let mut card = serde_json::json!({
+                "character_id": char_id,
+                "display_name": display_name,
+                "agent_id": agent_id,
+                "is_agent": is_agent,
+                "is_owner": is_owner,
+            });
+
+            // Read character world state
+            let char_state_path = chars_dir.join(char_id).join("state.json");
+            if let Ok(s) = std::fs::read_to_string(&char_state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    card["world_state"] = v;
+                }
+            }
+
+            // For AI characters, read agent life state and related data
+            if is_agent && !agent_id.is_empty() {
+                let agent_dir = agents_dir.join(&agent_id);
+
+                // Life state
+                let life_state_path = agent_dir.join("life/state.json");
+                if let Ok(s) = std::fs::read_to_string(&life_state_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        card["life_state"] = v;
+                    }
+                }
+
+                // Today's schedule
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let schedule_path = agent_dir.join(format!("life/{today}.json"));
+                if let Ok(s) = std::fs::read_to_string(&schedule_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        card["schedule"] = v;
+                    }
+                }
+
+                // Wardrobe state
+                let wardrobe_state_path = agent_dir.join("wardrobe/state.json");
+                if let Ok(s) = std::fs::read_to_string(&wardrobe_state_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        card["wardrobe_state"] = v;
+                    }
+                }
+
+                // Wardrobe manifest (for resolving current outfit name)
+                let wardrobe_manifest_path = agent_dir.join("wardrobe/manifest.json");
+                if let Ok(s) = std::fs::read_to_string(&wardrobe_manifest_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        if let Some(current_id) = card
+                            .get("wardrobe_state")
+                            .and_then(|ws| ws.get("current_item_id"))
+                            .and_then(|v| v.as_str())
+                        {
+                            // items can be a dict (id → item) or an array
+                            let found = if let Some(obj) = v.get("items").and_then(|i| i.as_object()) {
+                                obj.get(current_id).cloned()
+                            } else if let Some(arr) = v.get("items").and_then(|i| i.as_array()) {
+                                arr.iter().find(|item| item.get("id").and_then(|i| i.as_str()) == Some(current_id)).cloned()
+                            } else {
+                                None
+                            };
+                            if let Some(item) = found {
+                                card["current_outfit"] = serde_json::json!({
+                                    "name": item.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                                    "description": item.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Active plan
+                let plan_path = agent_dir.join("life/active_plan.json");
+                if let Ok(s) = std::fs::read_to_string(&plan_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        card["active_plan"] = v;
+                    }
+                }
+
+                // Context cache (last interaction info)
+                let cache_path = agent_dir.join("context_cache.json");
+                if let Ok(s) = std::fs::read_to_string(&cache_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        card["context_cache"] = serde_json::json!({
+                            "last_user_interaction_at": v.get("last_user_interaction_at"),
+                            "last_known_channel": v.get("last_known_channel"),
+                            "turn_channel": v.get("turn_channel"),
+                        });
+                    }
+                }
+
+                // Desire memories
+                let desires_path = agent_dir.join("life/desire_memories.json");
+                if let Ok(s) = std::fs::read_to_string(&desires_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        card["desire_memories"] = v;
+                    }
+                }
+            }
+
+            characters.push(card);
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"characters": characters})))
+}
+
+/// GET /api/characters/{agent_id}/avatar — Serve agent avatar image.
+pub async fn character_avatar(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<String>,
+) -> impl IntoResponse {
+    // Sanitize: agent_id must be alphanumeric + hyphen only
+    if !agent_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return (StatusCode::BAD_REQUEST, [("content-type", "text/plain")], vec![]);
+    }
+    let avatar_path = state
+        .kernel
+        .config
+        .home_dir
+        .join("agents")
+        .join(&agent_id)
+        .join("avatar.png");
+    match std::fs::read(&avatar_path) {
+        Ok(data) => (StatusCode::OK, [("content-type", "image/png")], data),
+        Err(_) => (StatusCode::NOT_FOUND, [("content-type", "text/plain")], vec![]),
+    }
+}
+
+/// GET /api/characters/{agent_id}/wardrobe — List all wardrobe items with image URLs.
+pub async fn character_wardrobe(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<String>,
+) -> impl IntoResponse {
+    if !agent_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid agent ID"})));
+    }
+    let manifest_path = state
+        .kernel
+        .config
+        .home_dir
+        .join("agents")
+        .join(&agent_id)
+        .join("wardrobe/manifest.json");
+
+    let state_path = state
+        .kernel
+        .config
+        .home_dir
+        .join("agents")
+        .join(&agent_id)
+        .join("wardrobe/state.json");
+
+    let current_item_id = std::fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("current_item_id").and_then(|i| i.as_str()).map(String::from));
+
+    match std::fs::read_to_string(&manifest_path) {
+        Ok(s) => {
+            let manifest: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
+            let items_obj = manifest.get("items").and_then(|i| i.as_object());
+            let mut items = Vec::new();
+            if let Some(obj) = items_obj {
+                for (id, item) in obj {
+                    let is_current = current_item_id.as_deref() == Some(id.as_str());
+                    items.push(serde_json::json!({
+                        "id": id,
+                        "name": item.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                        "description": item.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                        "tags": item.get("tags").unwrap_or(&serde_json::json!([])),
+                        "status": item.get("status").and_then(|s| s.as_str()).unwrap_or(""),
+                        "created_at": item.get("created_at"),
+                        "last_worn_at": item.get("last_worn_at"),
+                        "is_current": is_current,
+                        "image_url": format!("/api/characters/{agent_id}/wardrobe/{id}/image"),
+                    }));
+                }
+            }
+            // Sort: current first, then by last_worn_at desc
+            items.sort_by(|a, b| {
+                let a_current = a.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false);
+                let b_current = b.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false);
+                b_current.cmp(&a_current)
+            });
+            (StatusCode::OK, Json(serde_json::json!({
+                "agent_id": agent_id,
+                "current_item_id": current_item_id,
+                "items": items,
+            })))
+        }
+        Err(_) => (StatusCode::OK, Json(serde_json::json!({
+            "agent_id": agent_id,
+            "current_item_id": current_item_id,
+            "items": [],
+        }))),
+    }
+}
+
+/// GET /api/characters/{agent_id}/wardrobe/{item_id}/image — Serve wardrobe item image.
+pub async fn character_wardrobe_image(
+    State(state): State<Arc<AppState>>,
+    Path((agent_id, item_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // Sanitize both IDs
+    let valid = |s: &str| s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    if !valid(&agent_id) || !valid(&item_id) {
+        return (StatusCode::BAD_REQUEST, [("content-type", "text/plain")], vec![]);
+    }
+    let image_path = state
+        .kernel
+        .config
+        .home_dir
+        .join("agents")
+        .join(&agent_id)
+        .join("wardrobe")
+        .join(&item_id)
+        .join("base.png");
+    match std::fs::read(&image_path) {
+        Ok(data) => (StatusCode::OK, [("content-type", "image/png")], data),
+        Err(_) => (StatusCode::NOT_FOUND, [("content-type", "text/plain")], vec![]),
+    }
 }

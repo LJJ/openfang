@@ -410,6 +410,34 @@ pub async fn build_router(
             axum::routing::get(routes::usage_by_model),
         )
         .route("/api/usage/daily", axum::routing::get(routes::usage_daily))
+        // Trace endpoints
+        .route("/api/traces", axum::routing::get(routes::list_traces))
+        .route(
+            "/api/traces/cleanup",
+            axum::routing::delete(routes::cleanup_traces),
+        )
+        .route("/api/traces/{id}", axum::routing::get(routes::get_trace))
+        .route(
+            "/api/traces/{trace_id}/spans",
+            axum::routing::post(routes::report_span),
+        )
+        // Character status endpoints
+        .route(
+            "/api/characters",
+            axum::routing::get(routes::list_characters),
+        )
+        .route(
+            "/api/characters/{agent_id}/avatar",
+            axum::routing::get(routes::character_avatar),
+        )
+        .route(
+            "/api/characters/{agent_id}/wardrobe",
+            axum::routing::get(routes::character_wardrobe),
+        )
+        .route(
+            "/api/characters/{agent_id}/wardrobe/{item_id}/image",
+            axum::routing::get(routes::character_wardrobe_image),
+        )
         // Budget endpoints
         .route(
             "/api/budget",

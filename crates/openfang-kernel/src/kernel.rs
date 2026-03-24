@@ -313,6 +313,8 @@ pub struct OpenFangKernel {
     pub audit_log: Arc<AuditLog>,
     /// Cost metering engine.
     pub metering: Arc<MeteringEngine>,
+    /// Distributed trace collector.
+    pub trace_collector: crate::trace_collector::TraceCollector,
     /// Default LLM driver (from kernel config).
     default_driver: Arc<dyn LlmDriver>,
     /// WASM sandbox engine (shared across all WASM agent executions).
@@ -720,6 +722,30 @@ fn read_identity_file(workspace: &Path, filename: &str) -> Option<String> {
     }
 }
 
+/// Load and concatenate all `.md` files from `{home_dir}/system-prompt.d/`.
+/// Files are sorted by name so ordering is controlled via filename prefixes
+/// (e.g. `01-world-briefing.md`, `02-rules.md`).
+fn load_prompt_suffix_dir(home_dir: &Path) -> Option<String> {
+    let dir = home_dir.join("system-prompt.d");
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "md"))
+        .collect();
+    entries.sort();
+    let mut parts = Vec::new();
+    for path in entries {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+    }
+    if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
+}
+
 /// Get the system hostname as a String.
 fn gethostname() -> Option<String> {
     #[cfg(unix)]
@@ -842,6 +868,11 @@ impl OpenFangKernel {
         let metering = Arc::new(MeteringEngine::new(Arc::new(
             openfang_memory::usage::UsageStore::new(memory.usage_conn()),
         )));
+
+        // Initialize trace collector (shares the same SQLite connection)
+        let trace_collector = crate::trace_collector::TraceCollector::new(
+            openfang_memory::trace_store::TraceStore::new(memory.usage_conn()),
+        );
 
         let supervisor = Supervisor::new();
         let background = BackgroundExecutor::new(supervisor.subscribe());
@@ -1108,6 +1139,7 @@ impl OpenFangKernel {
             background,
             audit_log: Arc::new(AuditLog::new()),
             metering,
+            trace_collector,
             default_driver: driver,
             wasm_sandbox,
             auth,
@@ -1724,6 +1756,7 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
+                prompt_suffix: load_prompt_suffix_dir(&self.config.home_dir),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -1739,6 +1772,9 @@ impl OpenFangKernel {
             message.to_string()
         };
         let kernel_clone = Arc::clone(self);
+        // Capture trigger type before spawn (task-locals don't cross spawn boundaries)
+        let captured_trigger = openfang_runtime::tool_runner::trigger_type()
+            .unwrap_or_else(|| "unknown".to_string());
 
         let handle = tokio::spawn(async move {
             // Auto-compact if the session is large before running the loop
@@ -1796,7 +1832,21 @@ impl OpenFangKernel {
                     let _ = phase_tx.try_send(event);
                 });
 
-            let result = run_agent_loop_streaming(
+            // Begin trace for streaming execution — trigger captured before spawn
+            let trigger = captured_trigger;
+            let trace_id = kernel_clone.trace_collector.begin_trace(
+                &trigger,
+                &agent_id.to_string(),
+                &manifest.name,
+            );
+            let trace_ctx = openfang_runtime::tool_runner::TraceContextRef {
+                trace_id: trace_id.clone(),
+                collector: std::sync::Arc::new(kernel_clone.trace_collector.clone()),
+            };
+
+            let result = openfang_runtime::tool_runner::TRACE_CONTEXT
+                .scope(Some(trace_ctx), async {
+            run_agent_loop_streaming(
                 &manifest,
                 &message_owned,
                 &mut session,
@@ -1828,10 +1878,20 @@ impl OpenFangKernel {
                 Some(&kernel_clone.process_manager),
                 media_blocks,
             )
+            .await
+                })
             .await;
 
             match result {
                 Ok(result) => {
+                    // End trace
+                    kernel_clone.trace_collector.end_trace(
+                        &trace_id,
+                        "completed",
+                        result.total_usage.input_tokens,
+                        result.total_usage.output_tokens,
+                        result.iterations as u64,
+                    );
                     // Append new messages to canonical session for cross-channel memory
                     if !stateless_session && session.messages.len() > messages_before {
                         let new_messages = session.messages[messages_before..].to_vec();
@@ -1880,6 +1940,7 @@ impl OpenFangKernel {
                     Ok(result)
                 }
                 Err(e) => {
+                    kernel_clone.trace_collector.end_trace(&trace_id, "error", 0, 0, 0);
                     kernel_clone.supervisor.record_panic();
                     warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed");
                     Err(KernelError::OpenFang(e))
@@ -2092,6 +2153,15 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         mut media_blocks: Vec<openfang_types::message::ContentBlock>,
     ) -> KernelResult<AgentLoopResult> {
+        // Begin trace — trigger type set by caller via task-local
+        let trigger = openfang_runtime::tool_runner::trigger_type()
+            .unwrap_or_else(|| "unknown".to_string());
+        let trace_id = self.trace_collector.begin_trace(
+            &trigger,
+            &agent_id.to_string(),
+            &entry.name,
+        );
+
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
@@ -2220,6 +2290,7 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
+                prompt_suffix: load_prompt_suffix_dir(&self.config.home_dir),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2317,12 +2388,13 @@ impl OpenFangKernel {
         // hook 可返回 ephemeral_context：仅注入本轮 LLM 调用，不存入 session。
         let mut skip_llm = false;
         let mut ephemeral_ctx: Option<String> = None;
+        let pre_hook_start = std::time::Instant::now();
         let message_with_links = if let Some(ref hook) = manifest.pre_turn {
             if let Some(ref tool_name) = hook.tool {
                 let input = if hook.pass_message {
-                    serde_json::json!({ "message": &message_with_links, "agent_name": &entry.name })
+                    serde_json::json!({ "message": &message_with_links, "agent_name": &entry.name, "trace_id": &trace_id })
                 } else {
-                    serde_json::json!({ "agent_name": &entry.name })
+                    serde_json::json!({ "agent_name": &entry.name, "trace_id": &trace_id })
                 };
                 match self.execute_hook_tool(agent_id, &manifest, tool_name, input).await {
                     Ok(content) => {
@@ -2380,6 +2452,21 @@ impl OpenFangKernel {
             message_with_links
         };
 
+        // Record pre-turn hook span (if a hook was configured)
+        if manifest.pre_turn.as_ref().and_then(|h| h.tool.as_ref()).is_some() {
+            let elapsed = pre_hook_start.elapsed().as_millis() as i64;
+            let now = chrono::Utc::now().to_rfc3339();
+            self.trace_collector.record_span_data(
+                crate::trace_collector::make_span(
+                    &trace_id, None,
+                    &format!("hook:pre_turn:{}", manifest.pre_turn.as_ref().unwrap().tool.as_ref().unwrap()),
+                    openfang_memory::trace_store::SpanKind::Hook,
+                    &now, &now, elapsed,
+                    None, None, "{}".to_string(), None, None,
+                ),
+            );
+        }
+
         // ── LLM 调用（skip_llm 时跳过）──
         let mut result = if skip_llm {
             info!(agent = %entry.name, "Pre-turn hook returned skip_llm=true, skipping LLM call");
@@ -2394,6 +2481,12 @@ impl OpenFangKernel {
         } else {
         // Inherit DYNAMIC_INJECTIONS from outer scope (e.g. tool_agent_send).
         let inherited_injections = openfang_runtime::tool_runner::take_dynamic_injections();
+        let trace_ctx = openfang_runtime::tool_runner::TraceContextRef {
+            trace_id: trace_id.clone(),
+            collector: std::sync::Arc::new(self.trace_collector.clone()),
+        };
+        openfang_runtime::tool_runner::TRACE_CONTEXT
+            .scope(Some(trace_ctx), async {
         openfang_runtime::tool_runner::EPHEMERAL_CONTEXT
             .scope(ephemeral_ctx, async {
         openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
@@ -2438,17 +2531,21 @@ impl OpenFangKernel {
             .await
             })
             .await
+            })
+            .await
             .map_err(KernelError::OpenFang)?
         };
 
         // ── Post-turn hook ──
         if let Some(ref hook) = manifest.post_turn {
             if let Some(ref tool_name) = hook.tool {
+                let post_hook_start = std::time::Instant::now();
                 let mut input = serde_json::Map::new();
                 if hook.pass_response {
                     input.insert("response".into(), serde_json::json!(&result.response));
                     input.insert("agent_name".into(), serde_json::json!(&entry.name));
                 }
+                input.insert("trace_id".into(), serde_json::json!(&trace_id));
                 if !hook.skills.is_empty() {
                     let mut skill_guides = serde_json::Map::new();
                     for skill_name in &hook.skills {
@@ -2480,11 +2577,33 @@ impl OpenFangKernel {
                         );
                     }
                 }
+                // Record post-turn hook span
+                let elapsed = post_hook_start.elapsed().as_millis() as i64;
+                let now = chrono::Utc::now().to_rfc3339();
+                self.trace_collector.record_span_data(
+                    crate::trace_collector::make_span(
+                        &trace_id, None,
+                        &format!("hook:post_turn:{tool_name}"),
+                        openfang_memory::trace_store::SpanKind::Hook,
+                        &now, &now, elapsed,
+                        None, None, "{}".to_string(), None, None,
+                    ),
+                );
+
                 if hook.clear_response {
                     result.response.clear();
                 }
             }
         }
+
+        // ── End trace ──
+        self.trace_collector.end_trace(
+            &trace_id,
+            "completed",
+            result.total_usage.input_tokens,
+            result.total_usage.output_tokens,
+            result.iterations as u64,
+        );
 
         // Append new messages to canonical session for cross-channel memory
         if !stateless_session && session.messages.len() > messages_before {
@@ -3342,7 +3461,10 @@ impl OpenFangKernel {
                     let aid = *agent_id;
                     let msg = message.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = kernel.send_message(aid, &msg).await {
+                        if let Err(e) = openfang_runtime::tool_runner::TRIGGER_TYPE.scope(
+                            Some("webhook".to_string()),
+                            kernel.send_message(aid, &msg),
+                        ).await {
                             warn!(agent = %aid, "Trigger dispatch failed: {e}");
                         }
                     });
@@ -3480,6 +3602,19 @@ impl OpenFangKernel {
         }
 
         self.start_async_media_worker();
+
+        // Start periodic trace cleanup (every hour: keep max 100 traces or 1 day)
+        {
+            let collector = self.trace_collector.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                interval.tick().await; // Skip the immediate first tick
+                loop {
+                    interval.tick().await;
+                    collector.cleanup(100, 86400);
+                }
+            });
+        }
 
         // Start heartbeat monitor for agent health checking
         self.start_heartbeat_monitor();
@@ -3671,7 +3806,10 @@ impl OpenFangKernel {
                                 let delivery = job.delivery.clone();
                                 match tokio::time::timeout(
                                     timeout,
-                                    kernel.send_message(agent_id, message),
+                                    openfang_runtime::tool_runner::TRIGGER_TYPE.scope(
+                                        Some("cron".to_string()),
+                                        kernel.send_message(agent_id, message),
+                                    ),
                                 )
                                 .await
                                 {
@@ -4257,7 +4395,10 @@ impl OpenFangKernel {
             .start_agent(agent_id, name, schedule, move |aid, msg| {
                 let k = Arc::clone(&kernel);
                 tokio::spawn(async move {
-                    match k.send_message(aid, &msg).await {
+                    match openfang_runtime::tool_runner::TRIGGER_TYPE.scope(
+                        Some("tick".to_string()),
+                        k.send_message(aid, &msg),
+                    ).await {
                         Ok(_) => {}
                         Err(e) => {
                             // send_message already records the panic in supervisor,

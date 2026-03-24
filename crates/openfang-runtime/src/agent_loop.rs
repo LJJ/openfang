@@ -1496,6 +1496,33 @@ pub async fn run_agent_loop(
 
         // Call LLM with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
+        let llm_call_start = std::time::Instant::now();
+        let llm_model_name = request.model.clone();
+
+        // Capture full input for tracing before request is consumed
+        let trace_input = if crate::tool_runner::trace_context().is_some() {
+            let mut parts = Vec::new();
+            if let Some(ref sys) = request.system {
+                parts.push(format!("[system]\n{sys}"));
+            }
+            for msg in &request.messages {
+                let role = format!("{:?}", msg.role).to_lowercase();
+                let text = match &msg.content {
+                    openfang_types::message::MessageContent::Text(t) => t.clone(),
+                    openfang_types::message::MessageContent::Blocks(blocks) => {
+                        blocks.iter().filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        }).collect::<Vec<_>>().join("\n")
+                    }
+                };
+                parts.push(format!("[{role}]\n{text}"));
+            }
+            Some(parts.join("\n\n"))
+        } else {
+            None
+        };
+
         let mut response = match call_with_retry(&*driver, request, Some(provider_name), None).await
         {
             Ok(response) => response,
@@ -1508,6 +1535,45 @@ pub async fn run_agent_loop(
                 return Err(error);
             }
         };
+
+        // Record LLM span in trace (full input/output)
+        if let Some(ctx) = crate::tool_runner::trace_context() {
+            let elapsed = llm_call_start.elapsed().as_millis() as i64;
+            let now = chrono::Utc::now().to_rfc3339();
+
+            // Full output: response text + tool calls
+            let mut output_parts = Vec::new();
+            let text = response.text();
+            if !text.is_empty() {
+                output_parts.push(text.to_string());
+            }
+            for tc in &response.tool_calls {
+                output_parts.push(format!("[tool_call: {}]\n{}", tc.name, tc.input));
+            }
+            let trace_output = output_parts.join("\n\n");
+
+            let span = openfang_memory::trace_store::TraceSpan {
+                id: uuid::Uuid::new_v4().to_string(),
+                trace_id: ctx.trace_id.clone(),
+                parent_span_id: None,
+                name: format!("llm:{llm_model_name}"),
+                kind: openfang_memory::trace_store::SpanKind::Llm,
+                started_at: now.clone(),
+                ended_at: Some(now),
+                duration_ms: Some(elapsed),
+                input: trace_input,
+                output: Some(trace_output),
+                metadata_json: serde_json::json!({
+                    "model": llm_model_name,
+                    "iteration": iteration,
+                    "provider": provider_name,
+                    "stop_reason": format!("{:?}", response.stop_reason),
+                }).to_string(),
+                token_input: Some(response.usage.input_tokens),
+                token_output: Some(response.usage.output_tokens),
+            };
+            ctx.collector.record_span(span);
+        }
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -1825,6 +1891,20 @@ pub async fn run_agent_loop(
                         }
                     }
 
+                    // Inject agent_name for shared MCP toolbox so
+                    // narrative tools write intents to the correct agent.
+                    let tool_input = if tool_call.name.starts_with("mcp_toolbox_") {
+                        let mut patched = tool_call.input.clone();
+                        if let Some(obj) = patched.as_object_mut() {
+                            obj.entry("agent_name").or_insert_with(|| {
+                                serde_json::Value::String(manifest.name.clone())
+                            });
+                        }
+                        patched
+                    } else {
+                        tool_call.input.clone()
+                    };
+
                     let result = if let Some(async_result) = maybe_enqueue_async_media(
                         manifest,
                         tool_call,
@@ -1838,12 +1918,13 @@ pub async fn run_agent_loop(
                     } else {
                         // Timeout-wrapped execution
                         let tool_timeout_secs = tool_timeout_secs(&tool_call.name);
-                        match tokio::time::timeout(
+                        let tool_exec_start = std::time::Instant::now();
+                        let tool_exec_result = match tokio::time::timeout(
                             Duration::from_secs(tool_timeout_secs),
                             tool_runner::execute_tool(
                                 &tool_call.id,
                                 &tool_call.name,
-                                &tool_call.input,
+                                &tool_input,
                                 kernel.as_ref(),
                                 Some(&allowed_tool_names),
                                 Some(&caller_id_str),
@@ -1879,7 +1960,31 @@ pub async fn run_agent_loop(
                                     response_delivered: false,
                                 }
                             }
+                        };
+                        // Record tool span in trace
+                        if let Some(ctx) = crate::tool_runner::trace_context() {
+                            let elapsed = tool_exec_start.elapsed().as_millis() as i64;
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let span = openfang_memory::trace_store::TraceSpan {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                trace_id: ctx.trace_id.clone(),
+                                parent_span_id: None,
+                                name: format!("tool:{}", tool_call.name),
+                                kind: openfang_memory::trace_store::SpanKind::Tool,
+                                started_at: now.clone(),
+                                ended_at: Some(now),
+                                duration_ms: Some(elapsed),
+                                input: Some(tool_input.to_string()),
+                                output: Some(tool_exec_result.content.chars().take(4096).collect()),
+                                metadata_json: serde_json::json!({
+                                    "is_error": tool_exec_result.is_error,
+                                }).to_string(),
+                                token_input: None,
+                                token_output: None,
+                            };
+                            ctx.collector.record_span(span);
                         }
+                        tool_exec_result
                     };
 
                     // Fire AfterToolCall hook
@@ -2591,6 +2696,33 @@ pub async fn run_agent_loop_streaming(
 
         // Stream LLM call with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
+        let llm_call_start = std::time::Instant::now();
+        let llm_model_name = request.model.clone();
+
+        // Capture full input for tracing before request is consumed
+        let trace_input = if crate::tool_runner::trace_context().is_some() {
+            let mut parts = Vec::new();
+            if let Some(ref sys) = request.system {
+                parts.push(format!("[system]\n{sys}"));
+            }
+            for msg in &request.messages {
+                let role = format!("{:?}", msg.role).to_lowercase();
+                let text = match &msg.content {
+                    openfang_types::message::MessageContent::Text(t) => t.clone(),
+                    openfang_types::message::MessageContent::Blocks(blocks) => {
+                        blocks.iter().filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        }).collect::<Vec<_>>().join("\n")
+                    }
+                };
+                parts.push(format!("[{role}]\n{text}"));
+            }
+            Some(parts.join("\n\n"))
+        } else {
+            None
+        };
+
         let mut response = match stream_with_retry(
             &*driver,
             request,
@@ -2610,6 +2742,44 @@ pub async fn run_agent_loop_streaming(
                 return Err(error);
             }
         };
+
+        // Record LLM span in trace (full input/output)
+        if let Some(ctx) = crate::tool_runner::trace_context() {
+            let elapsed = llm_call_start.elapsed().as_millis() as i64;
+            let now = chrono::Utc::now().to_rfc3339();
+
+            let mut output_parts = Vec::new();
+            let text = response.text();
+            if !text.is_empty() {
+                output_parts.push(text.to_string());
+            }
+            for tc in &response.tool_calls {
+                output_parts.push(format!("[tool_call: {}]\n{}", tc.name, tc.input));
+            }
+            let trace_output = output_parts.join("\n\n");
+
+            let span = openfang_memory::trace_store::TraceSpan {
+                id: uuid::Uuid::new_v4().to_string(),
+                trace_id: ctx.trace_id.clone(),
+                parent_span_id: None,
+                name: format!("llm:{llm_model_name}"),
+                kind: openfang_memory::trace_store::SpanKind::Llm,
+                started_at: now.clone(),
+                ended_at: Some(now),
+                duration_ms: Some(elapsed),
+                input: trace_input,
+                output: Some(trace_output),
+                metadata_json: serde_json::json!({
+                    "model": llm_model_name,
+                    "iteration": iteration,
+                    "provider": provider_name,
+                    "stop_reason": format!("{:?}", response.stop_reason),
+                }).to_string(),
+                token_input: Some(response.usage.input_tokens),
+                token_output: Some(response.usage.output_tokens),
+            };
+            ctx.collector.record_span(span);
+        }
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -2936,6 +3106,20 @@ pub async fn run_agent_loop_streaming(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
+                    // Inject agent_name for shared MCP toolbox so
+                    // narrative tools write intents to the correct agent.
+                    let tool_input = if tool_call.name.starts_with("mcp_toolbox_") {
+                        let mut patched = tool_call.input.clone();
+                        if let Some(obj) = patched.as_object_mut() {
+                            obj.entry("agent_name").or_insert_with(|| {
+                                serde_json::Value::String(manifest.name.clone())
+                            });
+                        }
+                        patched
+                    } else {
+                        tool_call.input.clone()
+                    };
+
                     let result = if let Some(async_result) = maybe_enqueue_async_media(
                         manifest,
                         tool_call,
@@ -2949,12 +3133,13 @@ pub async fn run_agent_loop_streaming(
                     } else {
                         // Timeout-wrapped execution
                         let tool_timeout_secs = tool_timeout_secs(&tool_call.name);
-                        match tokio::time::timeout(
+                        let tool_exec_start = std::time::Instant::now();
+                        let tool_exec_result = match tokio::time::timeout(
                             Duration::from_secs(tool_timeout_secs),
                             tool_runner::execute_tool(
                                 &tool_call.id,
                                 &tool_call.name,
-                                &tool_call.input,
+                                &tool_input,
                                 kernel.as_ref(),
                                 Some(&allowed_tool_names),
                                 Some(&caller_id_str),
@@ -2990,7 +3175,31 @@ pub async fn run_agent_loop_streaming(
                                     response_delivered: false,
                                 }
                             }
+                        };
+                        // Record tool span in trace (streaming path)
+                        if let Some(ctx) = crate::tool_runner::trace_context() {
+                            let elapsed = tool_exec_start.elapsed().as_millis() as i64;
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let span = openfang_memory::trace_store::TraceSpan {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                trace_id: ctx.trace_id.clone(),
+                                parent_span_id: None,
+                                name: format!("tool:{}", tool_call.name),
+                                kind: openfang_memory::trace_store::SpanKind::Tool,
+                                started_at: now.clone(),
+                                ended_at: Some(now),
+                                duration_ms: Some(elapsed),
+                                input: Some(tool_input.to_string()),
+                                output: Some(tool_exec_result.content.chars().take(4096).collect()),
+                                metadata_json: serde_json::json!({
+                                    "is_error": tool_exec_result.is_error,
+                                }).to_string(),
+                                token_input: None,
+                                token_output: None,
+                            };
+                            ctx.collector.record_span(span);
                         }
+                        tool_exec_result
                     };
 
                     // Fire AfterToolCall hook

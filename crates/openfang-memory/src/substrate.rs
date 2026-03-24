@@ -9,6 +9,7 @@ use crate::migration::run_migrations;
 use crate::semantic::SemanticStore;
 use crate::session::{Session, SessionStore};
 use crate::structured::StructuredStore;
+use crate::trace_store::TraceStore;
 use crate::usage::UsageStore;
 
 use async_trait::async_trait;
@@ -33,6 +34,7 @@ pub struct MemorySubstrate {
     sessions: SessionStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
+    traces: TraceStore,
 }
 
 impl MemorySubstrate {
@@ -51,6 +53,7 @@ impl MemorySubstrate {
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
+            traces: TraceStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
         })
     }
@@ -69,6 +72,7 @@ impl MemorySubstrate {
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
+            traces: TraceStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
         })
     }
@@ -76,6 +80,11 @@ impl MemorySubstrate {
     /// Get a reference to the usage store.
     pub fn usage(&self) -> &UsageStore {
         &self.usage
+    }
+
+    /// Get a reference to the trace store.
+    pub fn traces(&self) -> &TraceStore {
+        &self.traces
     }
 
     /// Get the shared database connection (for constructing stores from outside).

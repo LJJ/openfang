@@ -68,6 +68,10 @@
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg></span>
               <span class="nav-label">Overview</span>
             </a>
+            <a class="nav-item" :class="{ active: page === 'characters' }" @click="navigate('characters')" :aria-current="page === 'characters' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+              <span class="nav-label">Characters</span>
+            </a>
             <a class="nav-item" :class="{ active: page === 'analytics' }" @click="navigate('analytics')" :aria-current="page === 'analytics' ? 'page' : false">
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6"/></svg></span>
               <span class="nav-label">Analytics</span>
@@ -75,6 +79,10 @@
             <a class="nav-item" :class="{ active: page === 'logs' }" @click="navigate('logs')" :aria-current="page === 'logs' ? 'page' : false">
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span>
               <span class="nav-label">Logs</span>
+            </a>
+            <a class="nav-item" :class="{ active: page === 'traces' }" @click="navigate('traces')" :aria-current="page === 'traces' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
+              <span class="nav-label">Traces</span>
             </a>
           </div>
         </template>
@@ -3858,6 +3866,323 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <p class="hint">Choose an agent from the dropdown above to browse and edit its memory store.</p>
             </div>
           </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Page: Characters -->
+    <template x-if="page === 'characters'">
+      <div x-data="charactersPage">
+        <div class="page-header">
+          <h2>Characters</h2>
+          <div class="flex gap-2 items-center">
+            <label style="font-size:13px;color:var(--text-muted);display:flex;align-items:center;gap:4px">
+              <input type="checkbox" x-model="autoRefresh"> Auto-refresh
+            </label>
+            <button class="btn btn-sm" @click="refresh()">Refresh</button>
+          </div>
+        </div>
+        <div class="page-body" x-init="loadData()">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading characters...</span></div>
+
+          <!-- Wardrobe overlay -->
+          <template x-if="wardrobeAgent">
+            <div>
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+                <button class="btn btn-sm" @click="closeWardrobe()">&larr; Back</button>
+                <h3 style="margin:0" x-text="wardrobeAgentName + ' — Wardrobe'"></h3>
+              </div>
+              <div x-show="wardrobeLoading" class="loading-state"><div class="spinner"></div></div>
+              <div x-show="!wardrobeLoading" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px">
+                <template x-for="item in wardrobeItems" :key="item.id">
+                  <div style="background:var(--card-bg);border-radius:8px;overflow:hidden;border:2px solid"
+                    :style="{borderColor: item.is_current ? '#8b5cf6' : 'var(--border)'}">
+                    <img :src="item.image_url" style="width:100%;aspect-ratio:3/4;object-fit:cover;display:block;background:var(--border)" loading="lazy"
+                      onerror="this.style.display='none'">
+                    <div style="padding:6px 8px">
+                      <div style="font-weight:600;font-size:11px;display:flex;align-items:center;gap:4px;line-height:1.3">
+                        <span x-text="item.name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+                        <span x-show="item.is_current" style="font-size:9px;padding:1px 4px;background:#8b5cf6;color:#fff;border-radius:3px;flex-shrink:0">now</span>
+                      </div>
+                      <div style="display:flex;gap:3px;flex-wrap:wrap;margin-top:3px" x-show="item.tags && item.tags.length">
+                        <template x-for="tag in (item.tags || [])" :key="tag">
+                          <span style="font-size:9px;padding:0 4px;border-radius:2px;background:var(--border);color:var(--text-muted)" x-text="tag"></span>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+              </div>
+              <div x-show="!wardrobeLoading && wardrobeItems.length === 0" style="color:var(--text-muted);text-align:center;padding:30px">Wardrobe is empty</div>
+            </div>
+          </template>
+
+          <!-- Character cards -->
+          <div x-show="!loading && !wardrobeAgent" style="display:flex;flex-wrap:wrap;gap:16px">
+            <template x-for="c in characters" :key="c.character_id">
+              <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:12px;padding:20px;min-width:340px;max-width:480px;flex:1">
+
+                <!-- Header: avatar + name + badges -->
+                <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+                  <img :src="avatarUrl(c)" style="width:48px;height:48px;border-radius:50%;object-fit:cover;background:var(--border);flex-shrink:0"
+                    onerror="this.style.display='none'">
+                  <div style="flex:1;min-width:0">
+                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                      <span style="font-size:20px;font-weight:700" x-text="c.display_name"></span>
+                      <span style="font-size:11px;padding:2px 8px;border-radius:4px;color:#fff"
+                        :style="{background: getMode(c) === 'in_person' ? '#8b5cf6' : '#6b7280'}"
+                        x-text="getMode(c)"></span>
+                      <span style="font-size:11px;padding:2px 8px;border-radius:4px;background:#3b82f6;color:#fff"
+                        x-show="getChannel(c)" x-text="getChannel(c)"></span>
+                    </div>
+                    <div style="font-size:11px;color:var(--text-muted)"
+                      x-text="'last: ' + formatDateTime(getLastInteraction(c))"></div>
+                  </div>
+                </div>
+
+                <!-- Mood -->
+                <div style="margin-bottom:10px">
+                  <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:2px">MOOD</div>
+                  <div style="font-size:14px" x-text="getMood(c)"></div>
+                </div>
+
+                <!-- Location + Activity + Outfit -->
+                <div style="display:flex;gap:16px;margin-bottom:10px;flex-wrap:wrap">
+                  <div style="flex:1;min-width:120px">
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:2px">LOCATION</div>
+                    <div style="font-size:13px" x-text="getLocation(c)"></div>
+                  </div>
+                  <div style="flex:1;min-width:120px" x-show="getActivity(c)">
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:2px">ACTIVITY</div>
+                    <div style="font-size:13px" x-text="getActivity(c) || '-'"></div>
+                  </div>
+                  <div style="flex:1;min-width:120px;cursor:pointer" x-show="getOutfit(c)" @click="openWardrobe(c.agent_id, c.display_name)">
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:2px">OUTFIT <span style="font-size:10px;color:var(--link-color)">[wardrobe]</span></div>
+                    <div style="font-size:13px" x-text="getOutfit(c) || '-'"></div>
+                  </div>
+                </div>
+
+                <!-- Physical bars: hunger + fatigue -->
+                <div style="margin-bottom:12px">
+                  <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">PHYSICAL</div>
+                  <div style="display:flex;gap:12px">
+                    <div style="flex:1">
+                      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted)">
+                        <span>Hunger</span><span x-text="pct(getPhysical(c).hunger) + '%'"></span>
+                      </div>
+                      <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:2px">
+                        <div style="height:100%;border-radius:3px;transition:width .3s"
+                          :style="{width: pct(getPhysical(c).hunger)+'%', background: barColor(getPhysical(c).hunger)}"></div>
+                      </div>
+                    </div>
+                    <div style="flex:1">
+                      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted)">
+                        <span>Fatigue</span><span x-text="pct(getPhysical(c).fatigue) + '%'"></span>
+                      </div>
+                      <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:2px">
+                        <div style="height:100%;border-radius:3px;transition:width .3s"
+                          :style="{width: pct(getPhysical(c).fatigue)+'%', background: barColor(getPhysical(c).fatigue)}"></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Life tensions -->
+                <template x-if="Object.keys(getTensions(c)).length > 0">
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">TENSIONS</div>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap">
+                      <template x-for="(v, k) in getTensions(c)" :key="k">
+                        <span style="font-size:11px;padding:2px 6px;border-radius:3px;border:1px solid var(--border)"
+                          :style="{color: tensionColor(v)}"
+                          x-text="tensionLabel(k) + ' ' + pct(v) + '%'"></span>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+
+                <!-- Schedule -->
+                <template x-if="getScheduleEntries(c).length > 0">
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">TODAY'S SCHEDULE</div>
+                    <div style="font-size:12px;max-height:120px;overflow-y:auto">
+                      <template x-for="(e, i) in getScheduleEntries(c)" :key="i">
+                        <div style="display:flex;gap:8px;padding:2px 0;border-bottom:1px solid var(--border)">
+                          <span style="color:var(--text-muted);white-space:nowrap;min-width:80px" x-text="e.start + '-' + e.end"></span>
+                          <span x-text="e.activity"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+
+                <!-- Thoughts -->
+                <template x-if="getThoughts(c).length > 0">
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">THOUGHTS</div>
+                    <div style="font-size:12px;max-height:80px;overflow-y:auto">
+                      <template x-for="(t, i) in getThoughts(c)" :key="i">
+                        <div style="padding:2px 0;color:var(--text-secondary)" x-text="t.text || t"></div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+
+                <!-- Recent events -->
+                <template x-if="getEvents(c).length > 0">
+                  <div style="margin-bottom:8px">
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">RECENT EVENTS</div>
+                    <div style="font-size:12px;max-height:100px;overflow-y:auto">
+                      <template x-for="(e, i) in getEvents(c)" :key="i">
+                        <div style="display:flex;gap:6px;padding:2px 0">
+                          <span style="color:var(--text-muted);white-space:nowrap;font-size:11px" x-text="formatTime(e.at)"></span>
+                          <span x-text="e.detail"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+
+                <!-- Unfulfilled desires -->
+                <template x-if="getDesires(c).length > 0">
+                  <div>
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">DESIRES</div>
+                    <div style="font-size:12px">
+                      <template x-for="(d, i) in getDesires(c)" :key="i">
+                        <div style="padding:2px 0;color:#d97706" x-text="d.text"></div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+
+              </div>
+            </template>
+          </div>
+          <div x-show="!loading && !wardrobeAgent && characters.length === 0" style="color:var(--text-muted);text-align:center;padding:40px">No AI characters found</div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Page: Traces -->
+    <template x-if="page === 'traces'">
+      <div x-data="tracesPage">
+        <div class="page-header">
+          <h2>Traces</h2>
+          <div class="flex gap-2 items-center">
+            <select class="form-input" style="width:140px" x-model="filterAgent" @change="loadTraces()">
+              <option value="">All Agents</option>
+              <template x-for="a in uniqueAgents" :key="a">
+                <option :value="a" x-text="a"></option>
+              </template>
+            </select>
+            <select class="form-input" style="width:140px" x-model="filterTrigger" @change="loadTraces()">
+              <option value="">All Triggers</option>
+              <option value="user">User</option>
+              <option value="tick">Tick</option>
+              <option value="cron">Cron</option>
+              <option value="webhook">Webhook</option>
+            </select>
+            <button class="btn btn-sm" @click="loadTraces()">Refresh</button>
+            <button class="btn btn-sm btn-danger" @click="doCleanup()">Cleanup</button>
+          </div>
+        </div>
+        <div class="page-body" x-init="loadTraces()">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading traces...</span></div>
+
+          <!-- Detail View -->
+          <template x-if="selectedTrace">
+            <div>
+              <button class="btn btn-sm" @click="closeDetail()" style="margin-bottom:12px">&larr; Back to list</button>
+              <div x-show="detailLoading" class="loading-state"><div class="spinner"></div></div>
+              <div x-show="!detailLoading">
+                <div style="background:var(--card-bg);border-radius:8px;padding:16px;margin-bottom:16px;border:1px solid var(--border)">
+                  <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
+                    <span style="font-weight:600" x-text="selectedTrace.agent_name"></span>
+                    <span style="padding:2px 8px;border-radius:4px;font-size:12px;color:#fff" :style="{background: triggerColor(selectedTrace.trigger_type)}" x-text="selectedTrace.trigger_type"></span>
+                    <span style="padding:2px 8px;border-radius:4px;font-size:12px;color:#fff" :style="{background: statusColor(selectedTrace.status)}" x-text="selectedTrace.status"></span>
+                    <span style="color:var(--text-muted);font-size:13px" x-text="formatTime(selectedTrace.started_at)"></span>
+                    <span style="color:var(--text-muted);font-size:13px" x-text="formatDuration(selectedTrace.total_duration_ms)"></span>
+                    <span style="color:var(--text-muted);font-size:13px" x-text="formatTokens(selectedTrace.total_input_tokens) + ' in / ' + formatTokens(selectedTrace.total_output_tokens) + ' out'"></span>
+                    <span style="color:var(--text-muted);font-size:13px" x-text="selectedTrace.total_llm_calls + ' LLM calls'"></span>
+                  </div>
+                  <div style="font-size:11px;color:var(--text-muted);margin-top:4px" x-text="'ID: ' + selectedTrace.id"></div>
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:6px">
+                  <template x-for="span in spans" :key="span.id">
+                    <div style="background:var(--card-bg);border-radius:6px;padding:10px 14px;border:1px solid var(--border);cursor:pointer" @click="toggleSpan(span.id)">
+                      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                        <span style="padding:2px 6px;border-radius:3px;font-size:11px;color:#fff;min-width:40px;text-align:center" :style="{background: kindColor(span.kind)}" x-text="span.kind"></span>
+                        <span style="font-weight:500;font-size:14px" x-text="span.name"></span>
+                        <span style="color:var(--text-muted);font-size:12px" x-text="formatDuration(span.duration_ms)"></span>
+                        <template x-if="span.token_input || span.token_output">
+                          <span style="color:var(--text-muted);font-size:12px" x-text="formatTokens(span.token_input) + ' in / ' + formatTokens(span.token_output) + ' out'"></span>
+                        </template>
+                        <span style="color:var(--text-muted);font-size:11px;margin-left:auto" x-text="formatTime(span.started_at)"></span>
+                      </div>
+                      <template x-if="isExpanded(span.id)">
+                        <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+                          <template x-if="span.input">
+                            <div style="margin-bottom:8px">
+                              <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">INPUT</div>
+                              <pre style="font-size:12px;max-height:300px;overflow:auto;background:var(--bg);padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all" x-text="span.input"></pre>
+                            </div>
+                          </template>
+                          <template x-if="span.output">
+                            <div>
+                              <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">OUTPUT</div>
+                              <pre style="font-size:12px;max-height:300px;overflow:auto;background:var(--bg);padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all" x-text="span.output"></pre>
+                            </div>
+                          </template>
+                          <template x-if="span.metadata_json && span.metadata_json !== '{}'">
+                            <div style="margin-top:8px">
+                              <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">METADATA</div>
+                              <pre style="font-size:12px;max-height:150px;overflow:auto;background:var(--bg);padding:8px;border-radius:4px;white-space:pre-wrap" x-text="span.metadata_json"></pre>
+                            </div>
+                          </template>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                  <div x-show="spans.length === 0" style="color:var(--text-muted);text-align:center;padding:20px">No spans recorded</div>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <!-- List View -->
+          <template x-if="!selectedTrace && !loading">
+            <div>
+              <div x-show="traces.length === 0" style="color:var(--text-muted);text-align:center;padding:40px">No traces found</div>
+              <table class="data-table" x-show="traces.length > 0" style="width:100%">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Agent</th>
+                    <th>Trigger</th>
+                    <th>Status</th>
+                    <th>Duration</th>
+                    <th>Tokens</th>
+                    <th>LLM</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="t in traces" :key="t.id">
+                    <tr @click="selectTrace(t.id)" style="cursor:pointer">
+                      <td style="white-space:nowrap;font-size:13px" x-text="formatTime(t.started_at)"></td>
+                      <td x-text="t.agent_name"></td>
+                      <td><span style="padding:2px 6px;border-radius:3px;font-size:11px;color:#fff" :style="{background: triggerColor(t.trigger_type)}" x-text="t.trigger_type"></span></td>
+                      <td><span style="padding:2px 6px;border-radius:3px;font-size:11px;color:#fff" :style="{background: statusColor(t.status)}" x-text="t.status"></span></td>
+                      <td style="font-size:13px" x-text="formatDuration(t.total_duration_ms)"></td>
+                      <td style="font-size:13px" x-text="formatTokens(t.total_input_tokens) + ' / ' + formatTokens(t.total_output_tokens)"></td>
+                      <td style="font-size:13px" x-text="t.total_llm_calls"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <div style="margin-top:8px;color:var(--text-muted);font-size:12px" x-text="total + ' trace(s) total'"></div>
+            </div>
+          </template>
         </div>
       </div>
     </template>
