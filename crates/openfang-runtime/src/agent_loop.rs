@@ -322,9 +322,13 @@ fn save_llm_request_log(
 /// `text` intent.  This enforces "delivery is a code concern" — the kernel's
 /// Turn Script executor will pick it up and send it to the user regardless of
 /// whether the LLM remembered to call the `reply` tool.
-fn auto_wrap_text_to_turn_script(text: &str) -> Result<(), String> {
-    let state_agent = std::env::var("OPENFANG_STATE_AGENT")
-        .unwrap_or_else(|_| "assistant".to_string());
+fn auto_wrap_text_to_turn_script(text: &str, agent_name: &str) -> Result<(), String> {
+    let state_agent = if agent_name.is_empty() {
+        std::env::var("OPENFANG_STATE_AGENT")
+            .unwrap_or_else(|_| "assistant".to_string())
+    } else {
+        agent_name.to_string()
+    };
     let home_dir = std::env::var("OPENFANG_HOME").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ljj".to_string());
         format!("{home}/.openfang")
@@ -1593,7 +1597,7 @@ pub async fn run_agent_loop(
                             agent = %manifest.name,
                             "Tool-only agent produced text without tool calls — auto-wrapping into Turn Script"
                         );
-                        if let Err(e) = auto_wrap_text_to_turn_script(&text) {
+                        if let Err(e) = auto_wrap_text_to_turn_script(&text, &manifest.name) {
                             warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script");
                         }
                         session.messages.push(Message::assistant(text));
@@ -1933,7 +1937,7 @@ pub async fn run_agent_loop(
                     let companion_text = response.text();
                     if !companion_text.trim().is_empty() {
                         debug!(agent = %manifest.name, "Preserving companion text from failed tool iteration");
-                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
                             warn!(agent = %manifest.name, error = %e, "Failed to preserve companion text");
                         }
                     }
@@ -1950,7 +1954,7 @@ pub async fn run_agent_loop(
                         let companion_text = response.text();
                         if !companion_text.trim().is_empty() {
                             debug!(agent = %manifest.name, "Auto-wrapping text into Turn Script alongside tool calls");
-                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
                                 warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script");
                             }
                         }
@@ -2677,7 +2681,7 @@ pub async fn run_agent_loop_streaming(
                             agent = %manifest.name,
                             "Tool-only agent produced text without tool calls (streaming) — auto-wrapping into Turn Script"
                         );
-                        if let Err(e) = auto_wrap_text_to_turn_script(&text) {
+                        if let Err(e) = auto_wrap_text_to_turn_script(&text, &manifest.name) {
                             warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script (streaming)");
                         }
                         session.messages.push(Message::assistant(text));
@@ -3058,7 +3062,7 @@ pub async fn run_agent_loop_streaming(
                     let companion_text = response.text();
                     if !companion_text.trim().is_empty() {
                         debug!(agent = %manifest.name, "Preserving companion text from failed tool iteration");
-                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
                             warn!(agent = %manifest.name, error = %e, "Failed to preserve companion text");
                         }
                     }
@@ -3075,7 +3079,7 @@ pub async fn run_agent_loop_streaming(
                         let companion_text = response.text();
                         if !companion_text.trim().is_empty() {
                             debug!(agent = %manifest.name, "Auto-wrapping text into Turn Script alongside tool calls (streaming)");
-                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim()) {
+                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
                                 warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script (streaming)");
                             }
                         }

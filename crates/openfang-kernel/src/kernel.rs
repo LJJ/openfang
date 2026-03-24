@@ -188,8 +188,16 @@ fn turn_state_agent_dir(config: &KernelConfig) -> PathBuf {
     config.home_dir.join("agents").join(state_agent_name())
 }
 
-fn current_interaction_mode(config: &KernelConfig) -> String {
-    let state_path = turn_state_agent_dir(config).join("life").join("state.json");
+fn agent_state_dir(config: &KernelConfig, agent_name: &str) -> PathBuf {
+    if agent_name.is_empty() {
+        turn_state_agent_dir(config)
+    } else {
+        config.home_dir.join("agents").join(agent_name)
+    }
+}
+
+fn current_interaction_mode(config: &KernelConfig, agent_name: &str) -> String {
+    let state_path = agent_state_dir(config, agent_name).join("life").join("state.json");
     let Ok(contents) = std::fs::read_to_string(state_path) else {
         return "remote".to_string();
     };
@@ -2219,7 +2227,7 @@ impl OpenFangKernel {
 
         // Inject interaction-mode-specific expression guidance for roleplay agents
         if manifest.agent_class == AgentClass::Roleplay {
-            let mode = current_interaction_mode(&self.config);
+            let mode = current_interaction_mode(&self.config, &manifest.name);
             let mode_prompt = load_roleplay_mode_prompt(&self.config, &manifest.name, &mode);
             if !mode_prompt.is_empty() {
                 manifest.model.system_prompt =
