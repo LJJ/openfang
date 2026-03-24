@@ -9164,6 +9164,22 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
                     }
                 }
 
+                // Resolve location ID → display name via known_places.toml
+                if let Some(loc_id) = card.pointer("/life_state/location").and_then(|v| v.as_str()) {
+                    let places_path = agent_dir.join("life/known_places.toml");
+                    if let Ok(places_str) = std::fs::read_to_string(&places_path) {
+                        if let Ok(places) = places_str.parse::<toml::Value>() {
+                            if let Some(name) = places
+                                .get(loc_id)
+                                .and_then(|p| p.get("name"))
+                                .and_then(|n| n.as_str())
+                            {
+                                card["location_name"] = serde_json::Value::String(name.to_string());
+                            }
+                        }
+                    }
+                }
+
                 // Today's schedule
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                 let schedule_path = agent_dir.join(format!("life/{today}.json"));
@@ -9233,6 +9249,48 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
                 if let Ok(s) = std::fs::read_to_string(&desires_path) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
                         card["desire_memories"] = v;
+                    }
+                }
+
+                // Social cognition
+                let social_dir = agent_dir.join("social");
+                if social_dir.is_dir() {
+                    let mut cognitions = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&social_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.extension().and_then(|e| e.to_str()) != Some("md") {
+                                continue;
+                            }
+                            let target_char = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                            if let Ok(content) = std::fs::read_to_string(&p) {
+                                // Extract text under "# 认知" heading
+                                if let Some(start) = content.find("# 认知") {
+                                    let after = &content[start + "# 认知".len()..];
+                                    let cognition = if let Some(next_heading) = after.find("\n# ") {
+                                        after[..next_heading].trim()
+                                    } else {
+                                        after.trim()
+                                    };
+                                    if !cognition.is_empty() {
+                                        // Resolve display name from registry
+                                        let display = registry
+                                            .get(&target_char)
+                                            .and_then(|e| e.get("display_name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or(&target_char);
+                                        cognitions.push(serde_json::json!({
+                                            "character_id": target_char,
+                                            "display_name": display,
+                                            "cognition": cognition,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !cognitions.is_empty() {
+                        card["social_cognition"] = serde_json::Value::Array(cognitions);
                     }
                 }
             }

@@ -4047,11 +4047,26 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
 
                 <!-- Unfulfilled desires -->
                 <template x-if="getDesires(c).length > 0">
-                  <div>
+                  <div style="margin-bottom:12px">
                     <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">DESIRES</div>
                     <div style="font-size:12px">
                       <template x-for="(d, i) in getDesires(c)" :key="i">
                         <div style="padding:2px 0;color:#d97706" x-text="d.text"></div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+
+                <!-- Social cognition -->
+                <template x-if="getSocialCognition(c).length > 0">
+                  <div>
+                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">SOCIAL</div>
+                    <div style="font-size:12px">
+                      <template x-for="(s, i) in getSocialCognition(c)" :key="s.character_id">
+                        <div style="padding:3px 0;border-bottom:1px solid var(--border)">
+                          <span style="font-weight:600;color:var(--text-primary)" x-text="s.display_name"></span>
+                          <span style="color:var(--text-secondary);margin-left:6px" x-text="s.cognition"></span>
+                        </div>
                       </template>
                     </div>
                   </div>

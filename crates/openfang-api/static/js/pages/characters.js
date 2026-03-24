@@ -110,7 +110,7 @@ function charactersPage() {
     },
 
     getLocation(c) {
-      return (c.life_state && c.life_state.location) || (c.world_state && c.world_state.location) || '-';
+      return c.location_name || (c.life_state && c.life_state.location) || (c.world_state && c.world_state.location) || '-';
     },
 
     getPhysical(c) {
@@ -157,6 +157,10 @@ function charactersPage() {
       if (!c.desire_memories) return [];
       var arr = Array.isArray(c.desire_memories) ? c.desire_memories : [];
       return arr.filter(function(d) { return !d.fulfilled_at; }).slice(-3);
+    },
+
+    getSocialCognition(c) {
+      return c.social_cognition || [];
     },
 
     getLastInteraction(c) {
