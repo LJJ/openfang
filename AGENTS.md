@@ -46,7 +46,7 @@
 
 详细文档：
 
-- `../../docs/source-tree.md`
-- `../../docs/architecture.md`
-- `../../docs/session-projection.md`
-- `../../docs/debug-runtime-mode.md`
+- `../../docs/source-tree.md` — 源码、发布、归档目录的分工
+- `../../docs/architecture.md` — 当前运行架构、关键链路、主组件职责
+- `../../docs/session-projection.md` — session 消息分层：长期对话、执行链路、推理痕迹的边界
+- `../../docs/debug-runtime-mode.md` — 切到源码 debug 二进制运行的步骤
