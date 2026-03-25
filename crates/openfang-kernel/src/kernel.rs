@@ -2110,7 +2110,7 @@ impl OpenFangKernel {
         let messages_before = session.messages.len();
 
         let tools = self.available_tools(agent_id);
-        let tools = entry.mode.filter_tools(tools);
+        let mut tools = entry.mode.filter_tools(tools);
 
         info!(
             agent = %entry.name,
@@ -2352,6 +2352,25 @@ impl OpenFangKernel {
                                         hook_tool = %tool_name,
                                         len = eph.len(),
                                         "Pre-turn hook returned ephemeral_context"
+                                    );
+                                }
+                            }
+                            // Extract disabled_tools — filter tools before LLM call
+                            if let Some(disabled) = parsed.get("disabled_tools").and_then(|v| v.as_array()) {
+                                let disabled_set: std::collections::HashSet<String> = disabled
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+                                if !disabled_set.is_empty() {
+                                    let before = tools.len();
+                                    tools.retain(|t| !disabled_set.contains(&t.name));
+                                    info!(
+                                        agent = %entry.name,
+                                        hook_tool = %tool_name,
+                                        disabled = ?disabled_set,
+                                        before,
+                                        after = tools.len(),
+                                        "Pre-turn hook filtered tools via disabled_tools"
                                     );
                                 }
                             }
