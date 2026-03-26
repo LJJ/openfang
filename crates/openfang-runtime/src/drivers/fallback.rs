@@ -154,6 +154,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
+                model: None,
             })
         }
     }
@@ -256,6 +257,7 @@ mod tests {
                             input_tokens: 1,
                             output_tokens: 1,
                         },
+                        model: None,
                     })
                 }
             }

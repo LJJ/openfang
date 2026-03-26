@@ -72,6 +72,9 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage statistics.
     pub usage: TokenUsage,
+    /// The model that actually handled the request (from API response).
+    /// May differ from the requested model when fallback occurs.
+    pub model: Option<String>,
 }
 
 impl CompletionResponse {
@@ -192,6 +195,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             usage: TokenUsage::default(),
+            model: None,
         };
         assert_eq!(response.text(), "Hello world!");
     }
@@ -256,6 +260,7 @@ mod tests {
                         input_tokens: 5,
                         output_tokens: 3,
                     },
+                    model: None,
                 })
             }
         }

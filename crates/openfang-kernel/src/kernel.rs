@@ -1757,6 +1757,7 @@ impl OpenFangKernel {
                     None
                 },
                 prompt_suffix: load_prompt_suffix_dir(&self.config.home_dir),
+                is_roleplay: manifest.agent_class == AgentClass::Roleplay,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -1772,9 +1773,10 @@ impl OpenFangKernel {
             message.to_string()
         };
         let kernel_clone = Arc::clone(self);
-        // Capture trigger type before spawn (task-locals don't cross spawn boundaries)
+        // Capture task-locals before spawn (task-locals don't cross spawn boundaries)
         let captured_trigger = openfang_runtime::tool_runner::trigger_type()
             .unwrap_or_else(|| "unknown".to_string());
+        let captured_parent_trace = openfang_runtime::tool_runner::parent_trace_id();
 
         let handle = tokio::spawn(async move {
             // Auto-compact if the session is large before running the loop
@@ -1832,12 +1834,13 @@ impl OpenFangKernel {
                     let _ = phase_tx.try_send(event);
                 });
 
-            // Begin trace for streaming execution — trigger captured before spawn
+            // Begin trace for streaming execution — trigger/parent captured before spawn
             let trigger = captured_trigger;
             let trace_id = kernel_clone.trace_collector.begin_trace(
                 &trigger,
                 &agent_id.to_string(),
                 &manifest.name,
+                captured_parent_trace.as_deref(),
             );
             let trace_ctx = openfang_runtime::tool_runner::TraceContextRef {
                 trace_id: trace_id.clone(),
@@ -2153,13 +2156,15 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         mut media_blocks: Vec<openfang_types::message::ContentBlock>,
     ) -> KernelResult<AgentLoopResult> {
-        // Begin trace — trigger type set by caller via task-local
+        // Begin trace — trigger type and parent trace set by caller via task-local
         let trigger = openfang_runtime::tool_runner::trigger_type()
             .unwrap_or_else(|| "unknown".to_string());
+        let parent_trace = openfang_runtime::tool_runner::parent_trace_id();
         let trace_id = self.trace_collector.begin_trace(
             &trigger,
             &agent_id.to_string(),
             &entry.name,
+            parent_trace.as_deref(),
         );
 
         // Check metering quota before starting
@@ -2291,6 +2296,7 @@ impl OpenFangKernel {
                     None
                 },
                 prompt_suffix: load_prompt_suffix_dir(&self.config.home_dir),
+                is_roleplay: manifest.agent_class == AgentClass::Roleplay,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2342,6 +2348,17 @@ impl OpenFangKernel {
             manifest.model.model = routed_model;
         }
 
+        // Per-request model override (e.g. cascade uses lighter model when owner absent)
+        if let Some(override_model) = openfang_runtime::tool_runner::model_override() {
+            info!(
+                agent = %manifest.name,
+                override_model = %override_model,
+                original_model = %manifest.model.model,
+                "MODEL_OVERRIDE applied"
+            );
+            manifest.model.model = override_model;
+        }
+
         let driver = self.resolve_driver(&manifest)?;
 
         // Look up model's context window: agent config > catalog > default
@@ -2386,8 +2403,10 @@ impl OpenFangKernel {
         // 通用机制：如果 manifest 配置了 pre_turn hook，调用指定 MCP 工具。
         // 返回值替换原始消息；返回 skip_llm=true 时跳过 LLM 调用。
         // hook 可返回 ephemeral_context：仅注入本轮 LLM 调用，不存入 session。
+        // hook 可返回 ephemeral_system：追加到 system prompt 末尾，仅本轮生效。
         let mut skip_llm = false;
         let mut ephemeral_ctx: Option<String> = None;
+        let mut ephemeral_sys: Option<String> = None;
         let pre_hook_start = std::time::Instant::now();
         let message_with_links = if let Some(ref hook) = manifest.pre_turn {
             if let Some(ref tool_name) = hook.tool {
@@ -2424,6 +2443,18 @@ impl OpenFangKernel {
                                         hook_tool = %tool_name,
                                         len = eph.len(),
                                         "Pre-turn hook returned ephemeral_context"
+                                    );
+                                }
+                            }
+                            // Extract ephemeral_system — appended to system prompt for this turn only
+                            if let Some(esys) = parsed.get("ephemeral_system").and_then(|v| v.as_str()) {
+                                if !esys.is_empty() {
+                                    ephemeral_sys = Some(esys.to_string());
+                                    info!(
+                                        agent = %entry.name,
+                                        hook_tool = %tool_name,
+                                        len = esys.len(),
+                                        "Pre-turn hook returned ephemeral_system"
                                     );
                                 }
                             }
@@ -2508,6 +2539,8 @@ impl OpenFangKernel {
             .scope(Some(trace_ctx), async {
         openfang_runtime::tool_runner::EPHEMERAL_CONTEXT
             .scope(ephemeral_ctx, async {
+        openfang_runtime::tool_runner::EPHEMERAL_SYSTEM
+            .scope(ephemeral_sys, async {
         openfang_runtime::tool_runner::USER_MESSAGE_INJECTION
             .scope(None, async {
                 openfang_runtime::tool_runner::DYNAMIC_INJECTIONS
@@ -2546,6 +2579,8 @@ impl OpenFangKernel {
                 .await
                     })
                     .await
+            })
+            .await
             })
             .await
             })

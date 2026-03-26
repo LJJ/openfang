@@ -20,9 +20,21 @@ impl TraceCollector {
     }
 
     /// Begin a new trace. Returns the generated trace_id.
-    pub fn begin_trace(&self, trigger_type: &str, agent_id: &str, agent_name: &str) -> String {
+    pub fn begin_trace(
+        &self,
+        trigger_type: &str,
+        agent_id: &str,
+        agent_name: &str,
+        parent_trace_id: Option<&str>,
+    ) -> String {
         let trace_id = uuid::Uuid::new_v4().to_string();
-        if let Err(e) = self.store.create_trace(&trace_id, trigger_type, agent_id, agent_name) {
+        if let Err(e) = self.store.create_trace(
+            &trace_id,
+            trigger_type,
+            agent_id,
+            agent_name,
+            parent_trace_id,
+        ) {
             warn!(error = %e, "Failed to create trace");
         }
         trace_id

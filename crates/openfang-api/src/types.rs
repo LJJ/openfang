@@ -37,6 +37,15 @@ pub struct MessageRequest {
     /// Optional file attachments (uploaded via /upload endpoint).
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
+    /// Override the trigger type (default: "user"). Used by MCP tools (e.g. Director cascade).
+    #[serde(default)]
+    pub trigger_type: Option<String>,
+    /// Parent trace ID for cascade trace linking.
+    #[serde(default)]
+    pub parent_trace_id: Option<String>,
+    /// Override the LLM model for this request (e.g. cascade uses lighter model when owner absent).
+    #[serde(default)]
+    pub model_override: Option<String>,
 }
 
 /// Response from sending a message.

@@ -17,6 +17,8 @@ pub enum SpanKind {
     Llm,
     Tool,
     Custom,
+    LlmAux,
+    Media,
 }
 
 impl fmt::Display for SpanKind {
@@ -26,6 +28,8 @@ impl fmt::Display for SpanKind {
             SpanKind::Llm => write!(f, "llm"),
             SpanKind::Tool => write!(f, "tool"),
             SpanKind::Custom => write!(f, "custom"),
+            SpanKind::LlmAux => write!(f, "llm_aux"),
+            SpanKind::Media => write!(f, "media"),
         }
     }
 }
@@ -36,6 +40,8 @@ impl SpanKind {
             "hook" => SpanKind::Hook,
             "llm" => SpanKind::Llm,
             "tool" => SpanKind::Tool,
+            "llm_aux" => SpanKind::LlmAux,
+            "media" => SpanKind::Media,
             _ => SpanKind::Custom,
         }
     }
@@ -73,6 +79,9 @@ pub struct TraceSummary {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_llm_calls: u64,
+    pub parent_trace_id: Option<String>,
+    pub full_input_tokens: u64,
+    pub full_output_tokens: u64,
 }
 
 /// Full trace detail with all spans.
@@ -111,6 +120,7 @@ impl TraceStore {
         trigger_type: &str,
         agent_id: &str,
         agent_name: &str,
+        parent_trace_id: Option<&str>,
     ) -> OpenFangResult<()> {
         let conn = self
             .conn
@@ -118,9 +128,9 @@ impl TraceStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO traces (id, trigger_type, agent_id, agent_name, status, started_at)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
-            rusqlite::params![id, trigger_type, agent_id, agent_name, now],
+            "INSERT INTO traces (id, trigger_type, agent_id, agent_name, status, started_at, parent_trace_id)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
+            rusqlite::params![id, trigger_type, agent_id, agent_name, now, parent_trace_id],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
@@ -198,6 +208,7 @@ impl TraceStore {
         offset: usize,
         agent_filter: Option<&str>,
         trigger_filter: Option<&str>,
+        parent_trace_filter: Option<&str>,
     ) -> OpenFangResult<(Vec<TraceSummary>, u64)> {
         let conn = self
             .conn
@@ -214,6 +225,10 @@ impl TraceStore {
         if let Some(trigger) = trigger_filter {
             where_clauses.push(format!("trigger_type = ?{}", params.len() + 1));
             params.push(Box::new(trigger.to_string()));
+        }
+        if let Some(parent_id) = parent_trace_filter {
+            where_clauses.push(format!("parent_trace_id = ?{}", params.len() + 1));
+            params.push(Box::new(parent_id.to_string()));
         }
 
         let where_sql = if where_clauses.is_empty() {
@@ -234,10 +249,13 @@ impl TraceStore {
 
         // Query with pagination
         let query_sql = format!(
-            "SELECT id, trigger_type, agent_id, agent_name, status, started_at, ended_at,
-                    total_duration_ms, total_input_tokens, total_output_tokens, total_llm_calls
-             FROM traces {where_sql}
-             ORDER BY started_at DESC
+            "SELECT t.id, t.trigger_type, t.agent_id, t.agent_name, t.status, t.started_at, t.ended_at,
+                    t.total_duration_ms, t.total_input_tokens, t.total_output_tokens, t.total_llm_calls,
+                    t.parent_trace_id,
+                    COALESCE((SELECT SUM(s.token_input) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0),
+                    COALESCE((SELECT SUM(s.token_output) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0)
+             FROM traces t {where_sql}
+             ORDER BY t.started_at DESC
              LIMIT ?{} OFFSET ?{}",
             params.len() + 1,
             params.len() + 2,
@@ -254,6 +272,10 @@ impl TraceStore {
 
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
+                let total_input = row.get::<_, i64>(8).map(|v| v as u64)?;
+                let total_output = row.get::<_, i64>(9).map(|v| v as u64)?;
+                let aux_input = row.get::<_, i64>(12).map(|v| v as u64)?;
+                let aux_output = row.get::<_, i64>(13).map(|v| v as u64)?;
                 Ok(TraceSummary {
                     id: row.get(0)?,
                     trigger_type: row.get(1)?,
@@ -263,9 +285,12 @@ impl TraceStore {
                     started_at: row.get(5)?,
                     ended_at: row.get(6)?,
                     total_duration_ms: row.get(7)?,
-                    total_input_tokens: row.get::<_, i64>(8).map(|v| v as u64)?,
-                    total_output_tokens: row.get::<_, i64>(9).map(|v| v as u64)?,
+                    total_input_tokens: total_input,
+                    total_output_tokens: total_output,
                     total_llm_calls: row.get::<_, i64>(10).map(|v| v as u64)?,
+                    parent_trace_id: row.get(11)?,
+                    full_input_tokens: total_input + aux_input,
+                    full_output_tokens: total_output + aux_output,
                 })
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -284,14 +309,21 @@ impl TraceStore {
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
 
-        // Get trace
+        // Get trace with aggregated aux token stats
         let trace = conn
             .query_row(
-                "SELECT id, trigger_type, agent_id, agent_name, status, started_at, ended_at,
-                        total_duration_ms, total_input_tokens, total_output_tokens, total_llm_calls
-                 FROM traces WHERE id = ?1",
+                "SELECT t.id, t.trigger_type, t.agent_id, t.agent_name, t.status, t.started_at, t.ended_at,
+                        t.total_duration_ms, t.total_input_tokens, t.total_output_tokens, t.total_llm_calls,
+                        t.parent_trace_id,
+                        COALESCE((SELECT SUM(s.token_input) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0),
+                        COALESCE((SELECT SUM(s.token_output) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0)
+                 FROM traces t WHERE t.id = ?1",
                 rusqlite::params![id],
                 |row| {
+                    let total_input = row.get::<_, i64>(8).map(|v| v as u64)?;
+                    let total_output = row.get::<_, i64>(9).map(|v| v as u64)?;
+                    let aux_input = row.get::<_, i64>(12).map(|v| v as u64)?;
+                    let aux_output = row.get::<_, i64>(13).map(|v| v as u64)?;
                     Ok(TraceSummary {
                         id: row.get(0)?,
                         trigger_type: row.get(1)?,
@@ -301,9 +333,12 @@ impl TraceStore {
                         started_at: row.get(5)?,
                         ended_at: row.get(6)?,
                         total_duration_ms: row.get(7)?,
-                        total_input_tokens: row.get::<_, i64>(8).map(|v| v as u64)?,
-                        total_output_tokens: row.get::<_, i64>(9).map(|v| v as u64)?,
+                        total_input_tokens: total_input,
+                        total_output_tokens: total_output,
                         total_llm_calls: row.get::<_, i64>(10).map(|v| v as u64)?,
+                        parent_trace_id: row.get(11)?,
+                        full_input_tokens: total_input + aux_input,
+                        full_output_tokens: total_output + aux_output,
                     })
                 },
             )
@@ -454,13 +489,13 @@ mod tests {
         let store = setup();
 
         store
-            .create_trace("t1", "user", "agent-1", "assistant")
+            .create_trace("t1", "user", "agent-1", "assistant", None)
             .unwrap();
         store
-            .create_trace("t2", "tick", "agent-1", "assistant")
+            .create_trace("t2", "tick", "agent-1", "assistant", None)
             .unwrap();
 
-        let (traces, total) = store.list_traces(50, 0, None, None).unwrap();
+        let (traces, total) = store.list_traces(50, 0, None, None, None).unwrap();
         assert_eq!(total, 2);
         assert_eq!(traces.len(), 2);
         // Most recent first
@@ -472,7 +507,7 @@ mod tests {
         let store = setup();
 
         store
-            .create_trace("t1", "user", "agent-1", "assistant")
+            .create_trace("t1", "user", "agent-1", "assistant", None)
             .unwrap();
         store
             .complete_trace("t1", "completed", 1000, 500, 2)
@@ -491,7 +526,7 @@ mod tests {
         let store = setup();
 
         store
-            .create_trace("t1", "user", "agent-1", "assistant")
+            .create_trace("t1", "user", "agent-1", "assistant", None)
             .unwrap();
 
         let span = TraceSpan {
@@ -523,23 +558,23 @@ mod tests {
         let store = setup();
 
         store
-            .create_trace("t1", "user", "a1", "assistant")
+            .create_trace("t1", "user", "a1", "assistant", None)
             .unwrap();
         store
-            .create_trace("t2", "tick", "a1", "assistant")
+            .create_trace("t2", "tick", "a1", "assistant", None)
             .unwrap();
         store
-            .create_trace("t3", "user", "a2", "ziling")
+            .create_trace("t3", "user", "a2", "ziling", None)
             .unwrap();
 
         let (traces, total) = store
-            .list_traces(50, 0, Some("assistant"), None)
+            .list_traces(50, 0, Some("assistant"), None, None)
             .unwrap();
         assert_eq!(total, 2);
         assert_eq!(traces.len(), 2);
 
         let (traces, total) = store
-            .list_traces(50, 0, None, Some("tick"))
+            .list_traces(50, 0, None, Some("tick"), None)
             .unwrap();
         assert_eq!(total, 1);
         assert_eq!(traces[0].trigger_type, "tick");
@@ -558,7 +593,7 @@ mod tests {
 
         for i in 0..5 {
             store
-                .create_trace(&format!("t{i}"), "user", "a1", "assistant")
+                .create_trace(&format!("t{i}"), "user", "a1", "assistant", None)
                 .unwrap();
             // Record a span for each
             store
@@ -584,7 +619,7 @@ mod tests {
         let deleted = store.cleanup(3, 999999).unwrap();
         assert_eq!(deleted, 2);
 
-        let (traces, total) = store.list_traces(50, 0, None, None).unwrap();
+        let (traces, total) = store.list_traces(50, 0, None, None, None).unwrap();
         assert_eq!(total, 3);
         assert_eq!(traces.len(), 3);
     }
@@ -593,7 +628,7 @@ mod tests {
     fn test_cleanup_nothing_to_delete() {
         let store = setup();
         store
-            .create_trace("t1", "user", "a1", "assistant")
+            .create_trace("t1", "user", "a1", "assistant", None)
             .unwrap();
         let deleted = store.cleanup(100, 86400).unwrap();
         assert_eq!(deleted, 0);

@@ -3919,6 +3919,14 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </div>
           </template>
 
+          <!-- Owner location -->
+          <div x-show="!loading && !wardrobeAgent && owner"
+            style="margin-bottom:12px;padding:8px 14px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;font-size:13px;display:inline-flex;align-items:center;gap:8px">
+            <span style="font-weight:600" x-text="owner.display_name"></span>
+            <span style="color:var(--text-muted)">@</span>
+            <span x-text="getOwnerLocation()"></span>
+          </div>
+
           <!-- Character cards -->
           <div x-show="!loading && !wardrobeAgent" style="display:flex;flex-wrap:wrap;gap:16px">
             <template x-for="c in characters" :key="c.character_id">
@@ -3931,9 +3939,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   <div style="flex:1;min-width:0">
                     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                       <span style="font-size:20px;font-weight:700" x-text="c.display_name"></span>
-                      <span style="font-size:11px;padding:2px 8px;border-radius:4px;color:#fff"
-                        :style="{background: getMode(c) === 'in_person' ? '#8b5cf6' : '#6b7280'}"
-                        x-text="getMode(c)"></span>
+                      <template x-for="cp in getCoPresenceList(c)" :key="cp.name">
+                        <span style="font-size:10px;padding:1px 6px;border-radius:3px;color:#fff"
+                          :style="{background: cp.mode === 'in_person' ? '#8b5cf6' : '#6b7280'}"
+                          x-text="cp.name + ' ' + cp.mode"></span>
+                      </template>
                       <span style="font-size:11px;padding:2px 8px;border-radius:4px;background:#3b82f6;color:#fff"
                         x-show="getChannel(c)" x-text="getChannel(c)"></span>
                     </div>
@@ -3947,6 +3957,22 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:2px">MOOD</div>
                   <div style="font-size:14px" x-text="getMood(c)"></div>
                 </div>
+
+                <!-- Arrangements -->
+                <template x-if="getArrangements(c).length > 0">
+                  <div style="margin-bottom:10px;padding:8px 10px;background:var(--bg-secondary);border-radius:6px;border-left:3px solid #8b5cf6">
+                    <div style="font-size:11px;font-weight:600;color:#8b5cf6;margin-bottom:4px">ARRANGEMENT</div>
+                    <template x-for="(a, ai) in getArrangements(c)" :key="ai">
+                      <div style="font-size:12px;color:var(--text-secondary);padding:2px 0">
+                        <span x-text="a.activity"></span>
+                        <span style="font-size:11px;color:var(--text-muted);margin-left:6px" x-text="'(' + arrangementStatusLabel(a.status) + ')'"></span>
+                        <template x-if="a.destination">
+                          <span style="font-size:11px;color:var(--text-muted);margin-left:4px" x-text="'→ ' + a.destination"></span>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </template>
 
                 <!-- Location + Activity + Outfit -->
                 <div style="display:flex;gap:16px;margin-bottom:10px;flex-wrap:wrap">
@@ -4120,9 +4146,17 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                     <span style="color:var(--text-muted);font-size:13px" x-text="formatTime(selectedTrace.started_at)"></span>
                     <span style="color:var(--text-muted);font-size:13px" x-text="formatDuration(selectedTrace.total_duration_ms)"></span>
                     <span style="color:var(--text-muted);font-size:13px" x-text="formatTokens(selectedTrace.total_input_tokens) + ' in / ' + formatTokens(selectedTrace.total_output_tokens) + ' out'"></span>
+                    <template x-if="selectedTrace.full_input_tokens > 0 || selectedTrace.full_output_tokens > 0">
+                      <span style="color:#f59e0b;font-size:13px" x-text="'(+aux ' + formatTokens(selectedTrace.full_input_tokens) + ' in / ' + formatTokens(selectedTrace.full_output_tokens) + ' out)'"></span>
+                    </template>
                     <span style="color:var(--text-muted);font-size:13px" x-text="selectedTrace.total_llm_calls + ' LLM calls'"></span>
                   </div>
-                  <div style="font-size:11px;color:var(--text-muted);margin-top:4px" x-text="'ID: ' + selectedTrace.id"></div>
+                  <div style="font-size:11px;color:var(--text-muted);margin-top:4px">
+                    <span x-text="'ID: ' + selectedTrace.id"></span>
+                    <template x-if="selectedTrace.parent_trace_id">
+                      <span> | parent: <a href="#" @click.prevent="selectTrace(selectedTrace.parent_trace_id)" style="color:#4f46e5" x-text="selectedTrace.parent_trace_id.slice(0,8) + '...'"></a></span>
+                    </template>
+                  </div>
                 </div>
 
                 <div style="display:flex;flex-direction:column;gap:6px">

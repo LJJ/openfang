@@ -4,6 +4,8 @@
 function charactersPage() {
   return {
     characters: [],
+    owner: null,
+    arrangements: [],
     loading: true,
     autoRefresh: true,
     _timer: null,
@@ -29,9 +31,13 @@ function charactersPage() {
     async refresh() {
       try {
         var data = await OpenFangAPI.get('/api/characters');
-        this.characters = (data.characters || []).filter(function(c) { return c.is_agent; });
+        var allChars = data.characters || [];
+        this.characters = allChars.filter(function(c) { return c.is_agent; });
+        this.owner = allChars.find(function(c) { return c.is_owner; }) || null;
+        this.arrangements = data.arrangements || [];
       } catch(e) {
         this.characters = [];
+        this.owner = null;
       }
     },
 
@@ -110,7 +116,7 @@ function charactersPage() {
     },
 
     getLocation(c) {
-      return c.location_name || (c.life_state && c.life_state.location) || (c.world_state && c.world_state.location) || '-';
+      return (c.world_state && c.world_state.location) || (c.life_state && c.life_state.location) || '-';
     },
 
     getPhysical(c) {
@@ -126,8 +132,24 @@ function charactersPage() {
       return null;
     },
 
-    getMode(c) {
-      return (c.life_state && c.life_state.interaction_mode) || 'remote';
+    getOwnerLocation() {
+      if (!this.owner) return '-';
+      return (this.owner.world_state && this.owner.world_state.location) || '-';
+    },
+
+    getCoPresenceList(c) {
+      var selfLoc = (c.world_state && c.world_state.location) || '';
+      var result = [];
+      // Compare with all other characters (AI + owner)
+      var others = this.characters.concat(this.owner ? [this.owner] : []);
+      for (var i = 0; i < others.length; i++) {
+        var other = others[i];
+        if (other.character_id === c.character_id) continue;
+        var otherLoc = (other.world_state && other.world_state.location) || '';
+        var mode = (selfLoc && otherLoc && selfLoc === otherLoc) ? 'in_person' : 'remote';
+        result.push({ name: other.display_name, mode: mode });
+      }
+      return result;
     },
 
     getThoughts(c) {
@@ -161,6 +183,19 @@ function charactersPage() {
 
     getSocialCognition(c) {
       return c.social_cognition || [];
+    },
+
+    getArrangements(c) {
+      if (!this.arrangements || !this.arrangements.length) return [];
+      var charId = c.character_id;
+      return this.arrangements.filter(function(a) {
+        return (a.status === 'pending' || a.status === 'in_progress') &&
+               a.participants && a.participants.indexOf(charId) >= 0;
+      });
+    },
+
+    arrangementStatusLabel(status) {
+      return status === 'pending' ? '准备中' : status === 'in_progress' ? '进行中' : status;
     },
 
     getLastInteraction(c) {

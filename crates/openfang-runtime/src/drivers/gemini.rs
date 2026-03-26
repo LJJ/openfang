@@ -350,6 +350,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         stop_reason,
         tool_calls,
         usage,
+        model: None,
     })
 }
 
@@ -633,6 +634,7 @@ impl LlmDriver for GeminiDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                model: None,
             });
         }
 

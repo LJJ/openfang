@@ -53,6 +53,8 @@ pub struct PromptContext {
     pub heartbeat_md: Option<String>,
     /// Extra content appended to the end of system prompt (from system-prompt.d/).
     pub prompt_suffix: Option<String>,
+    /// Whether this is a roleplay agent (skips generic assistant sections).
+    pub is_roleplay: bool,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -75,20 +77,20 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             ctx.soul_md.as_deref(),
             ctx.user_md.as_deref(),
             ctx.memory_md.as_deref(),
-            ctx.workspace_path.as_deref(),
+            if ctx.is_roleplay { None } else { ctx.workspace_path.as_deref() },
         );
         if !persona.is_empty() {
             sections.push(persona);
         }
     }
 
-    // Section 3 — Tool Call Behavior (skip for subagents)
-    if !ctx.is_subagent {
+    // Section 3 — Tool Call Behavior (skip for subagents and roleplay)
+    if !ctx.is_subagent && !ctx.is_roleplay {
         sections.push(TOOL_CALL_BEHAVIOR.to_string());
     }
 
-    // Section 3.5 — Agent Behavioral Guidelines (skip for subagents)
-    if !ctx.is_subagent {
+    // Section 3.5 — Agent Behavioral Guidelines (skip for subagents and roleplay)
+    if !ctx.is_subagent && !ctx.is_roleplay {
         if let Some(ref agents) = ctx.agents_md {
             if !agents.trim().is_empty() {
                 sections.push(cap_str(agents, 2000));
@@ -128,8 +130,8 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
-    // Section 8 — User Personalization (skip for subagents)
-    if !ctx.is_subagent {
+    // Section 8 — User Personalization (skip for subagents and roleplay)
+    if !ctx.is_subagent && !ctx.is_roleplay {
         sections.push(build_user_section(ctx.user_name.as_deref()));
     }
 
@@ -140,8 +142,8 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
-    // Section 10 — Safety & Oversight (skip for subagents)
-    if !ctx.is_subagent {
+    // Section 10 — Safety & Oversight (skip for subagents and roleplay)
+    if !ctx.is_subagent && !ctx.is_roleplay {
         sections.push(SAFETY_SECTION.to_string());
     }
 
@@ -170,8 +172,8 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
-    // Section 14 — Workspace Context (skip for subagents)
-    if !ctx.is_subagent {
+    // Section 14 — Workspace Context (skip for subagents and roleplay)
+    if !ctx.is_subagent && !ctx.is_roleplay {
         if let Some(ref ws_ctx) = ctx.workspace_context {
             if !ws_ctx.trim().is_empty() {
                 sections.push(cap_str(ws_ctx, 1000));

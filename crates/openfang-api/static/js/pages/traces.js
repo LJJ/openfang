@@ -98,12 +98,12 @@ function tracesPage() {
     },
 
     triggerColor(type) {
-      var map = { user: '#4f46e5', tick: '#059669', cron: '#d97706', plan: '#7c3aed', webhook: '#dc2626' };
+      var map = { user: '#4f46e5', tick: '#059669', cron: '#d97706', plan: '#7c3aed', webhook: '#dc2626', cascade: '#f97316', agent: '#06b6d4' };
       return map[type] || '#6b7280';
     },
 
     kindColor(kind) {
-      var map = { hook: '#3b82f6', llm: '#8b5cf6', tool: '#10b981', custom: '#6b7280' };
+      var map = { hook: '#3b82f6', llm: '#8b5cf6', tool: '#10b981', custom: '#6b7280', llm_aux: '#f59e0b', media: '#ec4899' };
       return map[kind] || '#6b7280';
     },
 

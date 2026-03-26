@@ -1392,6 +1392,13 @@ pub async fn run_agent_loop(
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
 
+    // Inject ephemeral system prompt suffix (from pre-turn hook) at the end of system prompt.
+    // Visible to the LLM for this turn only, NOT persisted.
+    if let Some(esys) = crate::tool_runner::ephemeral_system() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&esys);
+    }
+
     // Inject ephemeral context (from pre-turn hook) into the last user message.
     // This context is visible to the LLM for this turn but NOT stored in session history.
     if let Some(ephemeral) = crate::tool_runner::ephemeral_context() {
@@ -1537,6 +1544,15 @@ pub async fn run_agent_loop(
         };
 
         // Record LLM span in trace (full input/output)
+        // Use the actual model from the API response (captures fallback), fall back to requested model
+        let actual_model = response.model.as_deref().unwrap_or(&llm_model_name);
+        if actual_model != llm_model_name {
+            tracing::info!(
+                requested = %llm_model_name,
+                actual = %actual_model,
+                "LLM fallback: responded with different model"
+            );
+        }
         if let Some(ctx) = crate::tool_runner::trace_context() {
             let elapsed = llm_call_start.elapsed().as_millis() as i64;
             let now = chrono::Utc::now().to_rfc3339();
@@ -1556,7 +1572,7 @@ pub async fn run_agent_loop(
                 id: uuid::Uuid::new_v4().to_string(),
                 trace_id: ctx.trace_id.clone(),
                 parent_span_id: None,
-                name: format!("llm:{llm_model_name}"),
+                name: format!("llm:{actual_model}"),
                 kind: openfang_memory::trace_store::SpanKind::Llm,
                 started_at: now.clone(),
                 ended_at: Some(now),
@@ -1564,7 +1580,8 @@ pub async fn run_agent_loop(
                 input: trace_input,
                 output: Some(trace_output),
                 metadata_json: serde_json::json!({
-                    "model": llm_model_name,
+                    "model": actual_model,
+                    "requested_model": llm_model_name,
                     "iteration": iteration,
                     "provider": provider_name,
                     "stop_reason": format!("{:?}", response.stop_reason),
@@ -2578,6 +2595,12 @@ pub async fn run_agent_loop_streaming(
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
 
+    // Inject ephemeral system prompt suffix (from pre-turn hook) at the end of system prompt.
+    if let Some(esys) = crate::tool_runner::ephemeral_system() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&esys);
+    }
+
     // Inject ephemeral context (from pre-turn hook) into the last user message.
     // This context is visible to the LLM for this turn but NOT stored in session history.
     if let Some(ephemeral) = crate::tool_runner::ephemeral_context() {
@@ -2744,6 +2767,15 @@ pub async fn run_agent_loop_streaming(
         };
 
         // Record LLM span in trace (full input/output)
+        // Use the actual model from the API response (captures fallback), fall back to requested model
+        let actual_model = response.model.as_deref().unwrap_or(&llm_model_name);
+        if actual_model != llm_model_name {
+            tracing::info!(
+                requested = %llm_model_name,
+                actual = %actual_model,
+                "LLM fallback: responded with different model"
+            );
+        }
         if let Some(ctx) = crate::tool_runner::trace_context() {
             let elapsed = llm_call_start.elapsed().as_millis() as i64;
             let now = chrono::Utc::now().to_rfc3339();
@@ -2762,7 +2794,7 @@ pub async fn run_agent_loop_streaming(
                 id: uuid::Uuid::new_v4().to_string(),
                 trace_id: ctx.trace_id.clone(),
                 parent_span_id: None,
-                name: format!("llm:{llm_model_name}"),
+                name: format!("llm:{actual_model}"),
                 kind: openfang_memory::trace_store::SpanKind::Llm,
                 started_at: now.clone(),
                 ended_at: Some(now),
@@ -2770,7 +2802,8 @@ pub async fn run_agent_loop_streaming(
                 input: trace_input,
                 output: Some(trace_output),
                 metadata_json: serde_json::json!({
-                    "model": llm_model_name,
+                    "model": actual_model,
+                    "requested_model": llm_model_name,
                     "iteration": iteration,
                     "provider": provider_name,
                     "stop_reason": format!("{:?}", response.stop_reason),
@@ -4051,6 +4084,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 5,
                     },
+                    model: None,
                 })
             } else {
                 // Second call: LLM returns EndTurn with EMPTY text (the bug)
@@ -4062,6 +4096,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 0,
                     },
+                    model: None,
                 })
             }
         }
@@ -4104,6 +4139,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 5,
                     },
+                    model: None,
                 })
             } else {
                 Err(LlmError::Http("simulated llm failure".to_string()))
@@ -4129,6 +4165,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 0,
                 },
+                model: None,
             })
         }
     }
@@ -4152,6 +4189,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 8,
                 },
+                model: None,
             })
         }
     }
@@ -4516,6 +4554,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 0,
                     },
+                    model: None,
                 })
             } else {
                 // Second call (retry): normal response
@@ -4529,6 +4568,7 @@ mod tests {
                         input_tokens: 15,
                         output_tokens: 8,
                     },
+                    model: None,
                 })
             }
         }
@@ -4552,6 +4592,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 0,
                 },
+                model: None,
             })
         }
     }
@@ -4998,6 +5039,7 @@ mod tests {
                         input_tokens: 20,
                         output_tokens: 15,
                     },
+                    model: None,
                 })
             } else {
                 // After tool result, return normal response
@@ -5011,6 +5053,7 @@ mod tests {
                         input_tokens: 30,
                         output_tokens: 12,
                     },
+                    model: None,
                 })
             }
         }
@@ -5259,6 +5302,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 2,
                 },
+                model: None,
             })
         }
     }

@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -345,6 +349,21 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (8, datetime('now'), 'Add traces and trace_spans tables for distributed tracing');
         ",
+    )?;
+    Ok(())
+}
+
+/// Version 9: Add parent_trace_id column to traces table for cascade trace linking.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "traces", "parent_trace_id") {
+        conn.execute(
+            "ALTER TABLE traces ADD COLUMN parent_trace_id TEXT",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (9, datetime('now'), 'Add parent_trace_id to traces for cascade linking')",
+        [],
     )?;
     Ok(())
 }

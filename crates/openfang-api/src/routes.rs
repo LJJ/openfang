@@ -522,11 +522,18 @@ pub async fn send_message(
     );
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match openfang_runtime::tool_runner::TRIGGER_TYPE.scope(Some("user".to_string()), async {
-        state
-            .kernel
-            .send_message_with_handle_and_media(agent_id, &message, Some(kernel_handle), media_blocks)
-            .await
+    let trigger = req.trigger_type.as_deref().unwrap_or("user").to_string();
+    let parent_trace = req.parent_trace_id.clone();
+    let model_override = req.model_override.clone();
+    match openfang_runtime::tool_runner::TRIGGER_TYPE.scope(Some(trigger), async {
+        openfang_runtime::tool_runner::PARENT_TRACE_ID.scope(parent_trace, async {
+            openfang_runtime::tool_runner::MODEL_OVERRIDE.scope(model_override, async {
+                state
+                    .kernel
+                    .send_message_with_handle_and_media(agent_id, &message, Some(kernel_handle), media_blocks)
+                    .await
+            }).await
+        }).await
     }).await
     {
         Ok(result) => {
@@ -1253,10 +1260,21 @@ pub async fn send_message_stream(
     );
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+    let trigger = req.trigger_type.as_deref().unwrap_or("user").to_string();
+    let parent_trace = req.parent_trace_id.clone();
+    let model_override = req.model_override.clone();
+    // Scope task-locals so the kernel's streaming path can capture them before spawn
+    let stream_result = openfang_runtime::tool_runner::TRIGGER_TYPE.scope(Some(trigger),
+        openfang_runtime::tool_runner::PARENT_TRACE_ID.scope(parent_trace,
+            openfang_runtime::tool_runner::MODEL_OVERRIDE.scope(model_override, async {
+                state
+                    .kernel
+                    .send_message_streaming_with_media(agent_id, &message, Some(kernel_handle), media_blocks)
+            }),
+        ),
+    ).await;
     let (rx, _handle) =
-        match state
-            .kernel
-            .send_message_streaming_with_media(agent_id, &message, Some(kernel_handle), media_blocks)
+        match stream_result
         {
             Ok(pair) => pair,
             Err(e) => {
@@ -8977,12 +8995,13 @@ pub async fn list_traces(
         .unwrap_or(0);
     let agent_filter = params.get("agent").map(|s| s.as_str());
     let trigger_filter = params.get("trigger").map(|s| s.as_str());
+    let parent_trace_filter = params.get("parent_trace_id").map(|s| s.as_str());
 
     match state
         .kernel
         .trace_collector
         .store()
-        .list_traces(limit, offset, agent_filter, trigger_filter)
+        .list_traces(limit, offset, agent_filter, trigger_filter, parent_trace_filter)
     {
         Ok((traces, total)) => (
             StatusCode::OK,
@@ -9299,7 +9318,18 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
         }
     }
 
-    (StatusCode::OK, Json(serde_json::json!({"characters": characters})))
+    // World-level arrangements
+    let arrangements_path = home.join("world/arrangements.json");
+    let arrangements = if let Ok(s) = std::fs::read_to_string(&arrangements_path) {
+        serde_json::from_str::<serde_json::Value>(&s)
+            .ok()
+            .and_then(|v| v.get("arrangements").cloned())
+            .unwrap_or(serde_json::Value::Array(vec![]))
+    } else {
+        serde_json::Value::Array(vec![])
+    };
+
+    (StatusCode::OK, Json(serde_json::json!({"characters": characters, "arrangements": arrangements})))
 }
 
 /// GET /api/characters/{agent_id}/avatar — Serve agent avatar image.

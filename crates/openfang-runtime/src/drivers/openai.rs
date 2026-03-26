@@ -109,6 +109,7 @@ struct OaiToolDef {
 struct OaiResponse {
     choices: Vec<OaiChoice>,
     usage: Option<OaiUsage>,
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -432,6 +433,7 @@ impl LlmDriver for OpenAIDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                model: oai_response.model,
             });
         }
 
@@ -654,6 +656,7 @@ impl LlmDriver for OpenAIDriver {
             let mut tool_accum: Vec<(String, String, String)> = Vec::new();
             let mut finish_reason: Option<String> = None;
             let mut usage = TokenUsage::default();
+            let mut response_model: Option<String> = None;
 
             let mut byte_stream = resp.bytes_stream();
             while let Some(chunk_result) = byte_stream.next().await {
@@ -682,6 +685,13 @@ impl LlmDriver for OpenAIDriver {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+
+                    // Capture model from the first chunk that has it
+                    if response_model.is_none() {
+                        if let Some(m) = json["model"].as_str() {
+                            response_model = Some(m.to_string());
+                        }
+                    }
 
                     // Extract usage if present (some providers send it in the last chunk)
                     if let Some(u) = json.get("usage") {
@@ -815,6 +825,7 @@ impl LlmDriver for OpenAIDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                model: response_model,
             });
         }
 
@@ -911,6 +922,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
                     input_tokens: 0,
                     output_tokens: 0,
                 },
+                model: None,
             });
         }
         return None;
@@ -924,6 +936,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
             input_tokens: 0,
             output_tokens: 0,
         },
+        model: None,
     })
 }
 

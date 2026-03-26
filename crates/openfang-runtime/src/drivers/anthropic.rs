@@ -104,6 +104,7 @@ struct ApiResponse {
     content: Vec<ResponseContentBlock>,
     stop_reason: String,
     usage: ApiUsage,
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,6 +353,7 @@ impl LlmDriver for AnthropicDriver {
             let mut blocks: Vec<ContentBlockAccum> = Vec::new();
             let mut stop_reason = StopReason::EndTurn;
             let mut usage = TokenUsage::default();
+            let mut response_model: Option<String> = None;
 
             let mut byte_stream = resp.bytes_stream();
             while let Some(chunk_result) = byte_stream.next().await {
@@ -383,6 +385,9 @@ impl LlmDriver for AnthropicDriver {
 
                     match event_type.as_str() {
                         "message_start" => {
+                            if let Some(m) = json["message"]["model"].as_str() {
+                                response_model = Some(m.to_string());
+                            }
                             if let Some(it) = json["message"]["usage"]["input_tokens"].as_u64() {
                                 usage.input_tokens = it;
                             }
@@ -533,6 +538,7 @@ impl LlmDriver for AnthropicDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                model: response_model,
             });
         }
 
@@ -635,6 +641,7 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
             input_tokens: api.usage.input_tokens,
             output_tokens: api.usage.output_tokens,
         },
+        model: api.model,
     }
 }
 
@@ -667,6 +674,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 50,
             },
+            model: Some("claude-3-opus".to_string()),
         };
 
         let response = convert_response(api_response);

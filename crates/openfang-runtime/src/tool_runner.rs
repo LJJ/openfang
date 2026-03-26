@@ -111,10 +111,17 @@ tokio::task_local! {
     /// Ephemeral context injected by pre-turn hook.
     /// Prepended to the last user message for LLM calls but NOT stored in session history.
     pub static EPHEMERAL_CONTEXT: Option<String>;
+    /// Ephemeral system prompt suffix injected by pre-turn hook.
+    /// Appended to the system prompt for this LLM call only, NOT persisted.
+    pub static EPHEMERAL_SYSTEM: Option<String>;
     /// Trace context for distributed tracing — carries trace_id and span recorder.
     pub static TRACE_CONTEXT: Option<TraceContextRef>;
     /// Trigger type for the current request (user, tick, cron, webhook).
     pub static TRIGGER_TYPE: Option<String>;
+    /// Parent trace ID for cascade trace linking.
+    pub static PARENT_TRACE_ID: Option<String>;
+    /// Per-request model override (e.g. cascade uses lighter model when owner absent).
+    pub static MODEL_OVERRIDE: Option<String>;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
@@ -140,9 +147,27 @@ pub fn trigger_type() -> Option<String> {
     TRIGGER_TYPE.try_with(|v| v.clone()).ok().flatten()
 }
 
+/// Read the parent trace ID from the task-local, if any.
+pub fn parent_trace_id() -> Option<String> {
+    PARENT_TRACE_ID.try_with(|v| v.clone()).ok().flatten()
+}
+
+/// Read the per-request model override from the task-local, if any.
+pub fn model_override() -> Option<String> {
+    MODEL_OVERRIDE.try_with(|v| v.clone()).ok().flatten()
+}
+
 /// Read the ephemeral context set by pre-turn hook, if any.
 pub fn ephemeral_context() -> Option<String> {
     EPHEMERAL_CONTEXT
+        .try_with(|v| v.clone())
+        .ok()
+        .flatten()
+}
+
+/// Read the ephemeral system prompt suffix set by pre-turn hook, if any.
+pub fn ephemeral_system() -> Option<String> {
+    EPHEMERAL_SYSTEM
         .try_with(|v| v.clone())
         .ok()
         .flatten()
