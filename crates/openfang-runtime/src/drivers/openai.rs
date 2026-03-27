@@ -3,6 +3,7 @@
 //! Works with OpenAI, Ollama, vLLM, and any other OpenAI-compatible endpoint.
 
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
+use crate::think_filter::{FilterAction, StreamingThinkFilter};
 use async_trait::async_trait;
 use futures::StreamExt;
 use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
@@ -385,6 +386,7 @@ impl LlmDriver for OpenAIDriver {
             let mut tool_calls = Vec::new();
 
             if let Some(text) = choice.message.content {
+                let text = strip_think_tags(&text);
                 if !text.is_empty() {
                     content.push(ContentBlock::Text { text });
                 }
@@ -657,6 +659,7 @@ impl LlmDriver for OpenAIDriver {
             let mut finish_reason: Option<String> = None;
             let mut usage = TokenUsage::default();
             let mut response_model: Option<String> = None;
+            let mut think_filter = StreamingThinkFilter::new();
 
             let mut byte_stream = resp.bytes_stream();
             while let Some(chunk_result) = byte_stream.next().await {
@@ -711,15 +714,24 @@ impl LlmDriver for OpenAIDriver {
                     for choice in choices {
                         let delta = &choice["delta"];
 
-                        // Text content delta
+                        // Text content delta — filter out <think> tags
                         if let Some(text) = delta["content"].as_str() {
                             if !text.is_empty() {
-                                text_content.push_str(text);
-                                let _ = tx
-                                    .send(StreamEvent::TextDelta {
-                                        text: text.to_string(),
-                                    })
-                                    .await;
+                                for action in think_filter.process(text) {
+                                    match action {
+                                        FilterAction::EmitText(t) => {
+                                            text_content.push_str(&t);
+                                            let _ = tx
+                                                .send(StreamEvent::TextDelta { text: t })
+                                                .await;
+                                        }
+                                        FilterAction::EmitThinking(t) => {
+                                            let _ = tx
+                                                .send(StreamEvent::ThinkingDelta { text: t })
+                                                .await;
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -769,6 +781,19 @@ impl LlmDriver for OpenAIDriver {
                         if let Some(fr) = choice["finish_reason"].as_str() {
                             finish_reason = Some(fr.to_string());
                         }
+                    }
+                }
+            }
+
+            // Flush any remaining buffered content from the think filter
+            for action in think_filter.flush() {
+                match action {
+                    FilterAction::EmitText(t) => {
+                        text_content.push_str(&t);
+                        let _ = tx.send(StreamEvent::TextDelta { text: t }).await;
+                    }
+                    FilterAction::EmitThinking(t) => {
+                        let _ = tx.send(StreamEvent::ThinkingDelta { text: t }).await;
                     }
                 }
             }
@@ -839,6 +864,12 @@ impl LlmDriver for OpenAIDriver {
 /// Parse Groq's `tool_use_failed` error and extract the tool call from `failed_generation`.
 /// Extract the max_tokens limit from an API error message.
 /// Looks for patterns like: `must be less than or equal to \`8192\``
+/// Strip `<think>...</think>` blocks from text (non-streaming path).
+fn strip_think_tags(text: &str) -> String {
+    let re = regex_lite::Regex::new(r"(?s)<think>.*?</think>\s*").unwrap();
+    re.replace_all(text, "").to_string()
+}
+
 fn extract_max_tokens_limit(body: &str) -> Option<u32> {
     // Pattern: "must be <= `N`" or "must be less than or equal to `N`"
     let patterns = [

@@ -427,6 +427,9 @@ pub struct FallbackModel {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Override max_tokens for this fallback (e.g. model with lower output limit).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 /// Tool configuration within an agent manifest.
@@ -1014,6 +1017,7 @@ mod tests {
             model: "llama-3.3-70b".to_string(),
             api_key_env: Some("GROQ_API_KEY".to_string()),
             base_url: None,
+            max_tokens: None,
         };
         let json = serde_json::to_string(&fb).unwrap();
         let back: FallbackModel = serde_json::from_str(&json).unwrap();
@@ -1032,6 +1036,7 @@ mod tests {
                 model: "llama-3.3-70b".to_string(),
                 api_key_env: None,
                 base_url: None,
+                max_tokens: None,
             }],
             ..Default::default()
         };

@@ -327,6 +327,11 @@ pub struct OpenFangKernel {
     pub skill_registry: std::sync::RwLock<openfang_skills::registry::SkillRegistry>,
     /// Tracks running agent tasks for cancellation support.
     pub running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
+    /// Per-agent message serialization locks.
+    /// Ensures only one message is processed at a time per agent, preventing
+    /// concurrent pre-turn/post-turn hooks from interfering with each other's
+    /// context_cache flags and session state.
+    agent_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// MCP server connections (lazily initialized at start_background_agents).
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
@@ -1146,6 +1151,7 @@ impl OpenFangKernel {
             model_catalog: std::sync::RwLock::new(model_catalog),
             skill_registry: std::sync::RwLock::new(skill_registry),
             running_tasks: dashmap::DashMap::new(),
+            agent_locks: dashmap::DashMap::new(),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
             a2a_task_store: openfang_runtime::a2a::A2aTaskStore::default(),
@@ -1453,6 +1459,16 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         media_blocks: Vec<openfang_types::message::ContentBlock>,
     ) -> KernelResult<AgentLoopResult> {
+        // Per-agent serialization: acquire lock so only one message is processed
+        // at a time per agent. This prevents concurrent pre-turn/post-turn hooks
+        // from interfering with each other's context_cache flags and session state.
+        let lock = self
+            .agent_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         // Enforce quota before running the agent loop
         self.scheduler
             .check_quota(agent_id)
@@ -1778,7 +1794,17 @@ impl OpenFangKernel {
             .unwrap_or_else(|| "unknown".to_string());
         let captured_parent_trace = openfang_runtime::tool_runner::parent_trace_id();
 
+        // Clone the per-agent lock for the spawned task
+        let agent_lock = self
+            .agent_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+
         let handle = tokio::spawn(async move {
+            // Per-agent serialization: hold lock for the entire streaming loop
+            let _guard = agent_lock.lock().await;
+
             // Auto-compact if the session is large before running the loop
             if needs_compact {
                 info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
@@ -2758,6 +2784,36 @@ impl OpenFangKernel {
 
         info!(agent_id = %agent_id, "Session reset (summary saved to memory)");
         Ok(())
+    }
+
+    /// Restore session messages (replace current session content).
+    pub fn restore_session(
+        &self,
+        agent_id: AgentId,
+        messages: Vec<openfang_types::message::Message>,
+    ) -> KernelResult<usize> {
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        let mut session = match self.memory.get_session(entry.session_id).map_err(KernelError::OpenFang)? {
+            Some(s) => s,
+            None => {
+                // Session not yet persisted (e.g., fresh kernel start) — create it first
+                let new_session = self.memory.create_session(agent_id).map_err(KernelError::OpenFang)?;
+                self.registry.update_session_id(agent_id, new_session.id).map_err(KernelError::OpenFang)?;
+                new_session
+            }
+        };
+
+        let count = messages.len();
+        session.messages = messages;
+        self.memory
+            .save_session(&session)
+            .map_err(KernelError::OpenFang)?;
+
+        info!(agent_id = %agent_id, message_count = count, "Session restored");
+        Ok(count)
     }
 
     /// List all sessions for a specific agent.
@@ -4572,7 +4628,7 @@ impl OpenFangKernel {
 
         // If fallback models are configured, wrap in FallbackDriver
         if !manifest.fallback_models.is_empty() {
-            let mut chain = vec![(primary.clone(), None)];
+            let mut chain = vec![(primary.clone(), None, None)];
             for fb in &manifest.fallback_models {
                 let config = DriverConfig {
                     provider: fb.provider.clone(),
@@ -4583,7 +4639,7 @@ impl OpenFangKernel {
                     base_url: fb.base_url.clone(),
                 };
                 match drivers::create_driver(&config) {
-                    Ok(d) => chain.push((d, Some(fb.model.clone()))),
+                    Ok(d) => chain.push((d, Some(fb.model.clone()), fb.max_tokens)),
                     Err(e) => {
                         warn!("Fallback driver '{}' failed to init: {e}", fb.provider);
                     }

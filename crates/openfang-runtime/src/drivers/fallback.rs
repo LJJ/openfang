@@ -19,6 +19,7 @@ pub struct FallbackDriver {
 struct FallbackEntry {
     driver: Arc<dyn LlmDriver>,
     model_override: Option<String>,
+    max_tokens_override: Option<u32>,
 }
 
 impl FallbackDriver {
@@ -32,19 +33,23 @@ impl FallbackDriver {
                 .map(|driver| FallbackEntry {
                     driver,
                     model_override: None,
+                    max_tokens_override: None,
                 })
                 .collect(),
         }
     }
 
-    /// Create a fallback driver with optional model overrides per driver.
-    pub fn new_with_models(chain: Vec<(Arc<dyn LlmDriver>, Option<String>)>) -> Self {
+    /// Create a fallback driver with optional model and max_tokens overrides per driver.
+    pub fn new_with_models(
+        chain: Vec<(Arc<dyn LlmDriver>, Option<String>, Option<u32>)>,
+    ) -> Self {
         Self {
             chain: chain
                 .into_iter()
-                .map(|(driver, model_override)| FallbackEntry {
+                .map(|(driver, model_override, max_tokens_override)| FallbackEntry {
                     driver,
                     model_override,
+                    max_tokens_override,
                 })
                 .collect(),
         }
@@ -60,6 +65,9 @@ impl LlmDriver for FallbackDriver {
             let mut request_for_driver = request.clone();
             if let Some(model) = &entry.model_override {
                 request_for_driver.model = model.clone();
+            }
+            if let Some(max_tokens) = entry.max_tokens_override {
+                request_for_driver.max_tokens = request_for_driver.max_tokens.min(max_tokens);
             }
 
             match entry.driver.complete(request_for_driver).await {
@@ -96,6 +104,9 @@ impl LlmDriver for FallbackDriver {
             let mut request_for_driver = request.clone();
             if let Some(model) = &entry.model_override {
                 request_for_driver.model = model.clone();
+            }
+            if let Some(max_tokens) = entry.max_tokens_override {
+                request_for_driver.max_tokens = request_for_driver.max_tokens.min(max_tokens);
             }
 
             match entry.driver.stream(request_for_driver, tx.clone()).await {
@@ -273,10 +284,11 @@ mod tests {
         });
 
         let driver = FallbackDriver::new_with_models(vec![
-            (primary.clone() as Arc<dyn LlmDriver>, None),
+            (primary.clone() as Arc<dyn LlmDriver>, None, None),
             (
                 fallback.clone() as Arc<dyn LlmDriver>,
                 Some("deepseek-chat".to_string()),
+                None,
             ),
         ]);
 

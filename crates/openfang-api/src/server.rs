@@ -157,6 +157,10 @@ pub async fn build_router(
             axum::routing::post(routes::reset_session),
         )
         .route(
+            "/api/agents/{id}/session/restore",
+            axum::routing::put(routes::restore_session),
+        )
+        .route(
             "/api/agents/{id}/session/compact",
             axum::routing::post(routes::compact_session),
         )

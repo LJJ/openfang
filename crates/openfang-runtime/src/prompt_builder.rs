@@ -98,10 +98,14 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
-    // Section 4 — Available Tools (always present if tools exist)
-    let tools_section = build_tools_section(&ctx.granted_tools);
-    if !tools_section.is_empty() {
-        sections.push(tools_section);
+    // Section 4 — Available Tools
+    // Roleplay agents get tool guidance from mode files; skip the raw list to avoid
+    // redundant descriptions that confuse the LLM about which tool to use.
+    if !ctx.is_roleplay {
+        let tools_section = build_tools_section(&ctx.granted_tools);
+        if !tools_section.is_empty() {
+            sections.push(tools_section);
+        }
     }
 
     // Section 5 — Memory Protocol (always present)
@@ -116,8 +120,9 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         ));
     }
 
-    // Section 7 — MCP Servers (only if summary present)
-    if !ctx.mcp_summary.is_empty() {
+    // Section 7 — MCP Servers
+    // Same as Section 4: roleplay agents already have tool descriptions in mode files.
+    if !ctx.is_roleplay && !ctx.mcp_summary.is_empty() {
         sections.push(build_mcp_section(&ctx.mcp_summary));
     }
 

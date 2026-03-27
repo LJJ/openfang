@@ -82,6 +82,9 @@ pub struct TraceSummary {
     pub parent_trace_id: Option<String>,
     pub full_input_tokens: u64,
     pub full_output_tokens: u64,
+    /// Distinct model names used in LLM spans (extracted from span name "llm:{model}").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// Full trace detail with all spans.
@@ -253,7 +256,8 @@ impl TraceStore {
                     t.total_duration_ms, t.total_input_tokens, t.total_output_tokens, t.total_llm_calls,
                     t.parent_trace_id,
                     COALESCE((SELECT SUM(s.token_input) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0),
-                    COALESCE((SELECT SUM(s.token_output) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0)
+                    COALESCE((SELECT SUM(s.token_output) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0),
+                    COALESCE((SELECT GROUP_CONCAT(DISTINCT SUBSTR(s.name, 5)) FROM trace_spans s WHERE s.trace_id = t.id AND s.name LIKE 'llm:%'), '')
              FROM traces t {where_sql}
              ORDER BY t.started_at DESC
              LIMIT ?{} OFFSET ?{}",
@@ -276,6 +280,12 @@ impl TraceStore {
                 let total_output = row.get::<_, i64>(9).map(|v| v as u64)?;
                 let aux_input = row.get::<_, i64>(12).map(|v| v as u64)?;
                 let aux_output = row.get::<_, i64>(13).map(|v| v as u64)?;
+                let models_str: String = row.get(14)?;
+                let models: Vec<String> = if models_str.is_empty() {
+                    Vec::new()
+                } else {
+                    models_str.split(',').map(|s| s.to_string()).collect()
+                };
                 Ok(TraceSummary {
                     id: row.get(0)?,
                     trigger_type: row.get(1)?,
@@ -291,6 +301,7 @@ impl TraceStore {
                     parent_trace_id: row.get(11)?,
                     full_input_tokens: total_input + aux_input,
                     full_output_tokens: total_output + aux_output,
+                    models,
                 })
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -316,7 +327,8 @@ impl TraceStore {
                         t.total_duration_ms, t.total_input_tokens, t.total_output_tokens, t.total_llm_calls,
                         t.parent_trace_id,
                         COALESCE((SELECT SUM(s.token_input) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0),
-                        COALESCE((SELECT SUM(s.token_output) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0)
+                        COALESCE((SELECT SUM(s.token_output) FROM trace_spans s WHERE s.trace_id = t.id AND s.kind IN ('llm_aux', 'media', 'custom')), 0),
+                        COALESCE((SELECT GROUP_CONCAT(DISTINCT SUBSTR(s.name, 5)) FROM trace_spans s WHERE s.trace_id = t.id AND s.name LIKE 'llm:%'), '')
                  FROM traces t WHERE t.id = ?1",
                 rusqlite::params![id],
                 |row| {
@@ -324,6 +336,12 @@ impl TraceStore {
                     let total_output = row.get::<_, i64>(9).map(|v| v as u64)?;
                     let aux_input = row.get::<_, i64>(12).map(|v| v as u64)?;
                     let aux_output = row.get::<_, i64>(13).map(|v| v as u64)?;
+                    let models_str: String = row.get(14)?;
+                    let models: Vec<String> = if models_str.is_empty() {
+                        Vec::new()
+                    } else {
+                        models_str.split(',').map(|s| s.to_string()).collect()
+                    };
                     Ok(TraceSummary {
                         id: row.get(0)?,
                         trigger_type: row.get(1)?,
@@ -339,6 +357,7 @@ impl TraceStore {
                         parent_trace_id: row.get(11)?,
                         full_input_tokens: total_input + aux_input,
                         full_output_tokens: total_output + aux_output,
+                        models,
                     })
                 },
             )

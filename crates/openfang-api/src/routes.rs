@@ -5721,6 +5721,66 @@ pub async fn reset_session(
     }
 }
 
+/// PUT /api/agents/{id}/session/restore — Replace current session messages.
+pub async fn restore_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    let messages: Vec<openfang_types::message::Message> = match body.get("messages") {
+        Some(msgs) => {
+            // Normalize role casing: snapshots may store "User"/"Assistant"/"System"
+            // but serde expects lowercase "user"/"assistant"/"system"
+            let normalized = if let Some(arr) = msgs.as_array() {
+                let fixed: Vec<serde_json::Value> = arr.iter().map(|m| {
+                    let mut m = m.clone();
+                    if let Some(role) = m.get("role").and_then(|r| r.as_str()) {
+                        m["role"] = serde_json::Value::String(role.to_lowercase());
+                    }
+                    m
+                }).collect();
+                serde_json::Value::Array(fixed)
+            } else {
+                msgs.clone()
+            };
+            match serde_json::from_value(normalized) {
+                Ok(m) => m,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Invalid messages: {e}")})),
+                    )
+                }
+            }
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing 'messages' field"})),
+            )
+        }
+    };
+    match state.kernel.restore_session(agent_id, messages) {
+        Ok(count) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "message_count": count})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 /// POST /api/agents/{id}/session/compact — Trigger LLM session compaction.
 pub async fn compact_session(
     State(state): State<Arc<AppState>>,
@@ -9199,8 +9259,13 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
                     }
                 }
 
-                // Today's schedule
-                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                // Today's schedule — use agent's timezone (default UTC+8 Asia/Shanghai), not server local time
+                let tz_offset_hours = card.pointer("/life_state/home_timezone")
+                    .and_then(|v| v.as_str())
+                    .map(|tz| match tz { "Asia/Shanghai" => 8i64, "Asia/Tokyo" => 9, _ => 8 })
+                    .unwrap_or(8i64);
+                let today = (chrono::Utc::now() + chrono::Duration::hours(tz_offset_hours))
+                    .format("%Y-%m-%d").to_string();
                 let schedule_path = agent_dir.join(format!("life/{today}.json"));
                 if let Ok(s) = std::fs::read_to_string(&schedule_path) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {

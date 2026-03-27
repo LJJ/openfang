@@ -43,6 +43,7 @@ pub mod session_repair;
 pub mod shell_bleed;
 pub mod str_utils;
 pub mod subprocess_sandbox;
+pub mod think_filter;
 pub mod tool_policy;
 pub mod tool_runner;
 pub mod tts;
