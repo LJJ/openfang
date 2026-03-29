@@ -2253,7 +2253,7 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
-            let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
+            let mut prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
@@ -2324,18 +2324,20 @@ impl OpenFangKernel {
                 prompt_suffix: load_prompt_suffix_dir(&self.config.home_dir),
                 is_roleplay: manifest.agent_class == AgentClass::Roleplay,
             };
+            // Inject mode prompt into base_system_prompt so it appears right after
+            // agent.toml content but BEFORE SOUL.md, skills, and other identity files.
+            if manifest.agent_class == AgentClass::Roleplay {
+                let mode = current_interaction_mode(&self.config, &manifest.name);
+                let mode_prompt =
+                    load_roleplay_mode_prompt(&self.config, &manifest.name, &mode);
+                if !mode_prompt.is_empty() {
+                    prompt_ctx.base_system_prompt =
+                        format!("{}\n\n{}", prompt_ctx.base_system_prompt, mode_prompt);
+                }
+            }
+
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
-        }
-
-        // Inject interaction-mode-specific expression guidance for roleplay agents
-        if manifest.agent_class == AgentClass::Roleplay {
-            let mode = current_interaction_mode(&self.config, &manifest.name);
-            let mode_prompt = load_roleplay_mode_prompt(&self.config, &manifest.name, &mode);
-            if !mode_prompt.is_empty() {
-                manifest.model.system_prompt =
-                    format!("{}\n\n{}", manifest.model.system_prompt, mode_prompt);
-            }
         }
 
         let is_stable = self.config.mode == openfang_types::config::KernelMode::Stable;

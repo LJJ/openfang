@@ -9244,7 +9244,9 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
                 }
 
                 // Resolve location ID → display name via known_places.toml
-                if let Some(loc_id) = card.pointer("/life_state/location").and_then(|v| v.as_str()) {
+                if let Some(loc_id) = card.pointer("/world_state/location")
+                    .or_else(|| card.pointer("/life_state/location"))
+                    .and_then(|v| v.as_str()) {
                     let places_path = agent_dir.join("life/known_places.toml");
                     if let Ok(places_str) = std::fs::read_to_string(&places_path) {
                         if let Ok(places) = places_str.parse::<toml::Value>() {
@@ -9394,7 +9396,36 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
         serde_json::Value::Array(vec![])
     };
 
-    (StatusCode::OK, Json(serde_json::json!({"characters": characters, "arrangements": arrangements})))
+    // Known place keys + location aliases for frontend co_presence calculation
+    let known_places_path = home.join("world/known_places.toml");
+    // Extract section keys by line parsing (toml 0.8 doesn't support unicode bare keys)
+    let known_place_keys: Vec<String> = match std::fs::read_to_string(&known_places_path) {
+        Ok(s) => s.lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
+                    Some(trimmed[1..trimmed.len()-1].to_string())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
+
+    let aliases_path = home.join("world/location_aliases.json");
+    let location_aliases: serde_json::Value = if let Ok(s) = std::fs::read_to_string(&aliases_path) {
+        serde_json::from_str(&s).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "characters": characters,
+        "arrangements": arrangements,
+        "known_place_keys": known_place_keys,
+        "location_aliases": location_aliases,
+    })))
 }
 
 /// GET /api/characters/{agent_id}/avatar — Serve agent avatar image.

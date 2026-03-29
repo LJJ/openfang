@@ -142,8 +142,9 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     // Section 11 — Operational Guidelines (always present)
     sections.push(OPERATIONAL_GUIDELINES.to_string());
 
-    // Section 12 — Canonical Context (skip for subagents)
-    if !ctx.is_subagent {
+    // Section 12 — Canonical Context (skip for subagents and roleplay)
+    // Roleplay agents have their own diary system for continuity.
+    if !ctx.is_subagent && !ctx.is_roleplay {
         if let Some(ref canonical) = ctx.canonical_context {
             if !canonical.is_empty() {
                 sections.push(format!("## 上次聊到哪了\n{}", cap_str(canonical, 500)));
@@ -750,6 +751,15 @@ mod tests {
     fn test_canonical_context_omitted_for_subagent() {
         let mut ctx = basic_ctx();
         ctx.is_subagent = true;
+        ctx.canonical_context = Some("Previous context here.".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## 上次聊到哪了"));
+    }
+
+    #[test]
+    fn test_canonical_context_omitted_for_roleplay() {
+        let mut ctx = basic_ctx();
+        ctx.is_roleplay = true;
         ctx.canonical_context = Some("Previous context here.".to_string());
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## 上次聊到哪了"));

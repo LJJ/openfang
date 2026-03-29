@@ -6,6 +6,8 @@ function charactersPage() {
     characters: [],
     owner: null,
     arrangements: [],
+    knownPlaceKeys: [],
+    locationAliases: {},
     loading: true,
     autoRefresh: true,
     _timer: null,
@@ -35,6 +37,8 @@ function charactersPage() {
         this.characters = allChars.filter(function(c) { return c.is_agent; });
         this.owner = allChars.find(function(c) { return c.is_owner; }) || null;
         this.arrangements = data.arrangements || [];
+        this.knownPlaceKeys = data.known_place_keys || [];
+        this.locationAliases = data.location_aliases || {};
       } catch(e) {
         this.characters = [];
         this.owner = null;
@@ -137,23 +141,52 @@ function charactersPage() {
       return (this.owner.world_state && this.owner.world_state.location) || '-';
     },
 
+    // Location resolution — mirrors backend location_resolver.js (layers 1-3)
+    resolveLocation(loc) {
+      if (!loc) return null;
+      var keys = this.knownPlaceKeys;
+      // Layer 1: exact match
+      if (keys.indexOf(loc) >= 0) return loc;
+      // Layer 2: substring match (bidirectional, ≥2 chars)
+      for (var i = 0; i < keys.length; i++) {
+        var key = keys[i];
+        if (key.length < 2 || loc.length < 2) continue;
+        if (loc.indexOf(key) >= 0 || key.indexOf(loc) >= 0) return key;
+      }
+      // Layer 3: alias cache (null = confirmed no match)
+      if (this.locationAliases.hasOwnProperty(loc)) return this.locationAliases[loc];
+      return undefined; // cache miss
+    },
+
+    samePlace(locA, locB) {
+      if (!locA || !locB) return false;
+      if (locA === locB) return true;
+      var keyA = this.resolveLocation(locA);
+      var keyB = this.resolveLocation(locB);
+      if (keyA && keyB) return keyA === keyB;
+      // Fallback: bidirectional substring
+      if (locA.length >= 2 && locB.length >= 2) {
+        return locA.indexOf(locB) >= 0 || locB.indexOf(locA) >= 0;
+      }
+      return false;
+    },
+
     getCoPresenceList(c) {
       var selfLoc = (c.world_state && c.world_state.location) || '';
       var result = [];
-      // Compare with all other characters (AI + owner)
       var others = this.characters.concat(this.owner ? [this.owner] : []);
       for (var i = 0; i < others.length; i++) {
         var other = others[i];
         if (other.character_id === c.character_id) continue;
         var otherLoc = (other.world_state && other.world_state.location) || '';
-        var mode = (selfLoc && otherLoc && selfLoc === otherLoc) ? 'in_person' : 'remote';
+        var mode = this.samePlace(selfLoc, otherLoc) ? 'in_person' : 'remote';
         result.push({ name: other.display_name, mode: mode });
       }
       return result;
     },
 
     getThoughts(c) {
-      return (c.life_state && c.life_state.thoughts) || [];
+      return (c.world_state && c.world_state.thoughts) || (c.life_state && c.life_state.thoughts) || [];
     },
 
     getEvents(c) {

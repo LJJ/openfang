@@ -45,6 +45,8 @@ struct OaiRequest {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
 }
 
 /// GPT-5.x and o-series models require `max_completion_tokens` instead of `max_tokens`.
@@ -305,6 +307,7 @@ impl LlmDriver for OpenAIDriver {
             tools: oai_tools,
             tool_choice,
             stream: false,
+            stream_options: None,
         };
 
         let max_retries = 3;
@@ -597,6 +600,7 @@ impl LlmDriver for OpenAIDriver {
             tools: oai_tools,
             tool_choice,
             stream: true,
+            stream_options: Some(serde_json::json!({ "include_usage": true })),
         };
 
         // Retry loop for the initial HTTP request
