@@ -17,7 +17,7 @@ use crate::web_search::WebToolsContext;
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
-use openfang_types::agent::{AgentClass, AgentManifest};
+use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
 use openfang_types::message::{
@@ -174,13 +174,6 @@ fn manifest_silent_after_tools(manifest: &AgentManifest) -> HashSet<String> {
         .flatten()
         .filter_map(|value| value.as_str().map(ToOwned::to_owned))
         .collect()
-}
-
-/// Roleplay agents use explicit output tools (express / send_message) for all
-/// observable output.  Their text output is internal thinking — it must NOT be
-/// auto-wrapped into Turn Script for delivery.
-fn should_auto_wrap_text(manifest: &AgentManifest) -> bool {
-    manifest.agent_class != AgentClass::Roleplay
 }
 
 /// Apply dynamic injections to a messages list (clone, not in-place).
@@ -545,23 +538,6 @@ fn persistent_turn_placeholder(tool_calls: &[ToolCall]) -> String {
 
     for tc in tool_calls {
         match tc.name.as_str() {
-            // ── Output tools (express / send_message) ──────────────────
-            "mcp_toolbox_express" => {
-                if let Some(text) = tc.input.get("text").and_then(|v| v.as_str()) {
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        parts.push(text.to_string());
-                    }
-                }
-            }
-            "mcp_toolbox_send_message" => {
-                if let Some(content) = tc.input.get("content").and_then(|v| v.as_str()) {
-                    let content = content.trim();
-                    if !content.is_empty() {
-                        parts.push(content.to_string());
-                    }
-                }
-            }
             // ── Legacy: reply (kept for backward compat) ───────────────
             "mcp_toolbox_reply" => {
                 if let Some(text) = tc.input.get("content").and_then(|v| v.as_str()) {
@@ -1699,28 +1675,18 @@ pub async fn run_agent_loop(
                 // tool → write the text into Turn Script so the kernel delivers
                 // it.  This makes message delivery a code guarantee, not an LLM
                 // best-effort.
-                //
-                // Roleplay agents are exempt: their text output is internal
-                // thinking; observable output goes through express/send_message.
                 {
                     let silent_after = manifest_silent_after_tools(manifest);
                     if !silent_after.is_empty()
                         && !text.trim().is_empty()
                         && response.tool_calls.is_empty()
                     {
-                        if should_auto_wrap_text(manifest) {
-                            warn!(
-                                agent = %manifest.name,
-                                "Tool-only agent produced text without tool calls — auto-wrapping into Turn Script"
-                            );
-                            if let Err(e) = auto_wrap_text_to_turn_script(&text, &manifest.name) {
-                                warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script");
-                            }
-                        } else {
-                            warn!(
-                                agent = %manifest.name,
-                                "Roleplay agent produced text without output tools — text treated as internal thinking"
-                            );
+                        warn!(
+                            agent = %manifest.name,
+                            "Tool-only agent produced text without tool calls — auto-wrapping into Turn Script"
+                        );
+                        if let Err(e) = auto_wrap_text_to_turn_script(&text, &manifest.name) {
+                            warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script");
                         }
                         session.messages.push(Message::assistant(text));
                         save_projected_session(memory, session)?;
@@ -1759,22 +1725,6 @@ pub async fn run_agent_loop(
                         messages_count = messages.len(),
                         "Empty response from LLM — guard activated"
                     );
-                    // Roleplay agents: empty response after tool execution is normal
-                    // (tools already delivered output). Return silently to avoid
-                    // injecting technical English text into character sessions.
-                    if !should_auto_wrap_text(manifest) && iteration > 0 {
-                        debug!(agent = %manifest.name, "Roleplay agent empty after tools — silent exit");
-                        session.messages.push(Message::assistant("[no reply needed]".to_string()));
-                        save_projected_session(memory, session)?;
-                        return Ok(AgentLoopResult {
-                            response: String::new(),
-                            total_usage,
-                            iterations: iteration + 1,
-                            cost_usd: None,
-                            silent: true,
-                            directives: Default::default(),
-                        });
-                    }
                     if iteration > 0 {
                         "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
                     } else {
@@ -2110,8 +2060,7 @@ pub async fn run_agent_loop(
                         .any(|tool_name| silent_after_tools.contains(tool_name));
 
                 // Preserve companion text when tools fail and we're about to retry.
-                // Roleplay agents: text is internal thinking, skip auto-wrap.
-                if had_tool_errors && !silent_after_tools.is_empty() && should_auto_wrap_text(manifest) {
+                if had_tool_errors && !silent_after_tools.is_empty() {
                     let companion_text = response.text();
                     if !companion_text.trim().is_empty() {
                         debug!(agent = %manifest.name, "Preserving companion text from failed tool iteration");
@@ -2128,8 +2077,7 @@ pub async fn run_agent_loop(
                     // Text delivery is a code guarantee: if the LLM produced
                     // text alongside tool calls, auto-wrap it into Turn Script
                     // so the kernel delivers it to the user.
-                    // Roleplay agents: text is internal thinking, skip auto-wrap.
-                    if should_silent_after_tools && should_auto_wrap_text(manifest) {
+                    if should_silent_after_tools {
                         let companion_text = response.text();
                         if !companion_text.trim().is_empty() {
                             debug!(agent = %manifest.name, "Auto-wrapping text into Turn Script alongside tool calls");
@@ -2174,6 +2122,18 @@ pub async fn run_agent_loop(
                         silent: true,
                         directives: Default::default(),
                     });
+                }
+
+                // Auto-wrap intermediate text: every iteration's text output
+                // is the character's expression and should be delivered.
+                {
+                    let companion_text = response.text();
+                    if !companion_text.trim().is_empty() {
+                        debug!(agent = %manifest.name, "Auto-wrapping intermediate text into Turn Script (loop continues)");
+                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
+                            warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap intermediate text");
+                        }
+                    }
                 }
 
                 // Add tool results as a user message (Anthropic API requirement)
@@ -2931,26 +2891,18 @@ pub async fn run_agent_loop_streaming(
                 }
 
                 // Auto-wrap (streaming): same logic as non-streaming path.
-                // Roleplay agents: text is internal thinking, skip auto-wrap.
                 {
                     let silent_after = manifest_silent_after_tools(manifest);
                     if !silent_after.is_empty()
                         && !text.trim().is_empty()
                         && response.tool_calls.is_empty()
                     {
-                        if should_auto_wrap_text(manifest) {
-                            warn!(
-                                agent = %manifest.name,
-                                "Tool-only agent produced text without tool calls (streaming) — auto-wrapping into Turn Script"
-                            );
-                            if let Err(e) = auto_wrap_text_to_turn_script(&text, &manifest.name) {
-                                warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script (streaming)");
-                            }
-                        } else {
-                            warn!(
-                                agent = %manifest.name,
-                                "Roleplay agent produced text without output tools (streaming) — text treated as internal thinking"
-                            );
+                        warn!(
+                            agent = %manifest.name,
+                            "Tool-only agent produced text without tool calls (streaming) — auto-wrapping into Turn Script"
+                        );
+                        if let Err(e) = auto_wrap_text_to_turn_script(&text, &manifest.name) {
+                            warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script (streaming)");
                         }
                         session.messages.push(Message::assistant(text));
                         save_projected_session(memory, session)?;
@@ -2988,21 +2940,6 @@ pub async fn run_agent_loop_streaming(
                         messages_count = messages.len(),
                         "Empty response from LLM (streaming) — guard activated"
                     );
-                    // Roleplay agents: empty response after tool execution is normal
-                    // (tools already delivered output). Return silently.
-                    if !should_auto_wrap_text(manifest) && iteration > 0 {
-                        debug!(agent = %manifest.name, "Roleplay agent empty after tools (streaming) — silent exit");
-                        session.messages.push(Message::assistant("[no reply needed]".to_string()));
-                        save_projected_session(memory, session)?;
-                        return Ok(AgentLoopResult {
-                            response: String::new(),
-                            total_usage,
-                            iterations: iteration + 1,
-                            cost_usd: None,
-                            silent: true,
-                            directives: Default::default(),
-                        });
-                    }
                     if iteration > 0 {
                         "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
                     } else {
@@ -3380,8 +3317,7 @@ pub async fn run_agent_loop_streaming(
                         .any(|tool_name| silent_after_tools.contains(tool_name));
 
                 // Preserve companion text when tools fail and we're about to retry.
-                // Roleplay agents: text is internal thinking, skip auto-wrap.
-                if had_tool_errors && !silent_after_tools.is_empty() && should_auto_wrap_text(manifest) {
+                if had_tool_errors && !silent_after_tools.is_empty() {
                     let companion_text = response.text();
                     if !companion_text.trim().is_empty() {
                         debug!(agent = %manifest.name, "Preserving companion text from failed tool iteration");
@@ -3398,8 +3334,7 @@ pub async fn run_agent_loop_streaming(
                     // Text delivery is a code guarantee: if the LLM produced
                     // text alongside tool calls, auto-wrap it into Turn Script
                     // so the kernel delivers it to the user.
-                    // Roleplay agents: text is internal thinking, skip auto-wrap.
-                    if should_silent_after_tools && should_auto_wrap_text(manifest) {
+                    if should_silent_after_tools {
                         let companion_text = response.text();
                         if !companion_text.trim().is_empty() {
                             debug!(agent = %manifest.name, "Auto-wrapping text into Turn Script alongside tool calls (streaming)");
@@ -3443,6 +3378,18 @@ pub async fn run_agent_loop_streaming(
                         silent: true,
                         directives: Default::default(),
                     });
+                }
+
+                // Auto-wrap intermediate text (streaming): every iteration's
+                // text output is the character's expression and should be delivered.
+                {
+                    let companion_text = response.text();
+                    if !companion_text.trim().is_empty() {
+                        debug!(agent = %manifest.name, "Auto-wrapping intermediate text into Turn Script (streaming, loop continues)");
+                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
+                            warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap intermediate text (streaming)");
+                        }
+                    }
                 }
 
                 let tool_results_msg = Message {
