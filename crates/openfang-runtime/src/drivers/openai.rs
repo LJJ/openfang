@@ -34,7 +34,10 @@ impl OpenAIDriver {
 struct OaiRequest {
     model: String,
     messages: Vec<OaiMessage>,
-    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     temperature: f32,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OaiTool>,
@@ -42,6 +45,11 @@ struct OaiRequest {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+}
+
+/// GPT-5.x and o-series models require `max_completion_tokens` instead of `max_tokens`.
+fn use_max_completion_tokens(model: &str) -> bool {
+    model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4")
 }
 
 #[derive(Debug, Serialize)]
@@ -287,10 +295,12 @@ impl LlmDriver for OpenAIDriver {
             Some(serde_json::json!("auto"))
         };
 
+        let use_mct = use_max_completion_tokens(&request.model);
         let mut oai_request = OaiRequest {
             model: request.model.clone(),
             messages: oai_messages,
-            max_tokens: request.max_tokens,
+            max_tokens: if use_mct { None } else { Some(request.max_tokens) },
+            max_completion_tokens: if use_mct { Some(request.max_tokens) } else { None },
             temperature: request.temperature,
             tools: oai_tools,
             tool_choice,
@@ -350,16 +360,25 @@ impl LlmDriver for OpenAIDriver {
                     }
                 }
 
+                // Model requires max_completion_tokens instead of max_tokens — switch and retry
+                if status == 400 && body.contains("max_completion_tokens") && oai_request.max_tokens.is_some() && attempt < max_retries {
+                    let val = oai_request.max_tokens.take().unwrap();
+                    oai_request.max_completion_tokens = Some(val);
+                    warn!(model = %oai_request.model, "Switching from max_tokens to max_completion_tokens");
+                    continue;
+                }
+
                 // Auto-cap max_tokens when model rejects our value (e.g. Groq Maverick limit 8192)
                 if status == 400 && body.contains("max_tokens") && attempt < max_retries {
-                    // Extract the limit from error: "must be less than or equal to `8192`"
-                    let cap = extract_max_tokens_limit(&body).unwrap_or(oai_request.max_tokens / 2);
-                    warn!(
-                        old = oai_request.max_tokens,
-                        new = cap,
-                        "Auto-capping max_tokens to model limit"
-                    );
-                    oai_request.max_tokens = cap;
+                    let current = oai_request.max_tokens.or(oai_request.max_completion_tokens).unwrap_or(4096);
+                    let cap = extract_max_tokens_limit(&body).unwrap_or(current / 2);
+                    if oai_request.max_completion_tokens.is_some() {
+                        warn!(old = current, new = cap, "Auto-capping max_completion_tokens to model limit");
+                        oai_request.max_completion_tokens = Some(cap);
+                    } else {
+                        warn!(old = current, new = cap, "Auto-capping max_tokens to model limit");
+                        oai_request.max_tokens = Some(cap);
+                    }
                     continue;
                 }
 
@@ -568,10 +587,12 @@ impl LlmDriver for OpenAIDriver {
             Some(serde_json::json!("auto"))
         };
 
+        let use_mct = use_max_completion_tokens(&request.model);
         let mut oai_request = OaiRequest {
             model: request.model.clone(),
             messages: oai_messages,
-            max_tokens: request.max_tokens,
+            max_tokens: if use_mct { None } else { Some(request.max_tokens) },
+            max_completion_tokens: if use_mct { Some(request.max_tokens) } else { None },
             temperature: request.temperature,
             tools: oai_tools,
             tool_choice,
@@ -633,15 +654,25 @@ impl LlmDriver for OpenAIDriver {
                     }
                 }
 
+                // Model requires max_completion_tokens instead of max_tokens — switch and retry
+                if status == 400 && body.contains("max_completion_tokens") && oai_request.max_tokens.is_some() && attempt < max_retries {
+                    let val = oai_request.max_tokens.take().unwrap();
+                    oai_request.max_completion_tokens = Some(val);
+                    warn!(model = %oai_request.model, "Switching from max_tokens to max_completion_tokens (stream)");
+                    continue;
+                }
+
                 // Auto-cap max_tokens when model rejects our value
                 if status == 400 && body.contains("max_tokens") && attempt < max_retries {
-                    let cap = extract_max_tokens_limit(&body).unwrap_or(oai_request.max_tokens / 2);
-                    warn!(
-                        old = oai_request.max_tokens,
-                        new = cap,
-                        "Auto-capping max_tokens (stream)"
-                    );
-                    oai_request.max_tokens = cap;
+                    let current = oai_request.max_tokens.or(oai_request.max_completion_tokens).unwrap_or(4096);
+                    let cap = extract_max_tokens_limit(&body).unwrap_or(current / 2);
+                    if oai_request.max_completion_tokens.is_some() {
+                        warn!(old = current, new = cap, "Auto-capping max_completion_tokens (stream)");
+                        oai_request.max_completion_tokens = Some(cap);
+                    } else {
+                        warn!(old = current, new = cap, "Auto-capping max_tokens (stream)");
+                        oai_request.max_tokens = Some(cap);
+                    }
                     continue;
                 }
 

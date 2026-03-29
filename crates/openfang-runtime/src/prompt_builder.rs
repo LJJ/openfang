@@ -76,7 +76,6 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             ctx.identity_md.as_deref(),
             ctx.soul_md.as_deref(),
             ctx.user_md.as_deref(),
-            ctx.memory_md.as_deref(),
             if ctx.is_roleplay { None } else { ctx.workspace_path.as_deref() },
         );
         if !persona.is_empty() {
@@ -106,18 +105,6 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if !tools_section.is_empty() {
             sections.push(tools_section);
         }
-    }
-
-    // Section 5 — Memory Protocol (always present)
-    let mem_section = build_memory_section(&ctx.recalled_memories);
-    sections.push(mem_section);
-
-    // Section 6 — Skills (only if skills available)
-    if !ctx.skill_summary.is_empty() || !ctx.skill_prompt_context.is_empty() {
-        sections.push(build_skills_section(
-            &ctx.skill_summary,
-            &ctx.skill_prompt_context,
-        ));
     }
 
     // Section 7 — MCP Servers
@@ -278,18 +265,6 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
     out
 }
 
-fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
-    let mut out = String::from("## 你有的东西\n");
-    if !skill_summary.is_empty() {
-        out.push_str(skill_summary.trim());
-    }
-    if !prompt_context.is_empty() {
-        out.push('\n');
-        out.push_str(&cap_str(prompt_context, 2000));
-    }
-    out
-}
-
 fn build_mcp_section(mcp_summary: &str) -> String {
     format!("## 你手边的工具\n{}", mcp_summary.trim())
 }
@@ -298,7 +273,6 @@ fn build_persona_section(
     identity_md: Option<&str>,
     soul_md: Option<&str>,
     user_md: Option<&str>,
-    memory_md: Option<&str>,
     workspace_path: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -326,12 +300,6 @@ fn build_persona_section(
     if let Some(user) = user_md {
         if !user.trim().is_empty() {
             parts.push(format!("## 关于对方\n{}", cap_str(user, 500)));
-        }
-    }
-
-    if let Some(memory) = memory_md {
-        if !memory.trim().is_empty() {
-            parts.push(format!("## 长期记忆\n{}", cap_str(memory, 500)));
         }
     }
 
@@ -571,10 +539,8 @@ mod tests {
         assert!(prompt.contains("You are Researcher"));
         assert!(prompt.contains("## 行事习惯"));
         assert!(prompt.contains("## 你能做的事"));
-        assert!(prompt.contains("## 记忆"));
         assert!(prompt.contains("## 对方的信息"));
         assert!(prompt.contains("## 底线"));
-        assert!(prompt.contains("## 做事的分寸"));
     }
 
     #[test]
@@ -585,15 +551,11 @@ mod tests {
         let persona_pos = prompt.find("## 你是谁").unwrap();
         let tool_behavior_pos = prompt.find("## 行事习惯").unwrap();
         let tools_pos = prompt.find("## 你能做的事").unwrap();
-        let memory_pos = prompt.find("## 记忆").unwrap();
         let safety_pos = prompt.find("## 底线").unwrap();
-        let guidelines_pos = prompt.find("## 做事的分寸").unwrap();
 
         assert!(persona_pos < tool_behavior_pos);
         assert!(tool_behavior_pos < tools_pos);
-        assert!(tools_pos < memory_pos);
-        assert!(memory_pos < safety_pos);
-        assert!(safety_pos < guidelines_pos);
+        assert!(tools_pos < safety_pos);
     }
 
     #[test]
@@ -606,10 +568,8 @@ mod tests {
         assert!(!prompt.contains("## 对方的信息"));
         assert!(!prompt.contains("## 聊天渠道"));
         assert!(!prompt.contains("## 底线"));
-        // Subagents still get tools and guidelines
+        // Subagents still get tools
         assert!(prompt.contains("## 你能做的事"));
-        assert!(prompt.contains("## 做事的分寸"));
-        assert!(prompt.contains("## 记忆"));
     }
 
     #[test]
@@ -699,22 +659,6 @@ mod tests {
     }
 
     #[test]
-    fn test_skills_section_omitted_when_empty() {
-        let ctx = basic_ctx();
-        let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## 你有的东西"));
-    }
-
-    #[test]
-    fn test_skills_section_present() {
-        let mut ctx = basic_ctx();
-        ctx.skill_summary = "- web-search: Search the web\n- git-expert: Git commands".to_string();
-        let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("## 你有的东西"));
-        assert!(prompt.contains("web-search"));
-    }
-
-    #[test]
     fn test_mcp_section_omitted_when_empty() {
         let ctx = basic_ctx();
         let prompt = build_system_prompt(&ctx);
@@ -742,7 +686,7 @@ mod tests {
     #[test]
     fn test_persona_soul_capped_at_1000() {
         let long_soul = "x".repeat(2000);
-        let section = build_persona_section(None, Some(&long_soul), None, None, None);
+        let section = build_persona_section(None, Some(&long_soul), None, None);
         assert!(section.contains("..."));
         // The raw soul content in the section should be at most 1003 chars (1000 + "...")
         assert!(section.len() < 1200);
