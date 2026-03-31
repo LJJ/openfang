@@ -131,7 +131,7 @@ impl TraceStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO traces (id, trigger_type, agent_id, agent_name, status, started_at, parent_trace_id)
+            "INSERT OR IGNORE INTO traces (id, trigger_type, agent_id, agent_name, status, started_at, parent_trace_id)
              VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
             rusqlite::params![id, trigger_type, agent_id, agent_name, now, parent_trace_id],
         )

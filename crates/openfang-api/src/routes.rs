@@ -9148,6 +9148,21 @@ pub async fn report_span(
         token_output: body.get("token_output").and_then(|v| v.as_u64()),
     };
 
+    // 自动创建 trace（如果不存在）—— 支持外部进程（如 filming）上报 span
+    let trigger = body.get("trigger_type").and_then(|v| v.as_str()).unwrap_or("external");
+    let agent = body.get("agent_name").and_then(|v| v.as_str()).unwrap_or("filming");
+    let _ = state.kernel.trace_collector.store().create_trace(
+        &trace_id, trigger, "", agent, None,
+    ); // INSERT OR IGNORE 语义：已存在则忽略
+
+    // 特殊 span "_trace_complete" 用于结束 trace
+    let span_name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if span_name == "_trace_complete" {
+        let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+        state.kernel.trace_collector.end_trace(&trace_id, status, 0, 0, 0);
+        return (StatusCode::OK, Json(serde_json::json!({"ok": true})));
+    }
+
     state.kernel.trace_collector.record_span_data(span);
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
