@@ -525,12 +525,27 @@ pub async fn send_message(
     let trigger = req.trigger_type.as_deref().unwrap_or("user").to_string();
     let parent_trace = req.parent_trace_id.clone();
     let model_override = req.model_override.clone();
+
+    // Parse optional session routing target
+    let session_override = match &req.session_id {
+        Some(s) => match s.parse::<uuid::Uuid>() {
+            Ok(uuid) => Some(openfang_types::agent::SessionId(uuid)),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid session_id (expected UUID)"})),
+                );
+            }
+        },
+        None => None,
+    };
+
     match openfang_runtime::tool_runner::TRIGGER_TYPE.scope(Some(trigger), async {
         openfang_runtime::tool_runner::PARENT_TRACE_ID.scope(parent_trace, async {
             openfang_runtime::tool_runner::MODEL_OVERRIDE.scope(model_override, async {
                 state
                     .kernel
-                    .send_message_with_handle_and_media(agent_id, &message, Some(kernel_handle), media_blocks)
+                    .send_message_with_handle_and_media(agent_id, &message, Some(kernel_handle), media_blocks, session_override)
                     .await
             }).await
         }).await
@@ -1263,13 +1278,29 @@ pub async fn send_message_stream(
     let trigger = req.trigger_type.as_deref().unwrap_or("user").to_string();
     let parent_trace = req.parent_trace_id.clone();
     let model_override = req.model_override.clone();
+
+    // Parse optional session routing target
+    let session_override = match &req.session_id {
+        Some(s) => match s.parse::<uuid::Uuid>() {
+            Ok(uuid) => Some(openfang_types::agent::SessionId(uuid)),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid session_id (expected UUID)"})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
     // Scope task-locals so the kernel's streaming path can capture them before spawn
     let stream_result = openfang_runtime::tool_runner::TRIGGER_TYPE.scope(Some(trigger),
         openfang_runtime::tool_runner::PARENT_TRACE_ID.scope(parent_trace,
             openfang_runtime::tool_runner::MODEL_OVERRIDE.scope(model_override, async {
                 state
                     .kernel
-                    .send_message_streaming_with_media(agent_id, &message, Some(kernel_handle), media_blocks)
+                    .send_message_streaming_with_media(agent_id, &message, Some(kernel_handle), media_blocks, session_override)
             }),
         ),
     ).await;

@@ -371,12 +371,22 @@ pub enum AgentClass {
     Roleplay,
     /// Stateless orchestrator backed by its on-disk template (e.g. world-engine).
     Orchestrator,
+    /// Headless agent: no workspace, no identity files, no persona assembly.
+    /// System prompt comes solely from agent.toml + ephemeral_system from pre-turn hook.
+    /// Use for NPC agents or other lightweight agents that don't need the persona framework.
+    Headless,
 }
 
 impl AgentClass {
     /// Whether this class requires an on-disk template and should be reconciled on startup.
     pub fn is_template_backed(self) -> bool {
         matches!(self, AgentClass::Roleplay | AgentClass::Orchestrator)
+    }
+
+    /// Whether this class should skip all persona assembly (identity files, tools listing,
+    /// safety guidelines, workspace context, world lore, owner info).
+    pub fn is_headless(self) -> bool {
+        matches!(self, AgentClass::Headless)
     }
 }
 

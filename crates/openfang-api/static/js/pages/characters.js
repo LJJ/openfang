@@ -115,10 +115,6 @@ function charactersPage() {
       return '#ef4444';
     },
 
-    getMood(c) {
-      return (c.life_state && c.life_state.mood) || (c.world_state && c.world_state.mood) || '-';
-    },
-
     getLocation(c) {
       return (c.world_state && c.world_state.location) || (c.life_state && c.life_state.location) || '-';
     },

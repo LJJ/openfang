@@ -1034,7 +1034,7 @@ fn selfie_context_guard_message(
     }
 
     Some(format!(
-        "Selfie context guard: before {}, call {} in this turn. Time, location, current activity, and mood must come from get_life_status; appearance must come from current outfit/avatar; only the shot intent may be expanded from chat history. Do not invent a scene or guess morning vs evening from the user's wording.",
+        "Selfie context guard: before {}, call {} in this turn. Time, location, and current activity must come from get_life_status; appearance must come from current outfit/avatar; only the shot intent may be expanded from chat history. Do not invent a scene or guess morning vs evening from the user's wording.",
         tool_call.name,
         missing.join(", ")
     ))

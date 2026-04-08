@@ -71,7 +71,26 @@ impl LlmDriver for FallbackDriver {
             }
 
             match entry.driver.complete(request_for_driver).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    // Treat empty responses (no text, no tool calls, zero output tokens)
+                    // as driver failures — the API accepted the request but produced nothing.
+                    if response.text().trim().is_empty()
+                        && response.tool_calls.is_empty()
+                        && response.usage.output_tokens == 0
+                    {
+                        warn!(
+                            driver_index = i,
+                            "Fallback driver returned empty response, trying next"
+                        );
+                        last_error = Some(LlmError::Api {
+                            status: 0,
+                            message: "Empty response from LLM (no text, no tools, zero tokens)"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    return Ok(response);
+                }
                 Err(e @ LlmError::RateLimited { .. }) | Err(e @ LlmError::Overloaded { .. }) => {
                     // Retryable errors — bubble up for the retry loop to handle
                     return Err(e);
@@ -110,7 +129,24 @@ impl LlmDriver for FallbackDriver {
             }
 
             match entry.driver.stream(request_for_driver, tx.clone()).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if response.text().trim().is_empty()
+                        && response.tool_calls.is_empty()
+                        && response.usage.output_tokens == 0
+                    {
+                        warn!(
+                            driver_index = i,
+                            "Fallback driver (stream) returned empty response, trying next"
+                        );
+                        last_error = Some(LlmError::Api {
+                            status: 0,
+                            message: "Empty response from LLM (no text, no tools, zero tokens)"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    return Ok(response);
+                }
                 Err(e @ LlmError::RateLimited { .. }) | Err(e @ LlmError::Overloaded { .. }) => {
                     return Err(e);
                 }

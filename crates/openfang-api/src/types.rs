@@ -46,6 +46,11 @@ pub struct MessageRequest {
     /// Override the LLM model for this request (e.g. cascade uses lighter model when owner absent).
     #[serde(default)]
     pub model_override: Option<String>,
+    /// Route this message to a specific session instead of the agent's active session.
+    /// The session must already exist (created via POST /api/agents/:id/sessions).
+    /// If omitted, the agent's current active session is used.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Response from sending a message.

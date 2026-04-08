@@ -1446,7 +1446,7 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
     ) -> KernelResult<AgentLoopResult> {
-        self.send_message_with_handle_and_media(agent_id, message, kernel_handle, vec![])
+        self.send_message_with_handle_and_media(agent_id, message, kernel_handle, vec![], None)
             .await
     }
 
@@ -1458,6 +1458,7 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         media_blocks: Vec<openfang_types::message::ContentBlock>,
+        session_override: Option<SessionId>,
     ) -> KernelResult<AgentLoopResult> {
         // Per-agent serialization: acquire lock so only one message is processed
         // at a time per agent. This prevents concurrent pre-turn/post-turn hooks
@@ -1486,7 +1487,7 @@ impl OpenFangKernel {
             self.execute_python_agent(&entry, agent_id, message).await
         } else {
             // Default: LLM agent loop (builtin:chat or any unrecognized module)
-            self.execute_llm_agent(&entry, agent_id, message, kernel_handle, media_blocks)
+            self.execute_llm_agent(&entry, agent_id, message, kernel_handle, media_blocks, session_override)
                 .await
         };
 
@@ -1545,7 +1546,7 @@ impl OpenFangKernel {
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
     )> {
-        self.send_message_streaming_with_media(agent_id, message, kernel_handle, vec![])
+        self.send_message_streaming_with_media(agent_id, message, kernel_handle, vec![], None)
     }
 
     /// Send a message to an agent with streaming responses and optional inline
@@ -1556,6 +1557,7 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         media_blocks: Vec<openfang_types::message::ContentBlock>,
+        session_override: Option<SessionId>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -1624,14 +1626,15 @@ impl OpenFangKernel {
         }
 
         // LLM agent: true streaming via agent loop
+        let effective_session_id = session_override.unwrap_or(entry.session_id);
         let stateless_session = stateless_orchestrator(&entry.manifest);
         let mut session = if stateless_session {
-            fresh_agent_session(agent_id, entry.session_id)
+            fresh_agent_session(agent_id, effective_session_id)
         } else {
             self.memory
-                .get_session(entry.session_id)
+                .get_session(effective_session_id)
                 .map_err(KernelError::OpenFang)?
-                .unwrap_or_else(|| fresh_agent_session(agent_id, entry.session_id))
+                .unwrap_or_else(|| fresh_agent_session(agent_id, effective_session_id))
         };
 
         // Check if auto-compaction is needed: message-count OR token-count trigger
@@ -1694,7 +1697,8 @@ impl OpenFangKernel {
         }
 
         // Build the structured system prompt via prompt_builder
-        {
+        // Headless agents skip all persona assembly — system_prompt is used as-is
+        if !manifest.agent_class.is_headless() {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
             let shared_id = shared_memory_agent_id();
             let user_name = self
@@ -1777,7 +1781,7 @@ impl OpenFangKernel {
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
-        }
+        } // end if !headless
 
         let memory = Arc::clone(&self.memory);
         // Build link context from user message (auto-extract URLs for the agent)
@@ -2181,6 +2185,7 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         mut media_blocks: Vec<openfang_types::message::ContentBlock>,
+        session_override: Option<SessionId>,
     ) -> KernelResult<AgentLoopResult> {
         // Begin trace — trigger type and parent trace set by caller via task-local
         let trigger = openfang_runtime::tool_runner::trigger_type()
@@ -2198,14 +2203,16 @@ impl OpenFangKernel {
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
 
+        // Use caller-specified session or fall back to agent's active session.
+        let effective_session_id = session_override.unwrap_or(entry.session_id);
         let stateless_session = stateless_orchestrator(&entry.manifest);
         let mut session = if stateless_session {
-            fresh_agent_session(agent_id, entry.session_id)
+            fresh_agent_session(agent_id, effective_session_id)
         } else {
             self.memory
-                .get_session(entry.session_id)
+                .get_session(effective_session_id)
                 .map_err(KernelError::OpenFang)?
-                .unwrap_or_else(|| fresh_agent_session(agent_id, entry.session_id))
+                .unwrap_or_else(|| fresh_agent_session(agent_id, effective_session_id))
         };
 
         let messages_before = session.messages.len();
@@ -2216,6 +2223,8 @@ impl OpenFangKernel {
         info!(
             agent = %entry.name,
             agent_id = %agent_id,
+            session_id = %effective_session_id,
+            session_override = session_override.is_some(),
             tool_count = tools.len(),
             tool_names = ?tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             "Tools selected for LLM request"
@@ -2243,7 +2252,8 @@ impl OpenFangKernel {
         }
 
         // Build the structured system prompt via prompt_builder
-        {
+        // Headless agents skip all persona assembly — system_prompt is used as-is
+        if !manifest.agent_class.is_headless() {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
             let shared_id = shared_memory_agent_id();
             let user_name = self
@@ -2338,7 +2348,7 @@ impl OpenFangKernel {
 
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
-        }
+        } // end if !headless
 
         let is_stable = self.config.mode == openfang_types::config::KernelMode::Stable;
 
