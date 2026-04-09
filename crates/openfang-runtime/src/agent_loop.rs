@@ -1550,7 +1550,10 @@ pub async fn run_agent_loop(
 
         // Record LLM span in trace (full input/output)
         // Use the actual model from the API response (captures fallback), fall back to requested model
-        let actual_model = response.model.as_deref().unwrap_or(&llm_model_name);
+        // Note: some proxies return an empty string for model, treat that as missing
+        let actual_model = response.model.as_deref()
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&llm_model_name);
         if actual_model != llm_model_name {
             tracing::info!(
                 requested = %llm_model_name,
@@ -2785,7 +2788,10 @@ pub async fn run_agent_loop_streaming(
 
         // Record LLM span in trace (full input/output)
         // Use the actual model from the API response (captures fallback), fall back to requested model
-        let actual_model = response.model.as_deref().unwrap_or(&llm_model_name);
+        // Note: some proxies return an empty string for model, treat that as missing
+        let actual_model = response.model.as_deref()
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&llm_model_name);
         if actual_model != llm_model_name {
             tracing::info!(
                 requested = %llm_model_name,
