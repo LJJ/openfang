@@ -1776,12 +1776,29 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
-                prompt_suffix: load_prompt_suffix_dir(&self.config.home_dir),
+                // Roleplay agents: defer prompt_suffix to after mode injection
+                prompt_suffix: if manifest.agent_class == AgentClass::Roleplay {
+                    None
+                } else {
+                    load_prompt_suffix_dir(&self.config.home_dir)
+                },
                 is_roleplay: manifest.agent_class == AgentClass::Roleplay,
+                session_compact_summary: None, // injected by agent_loop after ephemeral system
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
         } // end if !headless
+
+        // Capture deferred prompt_suffix for roleplay agents — passed to manifest
+        // metadata so agent_loop can inject it after mode.
+        if manifest.agent_class == AgentClass::Roleplay {
+            if let Some(suffix) = load_prompt_suffix_dir(&self.config.home_dir) {
+                manifest.metadata.insert(
+                    "deferred_prompt_suffix".to_string(),
+                    serde_json::Value::String(suffix),
+                );
+            }
+        }
 
         let memory = Arc::clone(&self.memory);
         // Build link context from user message (auto-extract URLs for the agent)
@@ -2331,20 +2348,15 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
-                prompt_suffix: load_prompt_suffix_dir(&self.config.home_dir),
+                // Roleplay agents: defer prompt_suffix to after mode injection
+                prompt_suffix: if manifest.agent_class == AgentClass::Roleplay {
+                    None
+                } else {
+                    load_prompt_suffix_dir(&self.config.home_dir)
+                },
                 is_roleplay: manifest.agent_class == AgentClass::Roleplay,
+                session_compact_summary: None, // injected by agent_loop after ephemeral system
             };
-            // Inject mode prompt into base_system_prompt so it appears right after
-            // agent.toml content but BEFORE SOUL.md, skills, and other identity files.
-            if manifest.agent_class == AgentClass::Roleplay {
-                let mode = current_interaction_mode(&self.config, &manifest.name);
-                let mode_prompt =
-                    load_roleplay_mode_prompt(&self.config, &manifest.name, &mode);
-                if !mode_prompt.is_empty() {
-                    prompt_ctx.base_system_prompt =
-                        format!("{}\n\n{}", prompt_ctx.base_system_prompt, mode_prompt);
-                }
-            }
 
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2445,6 +2457,7 @@ impl OpenFangKernel {
         let mut skip_llm = false;
         let mut ephemeral_ctx: Option<String> = None;
         let mut ephemeral_sys: Option<String> = None;
+        let mut hook_interaction_mode: Option<String> = None;
         let pre_hook_start = std::time::Instant::now();
         let message_with_links = if let Some(ref hook) = manifest.pre_turn {
             if let Some(ref tool_name) = hook.tool {
@@ -2515,6 +2528,10 @@ impl OpenFangKernel {
                                     );
                                 }
                             }
+                            // Extract interaction_mode for post-hook mode prompt injection
+                            if let Some(im) = parsed.get("interaction_mode").and_then(|v| v.as_str()) {
+                                hook_interaction_mode = Some(im.to_string());
+                            }
                             parsed.get("message")
                                 .and_then(|v| v.as_str())
                                 .map(String::from)
@@ -2553,6 +2570,26 @@ impl OpenFangKernel {
                     None, None, "{}".to_string(), None, None,
                 ),
             );
+        }
+
+        // ── Post-hook mode prompt + deferred prompt_suffix injection ──
+        // For roleplay agents: mode first, then nsfw/content rules (prompt_suffix).
+        // This ensures mode context is closer to the identity sections than the
+        // reference-style content rules.
+        if manifest.agent_class == AgentClass::Roleplay {
+            let mode = hook_interaction_mode.as_deref().unwrap_or("remote");
+            let mode_prompt = load_roleplay_mode_prompt(&self.config, &manifest.name, mode);
+            if !mode_prompt.is_empty() {
+                manifest.model.system_prompt =
+                    format!("{}\n\n{}", manifest.model.system_prompt, mode_prompt);
+            }
+            // Append prompt_suffix (system-prompt.d/) AFTER mode
+            if let Some(suffix) = load_prompt_suffix_dir(&self.config.home_dir) {
+                if !suffix.trim().is_empty() {
+                    manifest.model.system_prompt =
+                        format!("{}\n\n{}", manifest.model.system_prompt, suffix);
+                }
+            }
         }
 
         // ── LLM 调用（skip_llm 时跳过）──
@@ -2782,6 +2819,9 @@ impl OpenFangKernel {
 
         // Delete the old session
         let _ = self.memory.delete_session(entry.session_id);
+
+        // Clear session compact state (rolling conversation summary)
+        let _ = self.memory.clear_session_compact(agent_id);
 
         // Create a fresh session
         let new_session = self
@@ -3177,8 +3217,14 @@ impl OpenFangKernel {
             ));
         }
 
-        let driver = self.resolve_driver(&entry.manifest)?;
-        let model = entry.manifest.model.model.clone();
+        // Compact model: prefer llm_routing.json "compact" slot, fallback to agent's primary
+        let (driver, model) = match self.resolve_compact_driver() {
+            Some((d, m)) => {
+                info!(agent_id = %agent_id, compact_model = %m, "Using dedicated compact model from llm_routing.json");
+                (d, m)
+            }
+            None => (self.resolve_driver(&entry.manifest)?, entry.manifest.model.model.clone()),
+        };
 
         let result = compact_session(driver, &model, &session, &config)
             .await
@@ -4626,11 +4672,16 @@ impl OpenFangKernel {
             let driver_config = DriverConfig {
                 provider: agent_provider.clone(),
                 api_key: std::env::var(&api_key_env).ok(),
-                base_url: manifest
-                    .model
-                    .base_url
-                    .clone()
-                    .or_else(|| self.config.default_model.base_url.clone()),
+                // Only inherit default_model's base_url when provider matches.
+                // Cross-provider inheritance (e.g. OpenAI URL → Gemini driver) causes
+                // URL format mismatches (OpenAI /v1 prefix vs Gemini /v1beta path).
+                base_url: manifest.model.base_url.clone().or_else(|| {
+                    if agent_provider == default_provider {
+                        self.config.default_model.base_url.clone()
+                    } else {
+                        None
+                    }
+                }),
             };
 
             drivers::create_driver(&driver_config).map_err(|e| {
@@ -4665,6 +4716,70 @@ impl OpenFangKernel {
         }
 
         Ok(primary)
+    }
+
+    /// Read the "compact" slot from llm_routing.json and create a dedicated driver.
+    /// Returns None if compact slot is not configured or driver creation fails.
+    fn resolve_compact_driver(&self) -> Option<(Arc<dyn LlmDriver>, String)> {
+        let routing_path = self.config.home_dir.join("llm_routing.json");
+        let content = std::fs::read_to_string(&routing_path).ok()?;
+        let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let model_id = config
+            .get("slots")?
+            .get("compact")?
+            .get("primary")?
+            .as_str()?
+            .to_string();
+
+        if model_id.is_empty() {
+            return None;
+        }
+
+        // Resolve provider from model catalog
+        let provider = self
+            .model_catalog
+            .read()
+            .ok()?
+            .find_model(&model_id)
+            .map(|e| e.provider.clone())
+            .unwrap_or_else(|| {
+                // Fallback: guess provider from model name prefix
+                if model_id.starts_with("deepseek") {
+                    "deepseek".to_string()
+                } else if model_id.starts_with("MiniMax") || model_id.starts_with("M2") {
+                    "minimax".to_string()
+                } else if model_id.starts_with("gpt-") {
+                    "azure".to_string()
+                } else {
+                    "openai".to_string()
+                }
+            });
+
+        // Resolve API key and base URL from provider catalog
+        let catalog = self.model_catalog.read().ok()?;
+        let provider_info = catalog.get_provider(&provider);
+        let api_key_env = provider_info
+            .map(|p| p.api_key_env.clone())
+            .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+        let base_url = provider_info.and_then(|p| {
+            let url = &p.base_url;
+            if url.is_empty() { None } else { Some(url.clone()) }
+        });
+        drop(catalog);
+
+        let driver_config = DriverConfig {
+            provider,
+            api_key: std::env::var(&api_key_env).ok(),
+            base_url,
+        };
+
+        match drivers::create_driver(&driver_config) {
+            Ok(d) => Some((d, model_id)),
+            Err(e) => {
+                warn!(compact_model = %model_id, "Failed to create compact driver: {e}");
+                None
+            }
+        }
     }
 
     /// Connect to all configured MCP servers and cache their tool definitions.

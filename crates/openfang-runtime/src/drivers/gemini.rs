@@ -24,6 +24,11 @@ pub struct GeminiDriver {
     api_key: Zeroizing<String>,
     base_url: String,
     client: reqwest::Client,
+    /// Cache of tool_call_id → thoughtSignature for Gemini 3.1+ multi-turn tool use.
+    /// Gemini requires thoughtSignature to be echoed back in the functionCall part
+    /// when sending conversation history. Stored here so it stays Gemini-internal
+    /// and doesn't leak into OpenFang's generic ContentBlock types.
+    thought_signatures: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl GeminiDriver {
@@ -37,6 +42,7 @@ impl GeminiDriver {
                 .timeout(std::time::Duration::from_secs(180))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            thought_signatures: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -65,7 +71,11 @@ struct GeminiContent {
 }
 
 /// A part within a content entry.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// Gemini parts can contain extra fields (`thoughtSignature`, `id`, etc.)
+/// that break `#[serde(untagged)]` matching. We deserialize as raw JSON
+/// first, then manually match on known keys.
+#[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 enum GeminiPart {
     Text {
@@ -78,11 +88,60 @@ enum GeminiPart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCallData,
+        /// Gemini 3.1+ requires thought_signature to be echoed back on multi-turn tool use.
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
         function_response: GeminiFunctionResponseData,
     },
+}
+
+impl<'de> serde::Deserialize<'de> for GeminiPart {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("expected object for GeminiPart"))?;
+
+        if let Some(text) = obj.get("text") {
+            return Ok(GeminiPart::Text {
+                text: text.as_str().unwrap_or_default().to_string(),
+            });
+        }
+        if let Some(fc) = obj.get("functionCall") {
+            let function_call: GeminiFunctionCallData =
+                serde_json::from_value(fc.clone()).map_err(serde::de::Error::custom)?;
+            let thought_signature = obj
+                .get("thoughtSignature")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            return Ok(GeminiPart::FunctionCall {
+                function_call,
+                thought_signature,
+            });
+        }
+        if let Some(fr) = obj.get("functionResponse") {
+            let function_response: GeminiFunctionResponseData =
+                serde_json::from_value(fr.clone()).map_err(serde::de::Error::custom)?;
+            return Ok(GeminiPart::FunctionResponse { function_response });
+        }
+        if let Some(id) = obj.get("inlineData") {
+            let inline_data: GeminiInlineData =
+                serde_json::from_value(id.clone()).map_err(serde::de::Error::custom)?;
+            return Ok(GeminiPart::InlineData { inline_data });
+        }
+
+        // Unknown part type — treat as empty text to avoid breaking the parse
+        warn!("Unknown GeminiPart keys: {:?}", obj.keys().collect::<Vec<_>>());
+        Ok(GeminiPart::Text {
+            text: String::new(),
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -175,11 +234,26 @@ struct GeminiErrorDetail {
 fn convert_messages(
     messages: &[Message],
     system: &Option<String>,
+    thought_sigs: &std::collections::HashMap<String, String>,
 ) -> (Vec<GeminiContent>, Option<GeminiContent>) {
     let mut contents = Vec::new();
 
     // Build system instruction
     let system_instruction = extract_system(messages, system);
+
+    // Build tool_use_id → name mapping so ToolResult can carry the correct name.
+    // Gemini requires functionResponse.name to match the original functionCall.name.
+    let mut tool_id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for msg in messages {
+        if let MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    tool_id_to_name.insert(id.clone(), name.clone());
+                }
+            }
+        }
+    }
 
     for msg in messages {
         if msg.role == Role::System {
@@ -201,12 +275,13 @@ fn convert_messages(
                         ContentBlock::Text { text } => {
                             parts.push(GeminiPart::Text { text: text.clone() });
                         }
-                        ContentBlock::ToolUse { name, input, .. } => {
+                        ContentBlock::ToolUse { id, name, input } => {
                             parts.push(GeminiPart::FunctionCall {
                                 function_call: GeminiFunctionCallData {
                                     name: name.clone(),
                                     args: input.clone(),
                                 },
+                                thought_signature: thought_sigs.get(id).cloned(),
                             });
                         }
                         ContentBlock::Image { media_type, data } => {
@@ -217,10 +292,24 @@ fn convert_messages(
                                 },
                             });
                         }
-                        ContentBlock::ToolResult { content, .. } => {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            let name = tool_id_to_name
+                                .get(tool_use_id)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    warn!(
+                                        tool_use_id,
+                                        "ToolResult has no matching ToolUse for name lookup"
+                                    );
+                                    "unknown_tool".to_string()
+                                });
                             parts.push(GeminiPart::FunctionResponse {
                                 function_response: GeminiFunctionResponseData {
-                                    name: String::new(),
+                                    name,
                                     response: serde_json::json!({ "result": content }),
                                 },
                             });
@@ -292,7 +381,11 @@ fn convert_tools(request: &CompletionRequest) -> Vec<GeminiToolConfig> {
 }
 
 /// Convert a Gemini response into our CompletionResponse.
-fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError> {
+/// Returns (response, thought_signatures) where thought_signatures is a vec of
+/// (tool_call_id, signature) pairs to cache in the driver.
+fn convert_response(
+    resp: GeminiResponse,
+) -> Result<(CompletionResponse, Vec<(String, String)>), LlmError> {
     let candidate = resp
         .candidates
         .into_iter()
@@ -300,6 +393,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         .ok_or_else(|| LlmError::Parse("No candidates in Gemini response".to_string()))?;
 
     let mut content = Vec::new();
+    let mut pending_thought_sigs: Vec<(String, String)> = Vec::new();
     let mut tool_calls = Vec::new();
 
     if let Some(gemini_content) = candidate.content {
@@ -310,8 +404,16 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
                         content.push(ContentBlock::Text { text });
                     }
                 }
-                GeminiPart::FunctionCall { function_call } => {
+                GeminiPart::FunctionCall {
+                    function_call,
+                    thought_signature,
+                } => {
                     let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    // Store thought_signature for later retrieval during convert_messages.
+                    // This is set on the CompletionResponse and cached by the driver.
+                    if let Some(ts) = thought_signature {
+                        pending_thought_sigs.push((id.clone(), ts));
+                    }
                     content.push(ContentBlock::ToolUse {
                         id: id.clone(),
                         name: function_call.name.clone(),
@@ -349,13 +451,16 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         })
         .unwrap_or_default();
 
-    Ok(CompletionResponse {
-        content,
-        stop_reason,
-        tool_calls,
-        usage,
-        model: None,
-    })
+    Ok((
+        CompletionResponse {
+            content,
+            stop_reason,
+            tool_calls,
+            usage,
+            model: None,
+        },
+        pending_thought_sigs,
+    ))
 }
 
 // ── LlmDriver implementation ──────────────────────────────────────────
@@ -363,7 +468,9 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
 #[async_trait]
 impl LlmDriver for GeminiDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let (contents, system_instruction) = convert_messages(&request.messages, &request.system);
+        let cached_sigs = self.thought_signatures.lock().unwrap().clone();
+        let (contents, system_instruction) =
+            convert_messages(&request.messages, &request.system, &cached_sigs);
         let tools = convert_tools(&request);
 
         let gemini_request = GeminiRequest {
@@ -376,66 +483,61 @@ impl LlmDriver for GeminiDriver {
             }),
         };
 
-        let max_retries = 3;
-        for attempt in 0..=max_retries {
-            let url = format!(
-                "{}/v1beta/models/{}:generateContent",
-                self.base_url, request.model
-            );
-            debug!(url = %url, attempt, "Sending Gemini API request");
+        let url = format!(
+            "{}/v1beta/models/{}:generateContent",
+            self.base_url, request.model
+        );
+        debug!(url = %url, "Sending Gemini API request");
 
-            let resp = self
-                .client
-                .post(&url)
-                .header("x-goog-api-key", self.api_key.as_str())
-                .header("content-type", "application/json")
-                .json(&gemini_request)
-                .send()
-                .await
-                .map_err(|e| LlmError::Http(e.to_string()))?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", self.api_key.as_str())
+            .header("content-type", "application/json")
+            .json(&gemini_request)
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
 
-            let status = resp.status().as_u16();
+        let status = resp.status().as_u16();
 
-            if status == 429 || status == 503 {
-                if attempt < max_retries {
-                    let retry_ms = (attempt + 1) as u64 * 2000;
-                    warn!(status, retry_ms, "Rate limited/overloaded, retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
-                    continue;
+        if status == 429 || status == 503 {
+            warn!(status, "Rate limited/overloaded");
+            return Err(if status == 429 {
+                LlmError::RateLimited {
+                    retry_after_ms: 5000,
                 }
-                return Err(if status == 429 {
-                    LlmError::RateLimited {
-                        retry_after_ms: 5000,
-                    }
-                } else {
-                    LlmError::Overloaded {
-                        retry_after_ms: 5000,
-                    }
-                });
-            }
-
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                let message = serde_json::from_str::<GeminiErrorResponse>(&body)
-                    .map(|e| e.error.message)
-                    .unwrap_or(body);
-                return Err(LlmError::Api { status, message });
-            }
-
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| LlmError::Http(e.to_string()))?;
-            let gemini_response: GeminiResponse =
-                serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))?;
-
-            return convert_response(gemini_response);
+            } else {
+                LlmError::Overloaded {
+                    retry_after_ms: 5000,
+                }
+            });
         }
 
-        Err(LlmError::Api {
-            status: 0,
-            message: "Max retries exceeded".to_string(),
-        })
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let message = serde_json::from_str::<GeminiErrorResponse>(&body)
+                .map(|e| e.error.message)
+                .unwrap_or(body);
+            return Err(LlmError::Api { status, message });
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+        let gemini_response: GeminiResponse =
+            serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))?;
+
+        let (response, new_sigs) = convert_response(gemini_response)?;
+        // Cache thought_signatures for subsequent multi-turn calls
+        if !new_sigs.is_empty() {
+            let mut cache = self.thought_signatures.lock().unwrap();
+            for (id, sig) in new_sigs {
+                cache.insert(id, sig);
+            }
+        }
+        Ok(response)
     }
 
     async fn stream(
@@ -443,7 +545,9 @@ impl LlmDriver for GeminiDriver {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<CompletionResponse, LlmError> {
-        let (contents, system_instruction) = convert_messages(&request.messages, &request.system);
+        let cached_sigs = self.thought_signatures.lock().unwrap().clone();
+        let (contents, system_instruction) =
+            convert_messages(&request.messages, &request.system, &cached_sigs);
         let tools = convert_tools(&request);
 
         let gemini_request = GeminiRequest {
@@ -456,195 +560,179 @@ impl LlmDriver for GeminiDriver {
             }),
         };
 
-        let max_retries = 3;
-        for attempt in 0..=max_retries {
-            let url = format!(
-                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
-                self.base_url, request.model
-            );
-            debug!(url = %url, attempt, "Sending Gemini streaming request");
+        let url = format!(
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, request.model
+        );
+        debug!(url = %url, "Sending Gemini streaming request");
 
-            let resp = self
-                .client
-                .post(&url)
-                .header("x-goog-api-key", self.api_key.as_str())
-                .header("content-type", "application/json")
-                .json(&gemini_request)
-                .send()
-                .await
-                .map_err(|e| LlmError::Http(e.to_string()))?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", self.api_key.as_str())
+            .header("content-type", "application/json")
+            .json(&gemini_request)
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
 
-            let status = resp.status().as_u16();
+        let status = resp.status().as_u16();
 
-            if status == 429 || status == 503 {
-                if attempt < max_retries {
-                    let retry_ms = (attempt + 1) as u64 * 2000;
-                    warn!(
-                        status,
-                        retry_ms, "Rate limited/overloaded (stream), retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
+        if status == 429 || status == 503 {
+            warn!(status, "Rate limited/overloaded (stream)");
+            return Err(if status == 429 {
+                LlmError::RateLimited {
+                    retry_after_ms: 5000,
+                }
+            } else {
+                LlmError::Overloaded {
+                    retry_after_ms: 5000,
+                }
+            });
+        }
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let message = serde_json::from_str::<GeminiErrorResponse>(&body)
+                .map(|e| e.error.message)
+                .unwrap_or(body);
+            return Err(LlmError::Api { status, message });
+        }
+
+        // Parse SSE stream
+        let mut buffer = String::new();
+        let mut text_content = String::new();
+        // Track function calls: (name, args_json)
+        let mut fn_calls: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut usage = TokenUsage::default();
+
+        let mut byte_stream = resp.bytes_stream();
+        while let Some(chunk_result) = byte_stream.next().await {
+            let chunk = chunk_result.map_err(|e| LlmError::Http(e.to_string()))?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete SSE events (delimited by \n\n or \r\n\r\n)
+            while let Some(pos) = buffer.find("\n\n") {
+                let event_text = buffer[..pos].to_string();
+                buffer = buffer[pos + 2..].to_string();
+
+                // Extract the data line
+                let data = event_text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap_or("");
+
+                if data.is_empty() {
                     continue;
                 }
-                return Err(if status == 429 {
-                    LlmError::RateLimited {
-                        retry_after_ms: 5000,
-                    }
-                } else {
-                    LlmError::Overloaded {
-                        retry_after_ms: 5000,
-                    }
-                });
-            }
 
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                let message = serde_json::from_str::<GeminiErrorResponse>(&body)
-                    .map(|e| e.error.message)
-                    .unwrap_or(body);
-                return Err(LlmError::Api { status, message });
-            }
+                let json: GeminiResponse = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
 
-            // Parse SSE stream
-            let mut buffer = String::new();
-            let mut text_content = String::new();
-            // Track function calls: (name, args_json)
-            let mut fn_calls: Vec<(String, serde_json::Value)> = Vec::new();
-            let mut finish_reason: Option<String> = None;
-            let mut usage = TokenUsage::default();
+                // Extract usage from each chunk (last one wins)
+                if let Some(ref u) = json.usage_metadata {
+                    usage.input_tokens = u.prompt_token_count;
+                    usage.output_tokens = u.candidates_token_count;
+                }
 
-            let mut byte_stream = resp.bytes_stream();
-            while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(|e| LlmError::Http(e.to_string()))?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // Process complete SSE events (delimited by \n\n or \r\n\r\n)
-                while let Some(pos) = buffer.find("\n\n") {
-                    let event_text = buffer[..pos].to_string();
-                    buffer = buffer[pos + 2..].to_string();
-
-                    // Extract the data line
-                    let data = event_text
-                        .lines()
-                        .find_map(|line| line.strip_prefix("data: "))
-                        .unwrap_or("");
-
-                    if data.is_empty() {
-                        continue;
+                for candidate in &json.candidates {
+                    if let Some(fr) = &candidate.finish_reason {
+                        finish_reason = Some(fr.clone());
                     }
 
-                    let json: GeminiResponse = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    // Extract usage from each chunk (last one wins)
-                    if let Some(ref u) = json.usage_metadata {
-                        usage.input_tokens = u.prompt_token_count;
-                        usage.output_tokens = u.candidates_token_count;
-                    }
-
-                    for candidate in &json.candidates {
-                        if let Some(fr) = &candidate.finish_reason {
-                            finish_reason = Some(fr.clone());
-                        }
-
-                        if let Some(ref content) = candidate.content {
-                            for part in &content.parts {
-                                match part {
-                                    GeminiPart::Text { text } => {
-                                        if !text.is_empty() {
-                                            text_content.push_str(text);
-                                            let _ = tx
-                                                .send(StreamEvent::TextDelta { text: text.clone() })
-                                                .await;
-                                        }
+                    if let Some(ref content) = candidate.content {
+                        for part in &content.parts {
+                            match part {
+                                GeminiPart::Text { text } => {
+                                    if !text.is_empty() {
+                                        text_content.push_str(text);
+                                        let _ = tx
+                                            .send(StreamEvent::TextDelta { text: text.clone() })
+                                            .await;
                                     }
-                                    GeminiPart::FunctionCall { function_call } => {
-                                        let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-                                        let _ = tx
-                                            .send(StreamEvent::ToolUseStart {
-                                                id: id.clone(),
-                                                name: function_call.name.clone(),
-                                            })
-                                            .await;
-                                        let args_str = serde_json::to_string(&function_call.args)
-                                            .unwrap_or_default();
-                                        let _ = tx
-                                            .send(StreamEvent::ToolInputDelta { text: args_str })
-                                            .await;
-                                        let _ = tx
-                                            .send(StreamEvent::ToolUseEnd {
-                                                id,
-                                                name: function_call.name.clone(),
-                                                input: function_call.args.clone(),
-                                            })
-                                            .await;
-                                        fn_calls.push((
-                                            function_call.name.clone(),
-                                            function_call.args.clone(),
-                                        ));
-                                    }
-                                    GeminiPart::InlineData { .. }
-                                    | GeminiPart::FunctionResponse { .. } => {}
                                 }
+                                GeminiPart::FunctionCall { function_call, .. } => {
+                                    let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                                    let _ = tx
+                                        .send(StreamEvent::ToolUseStart {
+                                            id: id.clone(),
+                                            name: function_call.name.clone(),
+                                        })
+                                        .await;
+                                    let args_str = serde_json::to_string(&function_call.args)
+                                        .unwrap_or_default();
+                                    let _ = tx
+                                        .send(StreamEvent::ToolInputDelta { text: args_str })
+                                        .await;
+                                    let _ = tx
+                                        .send(StreamEvent::ToolUseEnd {
+                                            id,
+                                            name: function_call.name.clone(),
+                                            input: function_call.args.clone(),
+                                        })
+                                        .await;
+                                    fn_calls.push((
+                                        function_call.name.clone(),
+                                        function_call.args.clone(),
+                                    ));
+                                }
+                                GeminiPart::InlineData { .. }
+                                | GeminiPart::FunctionResponse { .. } => {}
                             }
                         }
                     }
                 }
             }
+        }
 
-            // Build final response
-            let mut content = Vec::new();
-            let mut tool_calls = Vec::new();
+        // Build final response
+        let mut content = Vec::new();
+        let mut tool_calls = Vec::new();
 
-            if !text_content.is_empty() {
-                content.push(ContentBlock::Text { text: text_content });
-            }
+        if !text_content.is_empty() {
+            content.push(ContentBlock::Text { text: text_content });
+        }
 
-            for (name, args) in fn_calls {
-                let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-                content.push(ContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: args.clone(),
-                });
-                tool_calls.push(ToolCall {
-                    id,
-                    name,
-                    input: args,
-                });
-            }
-
-            let stop_reason = match finish_reason.as_deref() {
-                Some("STOP") => StopReason::EndTurn,
-                Some("MAX_TOKENS") => StopReason::MaxTokens,
-                Some("SAFETY") => StopReason::EndTurn,
-                _ => {
-                    if !tool_calls.is_empty() {
-                        StopReason::ToolUse
-                    } else {
-                        StopReason::EndTurn
-                    }
-                }
-            };
-
-            let _ = tx
-                .send(StreamEvent::ContentComplete { stop_reason, usage })
-                .await;
-
-            return Ok(CompletionResponse {
-                content,
-                stop_reason,
-                tool_calls,
-                usage,
-                model: None,
+        for (name, args) in fn_calls {
+            let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+            content.push(ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: args.clone(),
+            });
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                input: args,
             });
         }
 
-        Err(LlmError::Api {
-            status: 0,
-            message: "Max retries exceeded".to_string(),
+        let stop_reason = match finish_reason.as_deref() {
+            Some("STOP") => StopReason::EndTurn,
+            Some("MAX_TOKENS") => StopReason::MaxTokens,
+            Some("SAFETY") => StopReason::EndTurn,
+            _ => {
+                if !tool_calls.is_empty() {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                }
+            }
+        };
+
+        let _ = tx
+            .send(StreamEvent::ContentComplete { stop_reason, usage })
+            .await;
+
+        Ok(CompletionResponse {
+            content,
+            stop_reason,
+            tool_calls,
+            usage,
+            model: None,
         })
     }
 }
@@ -748,7 +836,7 @@ mod tests {
         });
 
         let resp: GeminiResponse = serde_json::from_value(json).unwrap();
-        let completion = convert_response(resp).unwrap();
+        let (completion, _) = convert_response(resp).unwrap();
         assert_eq!(completion.tool_calls.len(), 1);
         assert_eq!(completion.tool_calls[0].name, "web_search");
         assert_eq!(
@@ -762,7 +850,8 @@ mod tests {
     fn test_convert_messages_with_system() {
         let messages = vec![Message::user("Hello")];
         let system = Some("Be helpful.".to_string());
-        let (contents, sys_instruction) = convert_messages(&messages, &system);
+        let (contents, sys_instruction) =
+            convert_messages(&messages, &system, &std::collections::HashMap::new());
 
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].role.as_deref(), Some("user"));
@@ -778,7 +867,8 @@ mod tests {
     #[test]
     fn test_convert_messages_assistant_role() {
         let messages = vec![Message::user("Hello"), Message::assistant("Hi there!")];
-        let (contents, _) = convert_messages(&messages, &None);
+        let (contents, _) =
+            convert_messages(&messages, &None, &std::collections::HashMap::new());
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0].role.as_deref(), Some("user"));
         assert_eq!(contents[1].role.as_deref(), Some("model"));
@@ -845,7 +935,7 @@ mod tests {
             }),
         };
 
-        let completion = convert_response(resp).unwrap();
+        let (completion, _) = convert_response(resp).unwrap();
         assert_eq!(completion.content.len(), 1);
         assert!(completion.tool_calls.is_empty());
         assert_eq!(completion.stop_reason, StopReason::EndTurn);
@@ -880,7 +970,7 @@ mod tests {
             usage_metadata: None,
         };
 
-        let completion = convert_response(resp).unwrap();
+        let (completion, _) = convert_response(resp).unwrap();
         assert_eq!(completion.stop_reason, StopReason::MaxTokens);
     }
 

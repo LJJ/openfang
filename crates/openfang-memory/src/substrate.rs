@@ -8,6 +8,7 @@ use crate::knowledge::KnowledgeStore;
 use crate::migration::run_migrations;
 use crate::semantic::SemanticStore;
 use crate::session::{Session, SessionStore};
+use crate::session_compact::{SessionCompactState, SessionCompactStore};
 use crate::structured::StructuredStore;
 use crate::trace_store::TraceStore;
 use crate::usage::UsageStore;
@@ -32,6 +33,7 @@ pub struct MemorySubstrate {
     semantic: SemanticStore,
     knowledge: KnowledgeStore,
     sessions: SessionStore,
+    session_compacts: SessionCompactStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
     traces: TraceStore,
@@ -52,6 +54,7 @@ impl MemorySubstrate {
             semantic: SemanticStore::new(Arc::clone(&shared)),
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
+            session_compacts: SessionCompactStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             traces: TraceStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
@@ -71,6 +74,7 @@ impl MemorySubstrate {
             semantic: SemanticStore::new(Arc::clone(&shared)),
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
+            session_compacts: SessionCompactStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             traces: TraceStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
@@ -253,6 +257,49 @@ impl MemorySubstrate {
         self.sessions
             .append_canonical(agent_id, messages, compaction_threshold)?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Session compact (rolling summaries of evicted messages)
+    // -----------------------------------------------------------------
+
+    /// Append evicted messages to the compact buffer. Returns the new buffer_count.
+    pub fn append_evicted_messages(
+        &self,
+        agent_id: AgentId,
+        messages: &[openfang_types::message::Message],
+    ) -> OpenFangResult<usize> {
+        self.session_compacts.append_evicted(agent_id, messages)
+    }
+
+    /// Store a new compact summary and clear the pending buffer.
+    pub fn store_session_compact(
+        &self,
+        agent_id: AgentId,
+        summary: &str,
+    ) -> OpenFangResult<()> {
+        self.session_compacts.store_compact_result(agent_id, summary)
+    }
+
+    /// Read the compact summary for prompt injection.
+    pub fn session_compact_summary(
+        &self,
+        agent_id: AgentId,
+    ) -> OpenFangResult<Option<String>> {
+        self.session_compacts.get_summary(agent_id)
+    }
+
+    /// Load the full compact state (for compact logic that needs buffer contents).
+    pub fn session_compact_state(
+        &self,
+        agent_id: AgentId,
+    ) -> OpenFangResult<SessionCompactState> {
+        self.session_compacts.load(agent_id)
+    }
+
+    /// Clear the compact state (used during daily session reset).
+    pub fn clear_session_compact(&self, agent_id: AgentId) -> OpenFangResult<()> {
+        self.session_compacts.clear(agent_id)
     }
 
     // -----------------------------------------------------------------

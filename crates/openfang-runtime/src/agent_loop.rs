@@ -34,12 +34,6 @@ use tracing::{debug, info, warn};
 /// Maximum iterations in the agent loop before giving up.
 const MAX_ITERATIONS: u32 = 50;
 
-/// Maximum retries for rate-limited or overloaded API calls.
-const MAX_RETRIES: u32 = 3;
-
-/// Base delay for exponential backoff (milliseconds).
-const BASE_RETRY_DELAY_MS: u64 = 1000;
-
 /// Default timeout for individual tool executions (seconds).
 /// Raised from 60s to 120s for browser automation and long-running builds.
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
@@ -365,6 +359,7 @@ fn auto_wrap_text_to_turn_script(text: &str, agent_name: &str) -> Result<(), Str
     intents.push(serde_json::json!({
         "type": "text",
         "content": text,
+        "_autoWrapped": true,
     }));
 
     if let Some(parent) = pending_path.parent() {
@@ -1385,6 +1380,45 @@ pub async fn run_agent_loop(
         system_prompt.push_str(note);
     }
 
+    // Trim session history before creating working copy: pop old messages and feed
+    // them to session compact so their content is preserved as a rolling summary.
+    if session.messages.len() > MAX_HISTORY_MESSAGES {
+        let trim_count = session.messages.len() - MAX_HISTORY_MESSAGES;
+        warn!(
+            agent = %manifest.name,
+            total_messages = session.messages.len(),
+            trimming = trim_count,
+            "Trimming old messages from session"
+        );
+        let trimmed: Vec<Message> = session.messages.drain(..trim_count).collect();
+        // Ensure first message is User — Claude API rejects requests starting with Assistant.
+        if !session.messages.is_empty() && session.messages[0].role == Role::Assistant {
+            session.messages.remove(0);
+        }
+        // Feed trimmed messages to session compact for roleplay agents
+        if manifest.agent_class == openfang_types::agent::AgentClass::Roleplay {
+            match crate::session_compact::process_evicted_messages(
+                session.agent_id,
+                trimmed,
+                memory,
+                Arc::clone(&driver),
+                &manifest.model.model,
+                &manifest.name,
+                manifest.workspace.as_deref(),
+            )
+            .await
+            {
+                Ok(true) => debug!(agent = %manifest.name, "Session compact completed"),
+                Ok(false) => debug!(agent = %manifest.name, "Evicted messages buffered for compact"),
+                Err(e) => warn!(agent = %manifest.name, error = %e, "Session compact failed"),
+            }
+        }
+        // Persist trimmed session immediately to prevent re-trimming on next call
+        if let Err(e) = memory.save_session(session) {
+            warn!(agent = %manifest.name, error = %e, "Failed to save trimmed session");
+        }
+    }
+
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field
     let llm_messages: Vec<Message> = session
@@ -1404,6 +1438,23 @@ pub async fn run_agent_loop(
         system_prompt.push_str(&esys);
     }
 
+    // Deferred prompt_suffix (system-prompt.d/) — for roleplay agents this is
+    // injected after mode+ephemeral to keep mode closer to identity sections.
+    if let Some(suffix) = manifest.metadata.get("deferred_prompt_suffix").and_then(|v| v.as_str()) {
+        if !suffix.trim().is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(suffix);
+        }
+    }
+
+    // Session compact summary — appended last in system prompt, closest to conversation.
+    if manifest.agent_class == openfang_types::agent::AgentClass::Roleplay {
+        if let Ok(Some(compact)) = memory.session_compact_summary(session.agent_id) {
+            system_prompt.push_str("\n\n## 今天早些时候\n\n");
+            system_prompt.push_str(&compact);
+        }
+    }
+
     // Inject ephemeral context (from pre-turn hook) into the last user message.
     // This context is visible to the LLM for this turn but NOT stored in session history.
     if let Some(ephemeral) = crate::tool_runner::ephemeral_context() {
@@ -1421,24 +1472,6 @@ pub async fn run_agent_loop(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
-
-    // Safety valve: trim excessively long message histories to prevent context overflow.
-    // The full compaction system handles sophisticated summarization, but this prevents
-    // the catastrophic case where 200+ messages cause instant context overflow.
-    if messages.len() > MAX_HISTORY_MESSAGES {
-        let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
-        warn!(
-            agent = %manifest.name,
-            total_messages = messages.len(),
-            trimming = trim_count,
-            "Trimming old messages to prevent context overflow"
-        );
-        messages.drain(..trim_count);
-        // Ensure first message is User — Claude API rejects requests starting with Assistant.
-        if !messages.is_empty() && messages[0].role == Role::Assistant {
-            messages.remove(0);
-        }
-    }
 
     // Use autonomous config max_iterations if set, else default
     let max_iterations = manifest
@@ -1469,8 +1502,29 @@ pub async fn run_agent_loop(
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
         let recovery =
             recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
-        if recovery == RecoveryStage::FinalError {
+        if recovery.stage == RecoveryStage::FinalError {
             warn!("Context overflow unrecoverable — suggest /reset or /compact");
+        }
+
+        // Session compact: buffer evicted messages for roleplay agents
+        if !recovery.evicted.is_empty()
+            && manifest.agent_class == openfang_types::agent::AgentClass::Roleplay
+        {
+            match crate::session_compact::process_evicted_messages(
+                session.agent_id,
+                recovery.evicted,
+                memory,
+                Arc::clone(&driver),
+                &manifest.model.model,
+                &manifest.name,
+                manifest.workspace.as_deref(),
+            )
+            .await
+            {
+                Ok(true) => debug!(agent = %manifest.name, "Session compact completed"),
+                Ok(false) => debug!(agent = %manifest.name, "Evicted messages buffered for compact"),
+                Err(e) => warn!(agent = %manifest.name, error = %e, "Session compact failed"),
+            }
         }
 
         // Context guard: compact oversized tool results before LLM call
@@ -2257,85 +2311,55 @@ async fn call_with_retry(
         }
     }
 
-    let mut last_error = None;
+    match driver.complete(request.clone()).await {
+        Ok(response) => {
+            // Record success with circuit breaker
+            if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                cooldown.record_success(provider);
+            }
+            Ok(response)
+        }
+        Err(LlmError::RateLimited { .. }) => {
+            if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                cooldown.record_failure(provider, false);
+            }
+            Err(OpenFangError::LlmDriver(
+                "Rate limited (all providers exhausted)".to_string(),
+            ))
+        }
+        Err(LlmError::Overloaded { .. }) => {
+            if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                cooldown.record_failure(provider, false);
+            }
+            Err(OpenFangError::LlmDriver(
+                "Model overloaded (all providers exhausted)".to_string(),
+            ))
+        }
+        Err(e) => {
+            // Use classifier for smarter error handling
+            let raw_error = e.to_string();
+            let classified = llm_errors::classify_error(&raw_error, None);
+            warn!(
+                category = ?classified.category,
+                retryable = classified.is_retryable,
+                raw = %raw_error,
+                "LLM error classified: {}",
+                classified.sanitized_message
+            );
 
-    for attempt in 0..=MAX_RETRIES {
-        match driver.complete(request.clone()).await {
-            Ok(response) => {
-                // Record success with circuit breaker
-                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                    cooldown.record_success(provider);
-                }
-                return Ok(response);
+            if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                cooldown.record_failure(provider, classified.is_billing);
             }
-            Err(LlmError::RateLimited { retry_after_ms }) => {
-                if attempt == MAX_RETRIES {
-                    if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                        cooldown.record_failure(provider, false);
-                    }
-                    return Err(OpenFangError::LlmDriver(format!(
-                        "Rate limited after {} retries",
-                        MAX_RETRIES
-                    )));
-                }
-                let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
-                warn!(
-                    attempt,
-                    delay_ms = delay,
-                    "Rate limited, retrying after delay"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                last_error = Some("Rate limited".to_string());
-            }
-            Err(LlmError::Overloaded { retry_after_ms }) => {
-                if attempt == MAX_RETRIES {
-                    if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                        cooldown.record_failure(provider, false);
-                    }
-                    return Err(OpenFangError::LlmDriver(format!(
-                        "Model overloaded after {} retries",
-                        MAX_RETRIES
-                    )));
-                }
-                let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
-                warn!(
-                    attempt,
-                    delay_ms = delay,
-                    "Model overloaded, retrying after delay"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                last_error = Some("Overloaded".to_string());
-            }
-            Err(e) => {
-                // Use classifier for smarter error handling
-                let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
-                warn!(
-                    category = ?classified.category,
-                    retryable = classified.is_retryable,
-                    raw = %raw_error,
-                    "LLM error classified: {}",
-                    classified.sanitized_message
-                );
 
-                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                    cooldown.record_failure(provider, classified.is_billing);
-                }
-
-                // Include raw error detail so dashboard users can debug
-                let user_msg = if classified.category == llm_errors::LlmErrorCategory::Format {
-                    format!("{} — raw: {}", classified.sanitized_message, raw_error)
-                } else {
-                    classified.sanitized_message
-                };
-                return Err(OpenFangError::LlmDriver(user_msg));
-            }
+            // Include raw error detail so dashboard users can debug
+            let user_msg = if classified.category == llm_errors::LlmErrorCategory::Format {
+                format!("{} — raw: {}", classified.sanitized_message, raw_error)
+            } else {
+                classified.sanitized_message
+            };
+            Err(OpenFangError::LlmDriver(user_msg))
         }
     }
-
-    Err(OpenFangError::LlmDriver(
-        last_error.unwrap_or_else(|| "Unknown error".to_string()),
-    ))
 }
 
 /// Call an LLM driver in streaming mode with automatic retry on rate-limit and overload errors.
@@ -2369,82 +2393,52 @@ async fn stream_with_retry(
         }
     }
 
-    let mut last_error = None;
+    match driver.stream(request.clone(), tx.clone()).await {
+        Ok(response) => {
+            if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                cooldown.record_success(provider);
+            }
+            Ok(response)
+        }
+        Err(LlmError::RateLimited { .. }) => {
+            if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                cooldown.record_failure(provider, false);
+            }
+            Err(OpenFangError::LlmDriver(
+                "Rate limited (all providers exhausted)".to_string(),
+            ))
+        }
+        Err(LlmError::Overloaded { .. }) => {
+            if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                cooldown.record_failure(provider, false);
+            }
+            Err(OpenFangError::LlmDriver(
+                "Model overloaded (all providers exhausted)".to_string(),
+            ))
+        }
+        Err(e) => {
+            let raw_error = e.to_string();
+            let classified = llm_errors::classify_error(&raw_error, None);
+            warn!(
+                category = ?classified.category,
+                retryable = classified.is_retryable,
+                raw = %raw_error,
+                "LLM stream error classified: {}",
+                classified.sanitized_message
+            );
 
-    for attempt in 0..=MAX_RETRIES {
-        match driver.stream(request.clone(), tx.clone()).await {
-            Ok(response) => {
-                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                    cooldown.record_success(provider);
-                }
-                return Ok(response);
+            if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                cooldown.record_failure(provider, classified.is_billing);
             }
-            Err(LlmError::RateLimited { retry_after_ms }) => {
-                if attempt == MAX_RETRIES {
-                    if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                        cooldown.record_failure(provider, false);
-                    }
-                    return Err(OpenFangError::LlmDriver(format!(
-                        "Rate limited after {} retries",
-                        MAX_RETRIES
-                    )));
-                }
-                let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
-                warn!(
-                    attempt,
-                    delay_ms = delay,
-                    "Rate limited (stream), retrying after delay"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                last_error = Some("Rate limited".to_string());
-            }
-            Err(LlmError::Overloaded { retry_after_ms }) => {
-                if attempt == MAX_RETRIES {
-                    if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                        cooldown.record_failure(provider, false);
-                    }
-                    return Err(OpenFangError::LlmDriver(format!(
-                        "Model overloaded after {} retries",
-                        MAX_RETRIES
-                    )));
-                }
-                let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
-                warn!(
-                    attempt,
-                    delay_ms = delay,
-                    "Model overloaded (stream), retrying after delay"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                last_error = Some("Overloaded".to_string());
-            }
-            Err(e) => {
-                let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
-                warn!(
-                    category = ?classified.category,
-                    retryable = classified.is_retryable,
-                    raw = %raw_error,
-                    "LLM stream error classified: {}",
-                    classified.sanitized_message
-                );
 
-                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                    cooldown.record_failure(provider, classified.is_billing);
-                }
-
-                let user_msg = if classified.category == llm_errors::LlmErrorCategory::Format {
-                    format!("{} — raw: {}", classified.sanitized_message, raw_error)
-                } else {
-                    classified.sanitized_message
-                };
-                return Err(OpenFangError::LlmDriver(user_msg));
-            }
+            let user_msg = if classified.category == llm_errors::LlmErrorCategory::Format {
+                format!("{} — raw: {}", classified.sanitized_message, raw_error)
+            } else {
+                classified.sanitized_message
+            };
+            Err(OpenFangError::LlmDriver(user_msg))
         }
     }
-
-    Err(OpenFangError::LlmDriver(
-        last_error.unwrap_or_else(|| "Unknown error".to_string()),
-    ))
 }
 
 /// Run the agent execution loop with streaming support.
@@ -2605,6 +2599,42 @@ pub async fn run_agent_loop_streaming(
         system_prompt.push_str(note);
     }
 
+    // Trim session history before creating working copy: pop old messages and feed
+    // them to session compact so their content is preserved as a rolling summary.
+    if session.messages.len() > MAX_HISTORY_MESSAGES {
+        let trim_count = session.messages.len() - MAX_HISTORY_MESSAGES;
+        warn!(
+            agent = %manifest.name,
+            total_messages = session.messages.len(),
+            trimming = trim_count,
+            "Trimming old messages from session (streaming)"
+        );
+        let trimmed: Vec<Message> = session.messages.drain(..trim_count).collect();
+        if !session.messages.is_empty() && session.messages[0].role == Role::Assistant {
+            session.messages.remove(0);
+        }
+        if manifest.agent_class == openfang_types::agent::AgentClass::Roleplay {
+            match crate::session_compact::process_evicted_messages(
+                session.agent_id,
+                trimmed,
+                memory,
+                Arc::clone(&driver),
+                &manifest.model.model,
+                &manifest.name,
+                manifest.workspace.as_deref(),
+            )
+            .await
+            {
+                Ok(true) => debug!(agent = %manifest.name, "Session compact completed"),
+                Ok(false) => debug!(agent = %manifest.name, "Evicted messages buffered for compact"),
+                Err(e) => warn!(agent = %manifest.name, error = %e, "Session compact failed"),
+            }
+        }
+        if let Err(e) = memory.save_session(session) {
+            warn!(agent = %manifest.name, error = %e, "Failed to save trimmed session");
+        }
+    }
+
     let llm_messages: Vec<Message> = session
         .messages
         .iter()
@@ -2619,6 +2649,23 @@ pub async fn run_agent_loop_streaming(
     if let Some(esys) = crate::tool_runner::ephemeral_system() {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&esys);
+    }
+
+    // Deferred prompt_suffix (system-prompt.d/) — for roleplay agents this is
+    // injected after mode+ephemeral to keep mode closer to identity sections.
+    if let Some(suffix) = manifest.metadata.get("deferred_prompt_suffix").and_then(|v| v.as_str()) {
+        if !suffix.trim().is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(suffix);
+        }
+    }
+
+    // Session compact summary — appended last in system prompt, closest to conversation.
+    if manifest.agent_class == openfang_types::agent::AgentClass::Roleplay {
+        if let Ok(Some(compact)) = memory.session_compact_summary(session.agent_id) {
+            system_prompt.push_str("\n\n## 今天早些时候\n\n");
+            system_prompt.push_str(&compact);
+        }
     }
 
     // Inject ephemeral context (from pre-turn hook) into the last user message.
@@ -2638,22 +2685,6 @@ pub async fn run_agent_loop_streaming(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
-
-    // Safety valve: trim excessively long message histories to prevent context overflow.
-    if messages.len() > MAX_HISTORY_MESSAGES {
-        let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
-        warn!(
-            agent = %manifest.name,
-            total_messages = messages.len(),
-            trimming = trim_count,
-            "Trimming old messages to prevent context overflow (streaming)"
-        );
-        messages.drain(..trim_count);
-        // Ensure first message is User — Claude API rejects requests starting with Assistant.
-        if !messages.is_empty() && messages[0].role == Role::Assistant {
-            messages.remove(0);
-        }
-    }
 
     // Use autonomous config max_iterations if set, else default
     let max_iterations = manifest
@@ -2684,7 +2715,7 @@ pub async fn run_agent_loop_streaming(
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
         let recovery =
             recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
-        match &recovery {
+        match &recovery.stage {
             RecoveryStage::None => {}
             RecoveryStage::FinalError => {
                 if stream_tx.send(StreamEvent::PhaseChange {
@@ -2701,6 +2732,27 @@ pub async fn run_agent_loop_streaming(
                 }).await.is_err() {
                     warn!("Stream consumer disconnected while sending context trim warning");
                 }
+            }
+        }
+
+        // Session compact: buffer evicted messages for roleplay agents
+        if !recovery.evicted.is_empty()
+            && manifest.agent_class == openfang_types::agent::AgentClass::Roleplay
+        {
+            match crate::session_compact::process_evicted_messages(
+                session.agent_id,
+                recovery.evicted,
+                memory,
+                Arc::clone(&driver),
+                &manifest.model.model,
+                &manifest.name,
+                manifest.workspace.as_deref(),
+            )
+            .await
+            {
+                Ok(true) => debug!(agent = %manifest.name, "Session compact completed"),
+                Ok(false) => debug!(agent = %manifest.name, "Evicted messages buffered for compact"),
+                Err(e) => warn!(agent = %manifest.name, error = %e, "Session compact failed"),
             }
         }
 
@@ -3624,12 +3676,6 @@ mod tests {
     #[test]
     fn test_max_iterations_constant() {
         assert_eq!(MAX_ITERATIONS, 50);
-    }
-
-    #[test]
-    fn test_retry_constants() {
-        assert_eq!(MAX_RETRIES, 3);
-        assert_eq!(BASE_RETRY_DELAY_MS, 1000);
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub struct PromptContext {
     pub prompt_suffix: Option<String>,
     /// Whether this is a roleplay agent (skips generic assistant sections).
     pub is_roleplay: bool,
+    /// Session compact summary — rolling summary of evicted conversation messages.
+    /// Only used for roleplay agents to maintain earlier conversation awareness.
+    pub session_compact_summary: Option<String>,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -183,6 +186,10 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             }
         }
     }
+
+    // Note: Session compact summary is injected by agent_loop AFTER ephemeral
+    // system content, so it sits at the very tail of the system prompt, closest
+    // to the conversation messages.
 
     sections.join("\n\n")
 }

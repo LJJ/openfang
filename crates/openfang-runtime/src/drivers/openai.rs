@@ -337,12 +337,7 @@ impl LlmDriver for OpenAIDriver {
 
             let status = resp.status().as_u16();
             if status == 429 {
-                if attempt < max_retries {
-                    let retry_ms = (attempt + 1) as u64 * 2000;
-                    warn!(status, retry_ms, "Rate limited, retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
-                    continue;
-                }
+                warn!(status, "Rate limited");
                 return Err(LlmError::RateLimited {
                     retry_after_ms: 5000,
                 });
@@ -631,12 +626,7 @@ impl LlmDriver for OpenAIDriver {
 
             let status = resp.status().as_u16();
             if status == 429 {
-                if attempt < max_retries {
-                    let retry_ms = (attempt + 1) as u64 * 2000;
-                    warn!(status, retry_ms, "Rate limited (stream), retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
-                    continue;
-                }
+                warn!(status, "Rate limited (stream)");
                 return Err(LlmError::RateLimited {
                     retry_after_ms: 5000,
                 });

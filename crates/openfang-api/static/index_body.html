@@ -160,6 +160,10 @@
         </div>
         <template x-if="!collapsed">
           <div x-transition>
+            <a class="nav-item" :class="{ active: page === 'models' }" @click="navigate('models')" :aria-current="page === 'models' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></span>
+              <span class="nav-label">Models</span>
+            </a>
             <a class="nav-item" :class="{ active: page === 'settings' }" @click="navigate('settings')" :aria-current="page === 'settings' ? 'page' : false">
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/></svg></span>
               <span class="nav-label">Settings</span>
@@ -2842,6 +2846,183 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
+    <!-- Page: Models (LLM Routing) -->
+    <template x-if="page === 'models'">
+      <div x-data="llmRoutingPage">
+        <div class="page-header"><h2>Models</h2></div>
+        <div class="page-body" x-init="loadData()">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading model routing...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+          <div x-show="!loading && !loadError">
+            <!-- Tabs -->
+            <div class="tabs" role="tablist">
+              <div class="tab" role="tab" :class="{ active: tab === 'routing' }" @click="tab = 'routing'">LLM Routing</div>
+              <div class="tab" role="tab" :class="{ active: tab === 'test' }" @click="tab = 'test'">API Test</div>
+            </div>
+
+            <!-- Tab: Routing -->
+            <div x-show="tab === 'routing'">
+              <template x-for="group in groups" :key="group.id">
+                <div style="margin-bottom:1.5rem">
+                  <h3 style="font-size:0.95rem;font-weight:600;margin:0 0 0.75rem;color:var(--text-dim)" x-text="group.name"></h3>
+
+                  <!-- Agent group: 3 editable dropdowns per row -->
+                  <template x-if="group.id === 'agent'">
+                    <div class="table-wrap">
+                      <table>
+                        <thead><tr><th style="width:140px">Name</th><th>Primary</th><th>Fallback 1</th><th>Fallback 2</th><th style="width:40px"></th></tr></thead>
+                        <tbody>
+                          <template x-for="a in agentSlots()" :key="a.slot">
+                            <tr>
+                              <td class="font-bold" style="font-size:12px" x-text="a.name"></td>
+                              <td>
+                                <select class="form-select" style="width:180px;font-size:12px"
+                                  :value="a.primary"
+                                  @change="saveSlot(a.slot, 'primary', $event.target.value)">
+                                  <option value="">-</option>
+                                  <template x-for="m in allModelOptions" :key="m">
+                                    <option :value="m" x-text="m" :selected="m === a.primary"></option>
+                                  </template>
+                                </select>
+                              </td>
+                              <td>
+                                <select class="form-select" style="width:180px;font-size:12px"
+                                  :value="a.fallbacks[0] || ''"
+                                  @change="saveSlot(a.slot, 'fallback.0', $event.target.value)">
+                                  <option value="">-</option>
+                                  <template x-for="m in allModelOptions" :key="m">
+                                    <option :value="m" x-text="m" :selected="m === a.fallbacks[0]"></option>
+                                  </template>
+                                </select>
+                              </td>
+                              <td>
+                                <select class="form-select" style="width:180px;font-size:12px"
+                                  :value="a.fallbacks[1] || ''"
+                                  @change="saveSlot(a.slot, 'fallback.1', $event.target.value)">
+                                  <option value="">-</option>
+                                  <template x-for="m in allModelOptions" :key="m">
+                                    <option :value="m" x-text="m" :selected="m === a.fallbacks[1]"></option>
+                                  </template>
+                                </select>
+                              </td>
+                              <td>
+                                <span x-show="saving[a.slot + ':primary']" class="spinner" style="width:12px;height:12px;border-width:2px"></span>
+                              </td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                  </template>
+
+                  <!-- MCP groups: same 3 editable dropdowns -->
+                  <template x-if="group.id !== 'agent'">
+                    <div class="table-wrap">
+                      <table>
+                        <thead><tr><th style="width:140px">Name</th><th>Primary</th><th>Fallback 1</th><th>Fallback 2</th><th style="width:40px"></th></tr></thead>
+                        <tbody>
+                          <template x-for="s in mcpSlotsByGroup(group.id)" :key="s.slot">
+                            <tr>
+                              <td class="font-bold" style="font-size:12px" x-text="s.name"></td>
+                              <td>
+                                <select class="form-select" style="width:180px;font-size:12px"
+                                  :value="s.primary"
+                                  @change="saveSlot(s.slot, 'primary', $event.target.value)">
+                                  <option value="">-</option>
+                                  <template x-for="m in allModelOptions" :key="m">
+                                    <option :value="m" x-text="m" :selected="m === s.primary"></option>
+                                  </template>
+                                </select>
+                              </td>
+                              <td>
+                                <select class="form-select" style="width:180px;font-size:12px"
+                                  :value="s.fallback"
+                                  @change="saveSlot(s.slot, 'fallback', $event.target.value)">
+                                  <option value="">-</option>
+                                  <template x-for="m in allModelOptions" :key="m">
+                                    <option :value="m" x-text="m" :selected="m === s.fallback"></option>
+                                  </template>
+                                </select>
+                              </td>
+                              <td>
+                                <select class="form-select" style="width:180px;font-size:12px"
+                                  :value="s.fallback2"
+                                  @change="saveSlot(s.slot, 'fallback2', $event.target.value)">
+                                  <option value="">-</option>
+                                  <template x-for="m in allModelOptions" :key="m">
+                                    <option :value="m" x-text="m" :selected="m === s.fallback2"></option>
+                                  </template>
+                                </select>
+                              </td>
+                              <td>
+                                <span x-show="saving[s.slot + ':primary'] || saving[s.slot + ':fallback'] || saving[s.slot + ':fallback2']" class="spinner" style="width:12px;height:12px;border-width:2px"></span>
+                              </td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+
+            <!-- Tab: API Test -->
+            <div x-show="tab === 'test'">
+              <div class="info-card" style="margin-bottom:1rem">
+                <h4>API Connectivity Test</h4>
+                <p style="font-size:0.85rem;color:var(--text-dim)">Test each model by sending a simple message. Checks that the API key and endpoint are working.</p>
+              </div>
+
+              <!-- Quick test buttons for known models -->
+              <div class="card-grid" style="margin-bottom:1.5rem">
+                <template x-for="m in knownModels" :key="m">
+                  <div class="card" style="padding:0.75rem;min-width:200px">
+                    <div class="flex justify-between items-center">
+                      <div>
+                        <div class="font-bold" style="font-size:12px" x-text="m"></div>
+                        <div class="text-xs text-dim" x-text="resolveProvider(m).name"></div>
+                      </div>
+                      <div class="flex gap-2 items-center">
+                        <span class="badge" :class="testBadgeClass(m)" x-text="testBadgeText(m)" x-show="testResults[m]"></span>
+                        <button class="btn btn-ghost btn-sm" @click="testModel(m)" :disabled="testing[m]">
+                          <span x-show="!testing[m]">Test</span>
+                          <span x-show="testing[m]" class="spinner" style="width:10px;height:10px;border-width:2px"></span>
+                        </button>
+                      </div>
+                    </div>
+                    <div x-show="testResults[m] && testResults[m].response" class="text-xs" style="margin-top:6px;padding:6px;background:var(--bg-input);border-radius:4px;word-break:break-all;max-height:60px;overflow:auto" x-text="testResults[m] && testResults[m].response"></div>
+                    <div x-show="testResults[m] && testResults[m].status === 'error'" class="text-xs" style="margin-top:6px;color:var(--error);word-break:break-all;max-height:60px;overflow:auto" x-text="testResults[m] && testResults[m].error"></div>
+                  </div>
+                </template>
+              </div>
+
+              <!-- Custom test -->
+              <div style="border-top:1px solid var(--border);padding-top:1rem">
+                <h4 style="font-size:0.9rem;margin:0 0 0.5rem">Custom Test</h4>
+                <div class="flex gap-2" style="flex-wrap:wrap">
+                  <input class="form-input" type="text" placeholder="Model ID (e.g. deepseek-chat)" x-model="customTestModel" style="width:220px;font-size:12px">
+                  <input class="form-input" type="text" placeholder="Message (optional)" x-model="customTestMessage" style="flex:1;min-width:200px;font-size:12px">
+                  <button class="btn btn-primary btn-sm" @click="testCustom()" :disabled="!customTestModel.trim() || testing[customTestModel.trim()]">
+                    <span x-show="!testing[customTestModel.trim()]">Test</span>
+                    <span x-show="testing[customTestModel.trim()]" class="spinner" style="width:10px;height:10px;border-width:2px"></span>
+                  </button>
+                </div>
+                <div x-show="customTestModel.trim() && testResults[customTestModel.trim()]" style="margin-top:8px">
+                  <span class="badge" :class="testBadgeClass(customTestModel.trim())" x-text="testBadgeText(customTestModel.trim())"></span>
+                  <span class="text-xs text-dim" style="margin-left:8px" x-text="testResults[customTestModel.trim()] && (testResults[customTestModel.trim()].response || testResults[customTestModel.trim()].error || '')"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
     <!-- Page: Settings -->
     <template x-if="page === 'settings'">
       <div x-data="settingsPage">
@@ -4202,6 +4383,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <table class="data-table" x-show="traces.length > 0" style="width:100%">
                 <thead>
                   <tr>
+                    <th>Trace ID</th>
                     <th>Time</th>
                     <th>Agent</th>
                     <th>Trigger</th>
@@ -4214,6 +4396,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 <tbody>
                   <template x-for="t in traces" :key="t.id">
                     <tr @click="selectTrace(t.id)" style="cursor:pointer">
+                      <td style="white-space:nowrap;font-size:11px;font-family:monospace;color:var(--text-muted)" x-text="t.id.slice(0,12)"></td>
                       <td style="white-space:nowrap;font-size:13px" x-text="formatTime(t.started_at)"></td>
                       <td x-text="t.agent_name"></td>
                       <td><span style="padding:2px 6px;border-radius:3px;font-size:11px;color:#fff" :style="{background: triggerColor(t.trigger_type)}" x-text="t.trigger_type"></span></td>

@@ -110,6 +110,8 @@ mod release {
         include_str!("../static/js/pages/traces.js"),
         "\n",
         include_str!("../static/js/pages/characters.js"),
+        "\n",
+        include_str!("../static/js/pages/llm_routing.js"),
         "\n</script>\n",
         // Alpine.js MUST be last — it processes x-data and fires alpine:init
         "<script>\n",
@@ -233,6 +235,8 @@ mod debug {
             r("js/pages/traces.js"),
             "\n".into(),
             r("js/pages/characters.js"),
+            "\n".into(),
+            r("js/pages/llm_routing.js"),
             "\n</script>\n".into(),
             // Alpine.js MUST be last
             "<script>\n".into(),

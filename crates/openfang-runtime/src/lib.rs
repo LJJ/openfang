@@ -38,6 +38,7 @@ pub mod reply_directives;
 pub mod retry;
 pub mod routing;
 pub mod sandbox;
+pub mod session_compact;
 pub mod session_projection;
 pub mod session_repair;
 pub mod shell_bleed;

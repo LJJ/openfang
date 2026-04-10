@@ -391,6 +391,16 @@ pub async fn build_router(
             axum::routing::get(routes::config_schema),
         )
         .route("/api/config/set", axum::routing::post(routes::config_set))
+        // LLM routing endpoints
+        .route(
+            "/api/llm-routing",
+            axum::routing::get(crate::llm_routing::get_llm_routing)
+                .put(crate::llm_routing::put_llm_routing),
+        )
+        .route(
+            "/api/llm-routing/test",
+            axum::routing::post(crate::llm_routing::test_llm_routing),
+        )
         // Approval endpoints
         .route(
             "/api/approvals",

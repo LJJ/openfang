@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -45,6 +45,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 9 {
         migrate_v9(conn)?;
+    }
+
+    if current_version < 10 {
+        migrate_v10(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -364,6 +368,25 @@ fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
         "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (9, datetime('now'), 'Add parent_trace_id to traces for cascade linking')",
         [],
+    )?;
+    Ok(())
+}
+
+/// Version 10: Add session_compacts table for rolling conversation summaries.
+fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS session_compacts (
+            agent_id TEXT PRIMARY KEY,
+            summary TEXT NOT NULL DEFAULT '',
+            buffer BLOB NOT NULL,
+            buffer_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (10, datetime('now'), 'Add session_compacts table for rolling conversation summaries');
+        ",
     )?;
     Ok(())
 }

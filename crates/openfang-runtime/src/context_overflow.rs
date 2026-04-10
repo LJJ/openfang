@@ -27,6 +27,16 @@ pub enum RecoveryStage {
     FinalError,
 }
 
+/// Result of overflow recovery, including any messages that were evicted.
+#[derive(Debug, Clone)]
+pub struct RecoveryResult {
+    /// Which recovery stage was applied.
+    pub stage: RecoveryStage,
+    /// Messages that were removed from the session during recovery.
+    /// Empty if no messages were evicted (stages 3/4 or no recovery needed).
+    pub evicted: Vec<Message>,
+}
+
 /// Estimate token count using chars/4 heuristic.
 fn estimate_tokens(messages: &[Message], system_prompt: &str, tools: &[ToolDefinition]) -> usize {
     crate::compactor::estimate_token_count(messages, Some(system_prompt), Some(tools))
@@ -34,21 +44,26 @@ fn estimate_tokens(messages: &[Message], system_prompt: &str, tools: &[ToolDefin
 
 /// Run the 4-stage overflow recovery pipeline.
 ///
-/// Returns the recovery stage applied and the number of messages/results affected.
+/// Returns the recovery stage applied and any messages that were evicted.
 pub fn recover_from_overflow(
     messages: &mut Vec<Message>,
     system_prompt: &str,
     tools: &[ToolDefinition],
     context_window: usize,
-) -> RecoveryStage {
+) -> RecoveryResult {
     let estimated = estimate_tokens(messages, system_prompt, tools);
     let threshold_70 = (context_window as f64 * 0.70) as usize;
     let threshold_90 = (context_window as f64 * 0.90) as usize;
 
     // No recovery needed
     if estimated <= threshold_70 {
-        return RecoveryStage::None;
+        return RecoveryResult {
+            stage: RecoveryStage::None,
+            evicted: Vec::new(),
+        };
     }
+
+    let mut all_evicted: Vec<Message> = Vec::new();
 
     // Stage 1: Moderate trim — keep last 10 messages
     if estimated <= threshold_90 {
@@ -60,11 +75,14 @@ pub fn recover_from_overflow(
                 removing = remove,
                 "Stage 1: moderate trim to last {keep} messages"
             );
-            messages.drain(..remove);
+            all_evicted.extend(messages.drain(..remove));
             // Re-check after trim
             let new_est = estimate_tokens(messages, system_prompt, tools);
             if new_est <= threshold_70 {
-                return RecoveryStage::AutoCompaction { removed: remove };
+                return RecoveryResult {
+                    stage: RecoveryStage::AutoCompaction { removed: remove },
+                    evicted: all_evicted,
+                };
             }
         }
     }
@@ -79,17 +97,21 @@ pub fn recover_from_overflow(
                 removing = remove,
                 "Stage 2: aggressive overflow compaction to last {keep} messages"
             );
+            let total_removed = all_evicted.len() + remove;
             let summary = Message::user(format!(
                 "[System: {} earlier messages were removed due to context overflow. \
                  The conversation continues from here. Use /compact for smarter summarization.]",
-                remove
+                total_removed
             ));
-            messages.drain(..remove);
+            all_evicted.extend(messages.drain(..remove));
             messages.insert(0, summary);
 
             let new_est = estimate_tokens(messages, system_prompt, tools);
             if new_est <= threshold_90 {
-                return RecoveryStage::OverflowCompaction { removed: remove };
+                return RecoveryResult {
+                    stage: RecoveryStage::OverflowCompaction { removed: total_removed },
+                    evicted: all_evicted,
+                };
             }
         }
     }
@@ -119,7 +141,10 @@ pub fn recover_from_overflow(
     if truncated > 0 {
         let new_est = estimate_tokens(messages, system_prompt, tools);
         if new_est <= threshold_90 {
-            return RecoveryStage::ToolResultTruncation { truncated };
+            return RecoveryResult {
+                stage: RecoveryStage::ToolResultTruncation { truncated },
+                evicted: all_evicted,
+            };
         }
         warn!(
             estimated_tokens = new_est,
@@ -129,7 +154,10 @@ pub fn recover_from_overflow(
 
     // Stage 4: Final error — nothing more we can do automatically
     warn!("Stage 4: all recovery stages exhausted, context still too large");
-    RecoveryStage::FinalError
+    RecoveryResult {
+        stage: RecoveryStage::FinalError,
+        evicted: all_evicted,
+    }
 }
 
 #[cfg(test)]
@@ -156,8 +184,9 @@ mod tests {
     #[test]
     fn test_no_recovery_needed() {
         let mut msgs = make_messages(2, 100);
-        let stage = recover_from_overflow(&mut msgs, "sys", &[], 200_000);
-        assert_eq!(stage, RecoveryStage::None);
+        let result = recover_from_overflow(&mut msgs, "sys", &[], 200_000);
+        assert_eq!(result.stage, RecoveryStage::None);
+        assert!(result.evicted.is_empty());
     }
 
     #[test]
@@ -165,15 +194,18 @@ mod tests {
         // Create messages that push us past 70% but not 90%
         // Context window: 1000 tokens = 4000 chars
         // 70% = 700 tokens = 2800 chars
-        let mut msgs = make_messages(20, 150); // ~3000 chars total
-        let stage = recover_from_overflow(&mut msgs, "system", &[], 1000);
-        match stage {
+        let original_count = 20;
+        let mut msgs = make_messages(original_count, 150); // ~3000 chars total
+        let result = recover_from_overflow(&mut msgs, "system", &[], 1000);
+        match result.stage {
             RecoveryStage::AutoCompaction { removed } => {
                 assert!(removed > 0);
                 assert!(msgs.len() <= 10);
+                assert_eq!(result.evicted.len(), removed);
             }
             RecoveryStage::OverflowCompaction { .. } => {
                 // Also acceptable if moderate wasn't enough
+                assert!(!result.evicted.is_empty());
             }
             _ => {} // depends on exact token estimation
         }
@@ -183,10 +215,11 @@ mod tests {
     fn test_stage2_aggressive_trim() {
         // Push past 90%: 1000 tokens = 4000 chars, 90% = 3600 chars
         let mut msgs = make_messages(30, 200); // ~6000 chars
-        let stage = recover_from_overflow(&mut msgs, "system", &[], 1000);
-        match stage {
+        let result = recover_from_overflow(&mut msgs, "system", &[], 1000);
+        match result.stage {
             RecoveryStage::OverflowCompaction { removed } => {
                 assert!(removed > 0);
+                assert!(!result.evicted.is_empty());
             }
             RecoveryStage::ToolResultTruncation { .. } | RecoveryStage::FinalError => {}
             _ => {} // acceptable cascading
@@ -216,9 +249,9 @@ mod tests {
             },
         ];
         // Tiny context window to force all stages
-        let stage = recover_from_overflow(&mut msgs, "system", &[], 500);
+        let result = recover_from_overflow(&mut msgs, "system", &[], 500);
         // Should at least reach tool truncation
-        match stage {
+        match result.stage {
             RecoveryStage::ToolResultTruncation { truncated } => {
                 assert!(truncated > 0);
             }
@@ -231,9 +264,10 @@ mod tests {
     fn test_cascading_stages() {
         // Ensure stages cascade: if stage 1 isn't enough, stage 2 kicks in
         let mut msgs = make_messages(50, 500);
-        let stage = recover_from_overflow(&mut msgs, "system prompt", &[], 2000);
+        let result = recover_from_overflow(&mut msgs, "system prompt", &[], 2000);
         // With 50 messages of 500 chars each (25000 chars), context of 2000 tokens (8000 chars),
         // we should cascade through stages
-        assert_ne!(stage, RecoveryStage::None);
+        assert_ne!(result.stage, RecoveryStage::None);
+        assert!(!result.evicted.is_empty());
     }
 }

@@ -12,6 +12,7 @@ pub mod knowledge;
 pub mod migration;
 pub mod semantic;
 pub mod session;
+pub mod session_compact;
 pub mod structured;
 pub mod trace_store;
 pub mod usage;
