@@ -4187,22 +4187,18 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                           :style="{width: pct(getPhysical(c).fatigue)+'%', background: barColor(getPhysical(c).fatigue)}"></div>
                       </div>
                     </div>
+                    <div style="flex:1">
+                      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted)">
+                        <span>Desire</span><span x-text="pct(getPhysical(c).desire) + '%'"></span>
+                      </div>
+                      <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:2px">
+                        <div style="height:100%;border-radius:3px;transition:width .3s"
+                          :style="{width: pct(getPhysical(c).desire)+'%', background: barColor(getPhysical(c).desire)}"></div>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
-                <!-- Life tensions -->
-                <template x-if="Object.keys(getTensions(c)).length > 0">
-                  <div style="margin-bottom:12px">
-                    <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:4px">TENSIONS</div>
-                    <div style="display:flex;gap:6px;flex-wrap:wrap">
-                      <template x-for="(v, k) in getTensions(c)" :key="k">
-                        <span style="font-size:11px;padding:2px 6px;border-radius:3px;border:1px solid var(--border)"
-                          :style="{color: tensionColor(v)}"
-                          x-text="tensionLabel(k) + ' ' + pct(v) + '%'"></span>
-                      </template>
-                    </div>
-                  </div>
-                </template>
 
                 <!-- Schedule -->
                 <template x-if="getScheduleEntries(c).length > 0">
@@ -4213,6 +4209,9 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                         <div style="display:flex;gap:8px;padding:2px 0;border-bottom:1px solid var(--border)">
                           <span style="color:var(--text-muted);white-space:nowrap;min-width:80px" x-text="e.start + '-' + e.end"></span>
                           <span x-text="e.activity"></span>
+                          <template x-if="e.with && e.with.length">
+                            <span style="color:var(--accent);font-size:11px;white-space:nowrap" x-text="formatWith(e.with)"></span>
+                          </template>
                         </div>
                       </template>
                     </div>

@@ -190,13 +190,24 @@ function charactersPage() {
       return events.slice(-5).reverse();
     },
 
-    getTensions(c) {
-      return (c.life_state && c.life_state.life_tensions) || (c.world_state && c.world_state.life_tensions) || {};
-    },
 
     getScheduleEntries(c) {
       if (!c.schedule || !c.schedule.entries) return [];
       return c.schedule.entries;
+    },
+
+    formatWith(withArr) {
+      if (!withArr || !withArr.length) return '';
+      var self = this;
+      var names = withArr.map(function(w) {
+        // Try to resolve character_id to display_name
+        var all = self.characters.concat(self.owner ? [self.owner] : []);
+        for (var i = 0; i < all.length; i++) {
+          if (all[i].character_id === w) return all[i].display_name;
+        }
+        return w; // Already a display name or unknown
+      });
+      return 'w/ ' + names.join(', ');
     },
 
     getOutfit(c) {
@@ -237,19 +248,5 @@ function charactersPage() {
       return c.context_cache.last_known_channel.channel;
     },
 
-    tensionLabel(key) {
-      var m = {
-        rest_tension: 'rest', food_tension: 'food',
-        domestic_tension: 'domestic', social_tension: 'social',
-        solitude_tension: 'solitude'
-      };
-      return m[key] || key.replace(/_tension$/, '');
-    },
-
-    tensionColor(v) {
-      if (v == null || v <= 0.3) return '#10b981';
-      if (v <= 0.6) return '#f59e0b';
-      return '#ef4444';
-    }
   };
 }

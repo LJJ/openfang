@@ -380,7 +380,7 @@ pub enum AgentClass {
 impl AgentClass {
     /// Whether this class requires an on-disk template and should be reconciled on startup.
     pub fn is_template_backed(self) -> bool {
-        matches!(self, AgentClass::Roleplay | AgentClass::Orchestrator)
+        matches!(self, AgentClass::Roleplay | AgentClass::Orchestrator | AgentClass::Headless)
     }
 
     /// Whether this class should skip all persona assembly (identity files, tools listing,

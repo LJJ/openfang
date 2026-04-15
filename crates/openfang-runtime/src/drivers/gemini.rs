@@ -52,22 +52,22 @@ impl GeminiDriver {
 /// Top-level Gemini API request body.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiRequest {
-    contents: Vec<GeminiContent>,
+pub(crate) struct GeminiRequest {
+    pub(crate) contents: Vec<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<GeminiContent>,
+    pub(crate) system_instruction: Option<GeminiContent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<GeminiToolConfig>,
+    pub(crate) tools: Vec<GeminiToolConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    generation_config: Option<GenerationConfig>,
+    pub(crate) generation_config: Option<GenerationConfig>,
 }
 
 /// A content entry (user/model turn).
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct GeminiContent {
+pub(crate) struct GeminiContent {
     #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<String>,
-    parts: Vec<GeminiPart>,
+    pub(crate) role: Option<String>,
+    pub(crate) parts: Vec<GeminiPart>,
 }
 
 /// A part within a content entry.
@@ -77,7 +77,7 @@ struct GeminiContent {
 /// first, then manually match on known keys.
 #[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
-enum GeminiPart {
+pub(crate) enum GeminiPart {
     Text {
         text: String,
     },
@@ -88,7 +88,6 @@ enum GeminiPart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCallData,
-        /// Gemini 3.1+ requires thought_signature to be echoed back on multi-turn tool use.
         #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
     },
@@ -145,47 +144,47 @@ impl<'de> serde::Deserialize<'de> for GeminiPart {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct GeminiInlineData {
+pub(crate) struct GeminiInlineData {
     #[serde(rename = "mimeType")]
-    mime_type: String,
-    data: String,
+    pub(crate) mime_type: String,
+    pub(crate) data: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct GeminiFunctionCallData {
-    name: String,
-    args: serde_json::Value,
+pub(crate) struct GeminiFunctionCallData {
+    pub(crate) name: String,
+    pub(crate) args: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct GeminiFunctionResponseData {
-    name: String,
-    response: serde_json::Value,
+pub(crate) struct GeminiFunctionResponseData {
+    pub(crate) name: String,
+    pub(crate) response: serde_json::Value,
 }
 
 /// Tool configuration containing function declarations.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiToolConfig {
-    function_declarations: Vec<GeminiFunctionDeclaration>,
+pub(crate) struct GeminiToolConfig {
+    pub(crate) function_declarations: Vec<GeminiFunctionDeclaration>,
 }
 
 /// A function declaration for tool use.
 #[derive(Debug, Serialize)]
-struct GeminiFunctionDeclaration {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
+pub(crate) struct GeminiFunctionDeclaration {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) parameters: serde_json::Value,
 }
 
 /// Generation configuration (temperature, max tokens, etc.).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GenerationConfig {
+pub(crate) struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
+    pub(crate) temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
+    pub(crate) max_output_tokens: Option<u32>,
 }
 
 // ── Response types ─────────────────────────────────────────────────────
@@ -193,45 +192,45 @@ struct GenerationConfig {
 /// Top-level Gemini API response.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiResponse {
+pub(crate) struct GeminiResponse {
     #[serde(default)]
-    candidates: Vec<GeminiCandidate>,
+    pub(crate) candidates: Vec<GeminiCandidate>,
     #[serde(default)]
-    usage_metadata: Option<GeminiUsageMetadata>,
+    pub(crate) usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiCandidate {
-    content: Option<GeminiContent>,
+pub(crate) struct GeminiCandidate {
+    pub(crate) content: Option<GeminiContent>,
     #[serde(default)]
-    finish_reason: Option<String>,
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiUsageMetadata {
+pub(crate) struct GeminiUsageMetadata {
     #[serde(default)]
-    prompt_token_count: u64,
+    pub(crate) prompt_token_count: u64,
     #[serde(default)]
-    candidates_token_count: u64,
+    pub(crate) candidates_token_count: u64,
 }
 
 /// Gemini API error response.
 #[derive(Debug, Deserialize)]
-struct GeminiErrorResponse {
-    error: GeminiErrorDetail,
+pub(crate) struct GeminiErrorResponse {
+    pub(crate) error: GeminiErrorDetail,
 }
 
 #[derive(Debug, Deserialize)]
-struct GeminiErrorDetail {
-    message: String,
+pub(crate) struct GeminiErrorDetail {
+    pub(crate) message: String,
 }
 
 // ── Message conversion ─────────────────────────────────────────────────
 
 /// Convert OpenFang messages into Gemini content entries.
-fn convert_messages(
+pub(crate) fn convert_messages(
     messages: &[Message],
     system: &Option<String>,
     thought_sigs: &std::collections::HashMap<String, String>,
@@ -334,7 +333,7 @@ fn convert_messages(
 }
 
 /// Extract system prompt from messages or the explicit system field.
-fn extract_system(messages: &[Message], system: &Option<String>) -> Option<GeminiContent> {
+pub(crate) fn extract_system(messages: &[Message], system: &Option<String>) -> Option<GeminiContent> {
     let text = system.clone().or_else(|| {
         messages.iter().find_map(|m| {
             if m.role == Role::System {
@@ -355,7 +354,7 @@ fn extract_system(messages: &[Message], system: &Option<String>) -> Option<Gemin
 }
 
 /// Convert tool definitions to Gemini function declarations.
-fn convert_tools(request: &CompletionRequest) -> Vec<GeminiToolConfig> {
+pub(crate) fn convert_tools(request: &CompletionRequest) -> Vec<GeminiToolConfig> {
     if request.tools.is_empty() {
         return Vec::new();
     }
@@ -383,7 +382,7 @@ fn convert_tools(request: &CompletionRequest) -> Vec<GeminiToolConfig> {
 /// Convert a Gemini response into our CompletionResponse.
 /// Returns (response, thought_signatures) where thought_signatures is a vec of
 /// (tool_call_id, signature) pairs to cache in the driver.
-fn convert_response(
+pub(crate) fn convert_response(
     resp: GeminiResponse,
 ) -> Result<(CompletionResponse, Vec<(String, String)>), LlmError> {
     let candidate = resp

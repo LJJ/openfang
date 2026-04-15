@@ -730,7 +730,12 @@ fn read_identity_file(workspace: &Path, filename: &str) -> Option<String> {
 /// Load and concatenate all `.md` files from `{home_dir}/system-prompt.d/`.
 /// Files are sorted by name so ordering is controlled via filename prefixes
 /// (e.g. `01-world-briefing.md`, `02-rules.md`).
-fn load_prompt_suffix_dir(home_dir: &Path) -> Option<String> {
+///
+/// Agent filtering: if a `.toml` sidecar exists next to an `.md` file
+/// (e.g. `90-nsfw-rules.toml` for `90-nsfw-rules.md`) with an `agents`
+/// array, the `.md` is only included for agents in that whitelist.
+/// No sidecar → included for all agents.
+fn load_prompt_suffix_dir(home_dir: &Path, agent_name: &str) -> Option<String> {
     let dir = home_dir.join("system-prompt.d");
     let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .ok()?
@@ -741,6 +746,20 @@ fn load_prompt_suffix_dir(home_dir: &Path) -> Option<String> {
     entries.sort();
     let mut parts = Vec::new();
     for path in entries {
+        // Check for .toml sidecar with agent whitelist
+        let sidecar = path.with_extension("toml");
+        if sidecar.exists() {
+            if let Ok(toml_str) = std::fs::read_to_string(&sidecar) {
+                if let Ok(table) = toml_str.parse::<toml::Table>() {
+                    if let Some(agents) = table.get("agents").and_then(|v| v.as_array()) {
+                        let allowed: Vec<&str> = agents.iter().filter_map(|v| v.as_str()).collect();
+                        if !allowed.is_empty() && !allowed.contains(&agent_name) {
+                            continue; // skip this file for this agent
+                        }
+                    }
+                }
+            }
+        }
         if let Ok(content) = std::fs::read_to_string(&path) {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
@@ -769,6 +788,20 @@ fn gethostname() -> Option<String> {
     {
         None
     }
+}
+
+/// Result of running the pre-turn hook.
+/// Contains all fields the hook can return to influence the LLM call.
+struct PreTurnHookResult {
+    /// Replacement message (or original if hook didn't replace it)
+    message: String,
+    skip_llm: bool,
+    strip_media: bool,
+    ephemeral_ctx: Option<String>,
+    ephemeral_sys: Option<String>,
+    interaction_mode: Option<String>,
+    model_override: Option<String>,
+    disabled_tools: std::collections::HashSet<String>,
 }
 
 impl OpenFangKernel {
@@ -1556,7 +1589,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
-        media_blocks: Vec<openfang_types::message::ContentBlock>,
+        mut media_blocks: Vec<openfang_types::message::ContentBlock>,
         session_override: Option<SessionId>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
@@ -1667,8 +1700,8 @@ impl OpenFangKernel {
         };
 
         let tools = self.available_tools(agent_id);
-        let tools = entry.mode.filter_tools(tools);
-        let driver = self.resolve_driver(&entry.manifest)?;
+        let mut tools = entry.mode.filter_tools(tools);
+        let mut driver = self.resolve_driver(&entry.manifest)?;
 
         // Look up model's actual context window from the catalog
         let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
@@ -1780,7 +1813,7 @@ impl OpenFangKernel {
                 prompt_suffix: if manifest.agent_class == AgentClass::Roleplay {
                     None
                 } else {
-                    load_prompt_suffix_dir(&self.config.home_dir)
+                    load_prompt_suffix_dir(&self.config.home_dir, &manifest.name)
                 },
                 is_roleplay: manifest.agent_class == AgentClass::Roleplay,
                 session_compact_summary: None, // injected by agent_loop after ephemeral system
@@ -1792,7 +1825,7 @@ impl OpenFangKernel {
         // Capture deferred prompt_suffix for roleplay agents — passed to manifest
         // metadata so agent_loop can inject it after mode.
         if manifest.agent_class == AgentClass::Roleplay {
-            if let Some(suffix) = load_prompt_suffix_dir(&self.config.home_dir) {
+            if let Some(suffix) = load_prompt_suffix_dir(&self.config.home_dir, &manifest.name) {
                 manifest.metadata.insert(
                     "deferred_prompt_suffix".to_string(),
                     serde_json::Value::String(suffix),
@@ -1894,8 +1927,82 @@ impl OpenFangKernel {
                 collector: std::sync::Arc::new(kernel_clone.trace_collector.clone()),
             };
 
-            let result = openfang_runtime::tool_runner::TRACE_CONTEXT
+            // ── Pre-turn hook (streaming path) ──
+            let pre_hook = kernel_clone.run_pre_turn_hook(
+                agent_id, &manifest, &manifest.name, &message_owned, &trace_id,
+            ).await;
+            let message_owned = pre_hook.message;
+            if pre_hook.strip_media {
+                media_blocks.clear();
+            }
+            if !pre_hook.disabled_tools.is_empty() {
+                let before = tools.len();
+                tools.retain(|t| !pre_hook.disabled_tools.contains(&t.name));
+                info!(agent_id = %agent_id, disabled = ?pre_hook.disabled_tools, before, after = tools.len(),
+                    "Pre-turn hook filtered tools (streaming)");
+            }
+
+            // Mode prompt injection (streaming path — matches non-streaming)
+            if manifest.agent_class == AgentClass::Roleplay {
+                let mode = pre_hook.interaction_mode.as_deref().unwrap_or("remote");
+                let mode_prompt = load_roleplay_mode_prompt(&kernel_clone.config, &manifest.name, mode);
+                if !mode_prompt.is_empty() {
+                    manifest.model.system_prompt =
+                        format!("{}\n\n{}", manifest.model.system_prompt, mode_prompt);
+                }
+                if let Some(suffix) = load_prompt_suffix_dir(&kernel_clone.config.home_dir, &manifest.name) {
+                    if !suffix.trim().is_empty() {
+                        manifest.model.system_prompt =
+                            format!("{}\n\n{}", manifest.model.system_prompt, suffix);
+                    }
+                }
+            }
+
+            // Model override from pre-turn hook (streaming path)
+            if let Some(ref hook_model) = pre_hook.model_override {
+                if openfang_runtime::tool_runner::model_override().is_none() {
+                    info!(agent_id = %agent_id, hook_model_override = %hook_model,
+                        original_model = %manifest.model.model, "HOOK_MODEL_OVERRIDE applied (streaming)");
+                    if let Some(fb) = manifest.fallback_models.iter().find(|fb| &fb.model == hook_model) {
+                        manifest.model.provider = fb.provider.clone();
+                        manifest.model.base_url = fb.base_url.clone();
+                        manifest.model.api_key_env = fb.api_key_env.clone();
+                        if let Some(max_tokens) = fb.max_tokens {
+                            manifest.model.max_tokens = max_tokens;
+                        }
+                    } else if let Some(routing_config) = openfang_runtime::llm_routing::load_routing_config(&kernel_clone.config.home_dir) {
+                        let (provider, api_key_env, base_url) = openfang_runtime::llm_routing::resolve_provider(
+                            &routing_config, hook_model, &kernel_clone.model_catalog,
+                        );
+                        manifest.model.provider = provider;
+                        manifest.model.api_key_env = Some(api_key_env);
+                        manifest.model.base_url = base_url;
+                    }
+                    manifest.model.model = hook_model.to_string();
+                    driver = kernel_clone.resolve_driver(&manifest)
+                        .map_err(|e| openfang_types::error::OpenFangError::Internal(e.to_string()))?;
+                }
+            }
+
+            // skip_llm handling (streaming path)
+            let result = if pre_hook.skip_llm {
+                info!(agent_id = %agent_id, "Pre-turn hook returned skip_llm=true, skipping streaming LLM call");
+                Ok(AgentLoopResult {
+                    response: String::new(),
+                    iterations: 0,
+                    total_usage: openfang_types::message::TokenUsage::default(),
+                    cost_usd: None,
+                    silent: false,
+                    directives: Default::default(),
+                })
+            } else {
+
+            openfang_runtime::tool_runner::TRACE_CONTEXT
                 .scope(Some(trace_ctx), async {
+            openfang_runtime::tool_runner::EPHEMERAL_CONTEXT
+                .scope(pre_hook.ephemeral_ctx, async {
+            openfang_runtime::tool_runner::EPHEMERAL_SYSTEM
+                .scope(pre_hook.ephemeral_sys, async {
             run_agent_loop_streaming(
                 &manifest,
                 &message_owned,
@@ -1930,10 +2037,24 @@ impl OpenFangKernel {
             )
             .await
                 })
-            .await;
+            .await
+                })
+            .await
+                })
+            .await
+
+            }; // end skip_llm if/else
 
             match result {
-                Ok(result) => {
+                Ok(mut result) => {
+                    // ── Post-turn hook (streaming path) ──
+                    let clear_response = kernel_clone.run_post_turn_hook(
+                        agent_id, &manifest, &manifest.name, &result.response, &trace_id, &skill_snapshot,
+                    ).await;
+                    if clear_response {
+                        result.response.clear();
+                    }
+
                     // End trace
                     kernel_clone.trace_collector.end_trace(
                         &trace_id,
@@ -1942,21 +2063,9 @@ impl OpenFangKernel {
                         result.total_usage.output_tokens,
                         result.iterations as u64,
                     );
-                    // Append new messages to canonical session for cross-channel memory
-                    if !stateless_session && session.messages.len() > messages_before {
-                        let new_messages = session.messages[messages_before..].to_vec();
-                        if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
-                            warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
-                        }
-                    }
+                    // canonical_sessions and JSONL mirrors disabled — not used, adds cleanup burden
 
-                    // Write JSONL session mirror to workspace
                     if let Some(ref workspace) = manifest.workspace {
-                        if let Err(e) =
-                            memory.write_jsonl_mirror(&session, &workspace.join("sessions"))
-                        {
-                            warn!("Failed to write JSONL session mirror (streaming): {e}");
-                        }
                         // Append daily memory log (best-effort)
                         append_daily_memory_log(workspace, &result.response);
                     }
@@ -2148,6 +2257,178 @@ impl OpenFangKernel {
             silent: false,
             directives: Default::default(),
         })
+    }
+
+    /// Run pre-turn hook if configured. Returns hook results or defaults (pass-through).
+    async fn run_pre_turn_hook(
+        &self,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+        agent_name: &str,
+        message: &str,
+        trace_id: &str,
+    ) -> PreTurnHookResult {
+        let mut result = PreTurnHookResult {
+            message: message.to_string(),
+            skip_llm: false,
+            strip_media: false,
+            ephemeral_ctx: None,
+            ephemeral_sys: None,
+            interaction_mode: None,
+            model_override: None,
+            disabled_tools: std::collections::HashSet::new(),
+        };
+
+        let hook = match manifest.pre_turn.as_ref() {
+            Some(h) => h,
+            None => return result,
+        };
+        let tool_name = match hook.tool.as_ref() {
+            Some(t) => t,
+            None => return result,
+        };
+
+        let pre_hook_start = std::time::Instant::now();
+        let input = if hook.pass_message {
+            serde_json::json!({ "message": message, "agent_name": agent_name, "trace_id": trace_id })
+        } else {
+            serde_json::json!({ "agent_name": agent_name, "trace_id": trace_id })
+        };
+
+        match self.execute_hook_tool(agent_id, manifest, tool_name, input).await {
+            Ok(content) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if parsed.get("skip_llm").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        result.skip_llm = true;
+                        info!(agent = %agent_name, hook_tool = %tool_name, "Pre-turn hook returned skip_llm=true, skipping LLM call");
+                    }
+                    if parsed.get("strip_media").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        result.strip_media = true;
+                        info!(agent = %agent_name, hook_tool = %tool_name, "Pre-turn hook returned strip_media=true, clearing media blocks");
+                    }
+                    if let Some(eph) = parsed.get("ephemeral_context").and_then(|v| v.as_str()) {
+                        if !eph.is_empty() {
+                            info!(agent = %agent_name, hook_tool = %tool_name, len = eph.len(), "Pre-turn hook returned ephemeral_context");
+                            result.ephemeral_ctx = Some(eph.to_string());
+                        }
+                    }
+                    if let Some(esys) = parsed.get("ephemeral_system").and_then(|v| v.as_str()) {
+                        if !esys.is_empty() {
+                            info!(agent = %agent_name, hook_tool = %tool_name, len = esys.len(), "Pre-turn hook returned ephemeral_system");
+                            result.ephemeral_sys = Some(esys.to_string());
+                        }
+                    }
+                    if let Some(disabled) = parsed.get("disabled_tools").and_then(|v| v.as_array()) {
+                        let disabled_set: std::collections::HashSet<String> = disabled
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                        if !disabled_set.is_empty() {
+                            info!(agent = %agent_name, hook_tool = %tool_name, disabled = ?disabled_set, "Pre-turn hook disabled_tools");
+                            result.disabled_tools = disabled_set;
+                        }
+                    }
+                    if let Some(im) = parsed.get("interaction_mode").and_then(|v| v.as_str()) {
+                        result.interaction_mode = Some(im.to_string());
+                    }
+                    if let Some(mo) = parsed.get("model_override").and_then(|v| v.as_str()) {
+                        if !mo.is_empty() {
+                            result.model_override = Some(mo.to_string());
+                        }
+                    }
+                    result.message = parsed.get("message")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or(content);
+                } else {
+                    result.message = content;
+                }
+            }
+            Err(e) => {
+                warn!(agent = %agent_name, hook_tool = %tool_name, error = %e, "Pre-turn hook failed, using original message");
+            }
+        }
+
+        // Record trace span
+        let elapsed = pre_hook_start.elapsed().as_millis() as i64;
+        let now = chrono::Utc::now().to_rfc3339();
+        self.trace_collector.record_span_data(
+            crate::trace_collector::make_span(
+                trace_id, None,
+                &format!("hook:pre_turn:{tool_name}"),
+                openfang_memory::trace_store::SpanKind::Hook,
+                &now, &now, elapsed,
+                None, None, "{}".to_string(), None, None,
+            ),
+        );
+
+        result
+    }
+
+    /// Run post-turn hook if configured. Returns whether response should be cleared.
+    async fn run_post_turn_hook(
+        &self,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+        agent_name: &str,
+        response: &str,
+        trace_id: &str,
+        skill_snapshot: &openfang_skills::registry::SkillRegistry,
+    ) -> bool {
+        let hook = match manifest.post_turn.as_ref() {
+            Some(h) => h,
+            None => return false,
+        };
+        let tool_name = match hook.tool.as_ref() {
+            Some(t) => t,
+            None => return false,
+        };
+
+        let post_hook_start = std::time::Instant::now();
+        let mut input = serde_json::Map::new();
+        if hook.pass_response {
+            input.insert("response".into(), serde_json::json!(response));
+            input.insert("agent_name".into(), serde_json::json!(agent_name));
+        }
+        input.insert("trace_id".into(), serde_json::json!(trace_id));
+        if !hook.skills.is_empty() {
+            let mut skill_guides = serde_json::Map::new();
+            for skill_name in &hook.skills {
+                if let Some(skill) = skill_snapshot.get(skill_name) {
+                    let guide_path = skill.path.join("GUIDE.md");
+                    if let Ok(content) = std::fs::read_to_string(&guide_path) {
+                        skill_guides.insert(skill_name.clone(), serde_json::json!(content));
+                    }
+                }
+            }
+            if !skill_guides.is_empty() {
+                input.insert("skill_guides".into(), serde_json::Value::Object(skill_guides));
+            }
+        }
+
+        match self.execute_hook_tool(agent_id, manifest, tool_name, serde_json::Value::Object(input)).await {
+            Ok(_content) => {
+                info!(agent = %agent_name, hook_tool = %tool_name, "Post-turn hook executed successfully");
+            }
+            Err(e) => {
+                warn!(agent = %agent_name, hook_tool = %tool_name, error = %e, "Post-turn hook failed");
+            }
+        }
+
+        // Record trace span
+        let elapsed = post_hook_start.elapsed().as_millis() as i64;
+        let now = chrono::Utc::now().to_rfc3339();
+        self.trace_collector.record_span_data(
+            crate::trace_collector::make_span(
+                trace_id, None,
+                &format!("hook:post_turn:{tool_name}"),
+                openfang_memory::trace_store::SpanKind::Hook,
+                &now, &now, elapsed,
+                None, None, "{}".to_string(), None, None,
+            ),
+        );
+
+        hook.clear_response
     }
 
     async fn execute_hook_tool(
@@ -2352,7 +2633,7 @@ impl OpenFangKernel {
                 prompt_suffix: if manifest.agent_class == AgentClass::Roleplay {
                     None
                 } else {
-                    load_prompt_suffix_dir(&self.config.home_dir)
+                    load_prompt_suffix_dir(&self.config.home_dir, &manifest.name)
                 },
                 is_roleplay: manifest.agent_class == AgentClass::Roleplay,
                 session_compact_summary: None, // injected by agent_loop after ephemeral system
@@ -2406,10 +2687,43 @@ impl OpenFangKernel {
                 original_model = %manifest.model.model,
                 "MODEL_OVERRIDE applied"
             );
+            // Resolve the correct provider for the override model.
+            // Priority: 1) agent fallback_models  2) llm_routing.json providers (prefix match)
+            if let Some(fb) = manifest.fallback_models.iter().find(|fb| fb.model == override_model) {
+                // Agent-specific routing (fallback_models)
+                info!(
+                    agent = %manifest.name,
+                    override_provider = %fb.provider,
+                    original_provider = %manifest.model.provider,
+                    "MODEL_OVERRIDE: provider resolved from fallback chain"
+                );
+                manifest.model.provider = fb.provider.clone();
+                manifest.model.base_url = fb.base_url.clone();
+                manifest.model.api_key_env = fb.api_key_env.clone();
+                if let Some(max_tokens) = fb.max_tokens {
+                    manifest.model.max_tokens = max_tokens;
+                }
+            } else if let Some(routing_config) = openfang_runtime::llm_routing::load_routing_config(&self.config.home_dir) {
+                // Centralized routing via llm_routing.json providers (prefix match)
+                let (provider, api_key_env, base_url) = openfang_runtime::llm_routing::resolve_provider(
+                    &routing_config,
+                    &override_model,
+                    &self.model_catalog,
+                );
+                info!(
+                    agent = %manifest.name,
+                    override_provider = %provider,
+                    original_provider = %manifest.model.provider,
+                    "MODEL_OVERRIDE: provider resolved from llm_routing.json"
+                );
+                manifest.model.provider = provider;
+                manifest.model.api_key_env = Some(api_key_env);
+                manifest.model.base_url = base_url;
+            }
             manifest.model.model = override_model;
         }
 
-        let driver = self.resolve_driver(&manifest)?;
+        let mut driver = self.resolve_driver(&manifest)?;
 
         // Look up model's context window: agent config > catalog > default
         let ctx_window = manifest
@@ -2450,126 +2764,20 @@ impl OpenFangKernel {
         };
 
         // ── Pre-turn hook ──
-        // 通用机制：如果 manifest 配置了 pre_turn hook，调用指定 MCP 工具。
-        // 返回值替换原始消息；返回 skip_llm=true 时跳过 LLM 调用。
-        // hook 可返回 ephemeral_context：仅注入本轮 LLM 调用，不存入 session。
-        // hook 可返回 ephemeral_system：追加到 system prompt 末尾，仅本轮生效。
-        let mut skip_llm = false;
-        let mut ephemeral_ctx: Option<String> = None;
-        let mut ephemeral_sys: Option<String> = None;
-        let mut hook_interaction_mode: Option<String> = None;
-        let pre_hook_start = std::time::Instant::now();
-        let message_with_links = if let Some(ref hook) = manifest.pre_turn {
-            if let Some(ref tool_name) = hook.tool {
-                let input = if hook.pass_message {
-                    serde_json::json!({ "message": &message_with_links, "agent_name": &entry.name, "trace_id": &trace_id })
-                } else {
-                    serde_json::json!({ "agent_name": &entry.name, "trace_id": &trace_id })
-                };
-                match self.execute_hook_tool(agent_id, &manifest, tool_name, input).await {
-                    Ok(content) => {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if parsed.get("skip_llm").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                skip_llm = true;
-                                info!(
-                                    agent = %entry.name,
-                                    hook_tool = %tool_name,
-                                    "Pre-turn hook returned skip_llm=true, skipping LLM call"
-                                );
-                            }
-                            if parsed.get("strip_media").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                media_blocks.clear();
-                                info!(
-                                    agent = %entry.name,
-                                    hook_tool = %tool_name,
-                                    "Pre-turn hook returned strip_media=true, clearing media blocks"
-                                );
-                            }
-                            // Extract ephemeral_context — injected into LLM call but not persisted
-                            if let Some(eph) = parsed.get("ephemeral_context").and_then(|v| v.as_str()) {
-                                if !eph.is_empty() {
-                                    ephemeral_ctx = Some(eph.to_string());
-                                    info!(
-                                        agent = %entry.name,
-                                        hook_tool = %tool_name,
-                                        len = eph.len(),
-                                        "Pre-turn hook returned ephemeral_context"
-                                    );
-                                }
-                            }
-                            // Extract ephemeral_system — appended to system prompt for this turn only
-                            if let Some(esys) = parsed.get("ephemeral_system").and_then(|v| v.as_str()) {
-                                if !esys.is_empty() {
-                                    ephemeral_sys = Some(esys.to_string());
-                                    info!(
-                                        agent = %entry.name,
-                                        hook_tool = %tool_name,
-                                        len = esys.len(),
-                                        "Pre-turn hook returned ephemeral_system"
-                                    );
-                                }
-                            }
-                            // Extract disabled_tools — filter tools before LLM call
-                            if let Some(disabled) = parsed.get("disabled_tools").and_then(|v| v.as_array()) {
-                                let disabled_set: std::collections::HashSet<String> = disabled
-                                    .iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect();
-                                if !disabled_set.is_empty() {
-                                    let before = tools.len();
-                                    tools.retain(|t| !disabled_set.contains(&t.name));
-                                    info!(
-                                        agent = %entry.name,
-                                        hook_tool = %tool_name,
-                                        disabled = ?disabled_set,
-                                        before,
-                                        after = tools.len(),
-                                        "Pre-turn hook filtered tools via disabled_tools"
-                                    );
-                                }
-                            }
-                            // Extract interaction_mode for post-hook mode prompt injection
-                            if let Some(im) = parsed.get("interaction_mode").and_then(|v| v.as_str()) {
-                                hook_interaction_mode = Some(im.to_string());
-                            }
-                            parsed.get("message")
-                                .and_then(|v| v.as_str())
-                                .map(String::from)
-                                .unwrap_or(content)
-                        } else {
-                            content
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            agent = %entry.name,
-                            hook_tool = %tool_name,
-                            error = %e,
-                            "Pre-turn hook failed, using original message"
-                        );
-                        message_with_links
-                    }
-                }
-            } else {
-                message_with_links
-            }
-        } else {
-            message_with_links
-        };
-
-        // Record pre-turn hook span (if a hook was configured)
-        if manifest.pre_turn.as_ref().and_then(|h| h.tool.as_ref()).is_some() {
-            let elapsed = pre_hook_start.elapsed().as_millis() as i64;
-            let now = chrono::Utc::now().to_rfc3339();
-            self.trace_collector.record_span_data(
-                crate::trace_collector::make_span(
-                    &trace_id, None,
-                    &format!("hook:pre_turn:{}", manifest.pre_turn.as_ref().unwrap().tool.as_ref().unwrap()),
-                    openfang_memory::trace_store::SpanKind::Hook,
-                    &now, &now, elapsed,
-                    None, None, "{}".to_string(), None, None,
-                ),
-            );
+        let pre_hook = self.run_pre_turn_hook(agent_id, &manifest, &entry.name, &message_with_links, &trace_id).await;
+        let message_with_links = pre_hook.message;
+        let skip_llm = pre_hook.skip_llm;
+        let ephemeral_ctx = pre_hook.ephemeral_ctx;
+        let ephemeral_sys = pre_hook.ephemeral_sys;
+        let hook_interaction_mode = pre_hook.interaction_mode;
+        let hook_model_override = pre_hook.model_override;
+        if pre_hook.strip_media {
+            media_blocks.clear();
+        }
+        if !pre_hook.disabled_tools.is_empty() {
+            let before = tools.len();
+            tools.retain(|t| !pre_hook.disabled_tools.contains(&t.name));
+            info!(agent = %entry.name, disabled = ?pre_hook.disabled_tools, before, after = tools.len(), "Pre-turn hook filtered tools");
         }
 
         // ── Post-hook mode prompt + deferred prompt_suffix injection ──
@@ -2584,7 +2792,7 @@ impl OpenFangKernel {
                     format!("{}\n\n{}", manifest.model.system_prompt, mode_prompt);
             }
             // Append prompt_suffix (system-prompt.d/) AFTER mode
-            if let Some(suffix) = load_prompt_suffix_dir(&self.config.home_dir) {
+            if let Some(suffix) = load_prompt_suffix_dir(&self.config.home_dir, &manifest.name) {
                 if !suffix.trim().is_empty() {
                     manifest.model.system_prompt =
                         format!("{}\n\n{}", manifest.model.system_prompt, suffix);
@@ -2592,7 +2800,42 @@ impl OpenFangKernel {
             }
         }
 
-        // ── LLM 调用（skip_llm 时跳过）──
+        // ── Pre-turn hook model override ──
+        // Apply model_override returned by the pre-turn hook (e.g. in_person → Opus).
+        // Only applies if no task-local override (cascade) was already set.
+        if let Some(ref hook_model) = hook_model_override {
+            if openfang_runtime::tool_runner::model_override().is_none() {
+                info!(
+                    agent = %manifest.name,
+                    hook_model_override = %hook_model,
+                    original_model = %manifest.model.model,
+                    "HOOK_MODEL_OVERRIDE applied"
+                );
+                // Resolve provider for the override model (same logic as cascade model_override)
+                if let Some(fb) = manifest.fallback_models.iter().find(|fb| &fb.model == hook_model) {
+                    manifest.model.provider = fb.provider.clone();
+                    manifest.model.base_url = fb.base_url.clone();
+                    manifest.model.api_key_env = fb.api_key_env.clone();
+                    if let Some(max_tokens) = fb.max_tokens {
+                        manifest.model.max_tokens = max_tokens;
+                    }
+                } else if let Some(routing_config) = openfang_runtime::llm_routing::load_routing_config(&self.config.home_dir) {
+                    let (provider, api_key_env, base_url) = openfang_runtime::llm_routing::resolve_provider(
+                        &routing_config,
+                        hook_model,
+                        &self.model_catalog,
+                    );
+                    manifest.model.provider = provider;
+                    manifest.model.api_key_env = Some(api_key_env);
+                    manifest.model.base_url = base_url;
+                }
+                manifest.model.model = hook_model.clone();
+                // Re-resolve driver for the new provider
+                driver = self.resolve_driver(&manifest)?;
+            }
+        }
+
+        // ── LLM 调用（skip_llm 时跳过��──
         let mut result = if skip_llm {
             info!(agent = %entry.name, "Pre-turn hook returned skip_llm=true, skipping LLM call");
             AgentLoopResult {
@@ -2666,63 +2909,11 @@ impl OpenFangKernel {
         };
 
         // ── Post-turn hook ──
-        if let Some(ref hook) = manifest.post_turn {
-            if let Some(ref tool_name) = hook.tool {
-                let post_hook_start = std::time::Instant::now();
-                let mut input = serde_json::Map::new();
-                if hook.pass_response {
-                    input.insert("response".into(), serde_json::json!(&result.response));
-                    input.insert("agent_name".into(), serde_json::json!(&entry.name));
-                }
-                input.insert("trace_id".into(), serde_json::json!(&trace_id));
-                if !hook.skills.is_empty() {
-                    let mut skill_guides = serde_json::Map::new();
-                    for skill_name in &hook.skills {
-                        if let Some(skill) = skill_snapshot.get(skill_name) {
-                            let guide_path = skill.path.join("GUIDE.md");
-                            if let Ok(content) = std::fs::read_to_string(&guide_path) {
-                                skill_guides.insert(skill_name.clone(), serde_json::json!(content));
-                            }
-                        }
-                    }
-                    if !skill_guides.is_empty() {
-                        input.insert("skill_guides".into(), serde_json::Value::Object(skill_guides));
-                    }
-                }
-                match self.execute_hook_tool(agent_id, &manifest, tool_name, serde_json::Value::Object(input)).await {
-                    Ok(_content) => {
-                        info!(
-                            agent = %entry.name,
-                            hook_tool = %tool_name,
-                            "Post-turn hook executed successfully"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            agent = %entry.name,
-                            hook_tool = %tool_name,
-                            error = %e,
-                            "Post-turn hook failed"
-                        );
-                    }
-                }
-                // Record post-turn hook span
-                let elapsed = post_hook_start.elapsed().as_millis() as i64;
-                let now = chrono::Utc::now().to_rfc3339();
-                self.trace_collector.record_span_data(
-                    crate::trace_collector::make_span(
-                        &trace_id, None,
-                        &format!("hook:post_turn:{tool_name}"),
-                        openfang_memory::trace_store::SpanKind::Hook,
-                        &now, &now, elapsed,
-                        None, None, "{}".to_string(), None, None,
-                    ),
-                );
-
-                if hook.clear_response {
-                    result.response.clear();
-                }
-            }
+        let clear_response = self.run_post_turn_hook(
+            agent_id, &manifest, &entry.name, &result.response, &trace_id, &skill_snapshot,
+        ).await;
+        if clear_response {
+            result.response.clear();
         }
 
         // ── End trace ──
@@ -2734,23 +2925,10 @@ impl OpenFangKernel {
             result.iterations as u64,
         );
 
-        // Append new messages to canonical session for cross-channel memory
-        if !stateless_session && session.messages.len() > messages_before {
-            let new_messages = session.messages[messages_before..].to_vec();
-            if let Err(e) = self.memory.append_canonical(agent_id, &new_messages, None) {
-                warn!("Failed to update canonical session: {e}");
-            }
-        }
+        // canonical_sessions and JSONL mirrors disabled — not used, adds cleanup burden
 
-        // Write JSONL session mirror to workspace
+        // Append daily memory log (best-effort)
         if let Some(ref workspace) = manifest.workspace {
-            if let Err(e) = self
-                .memory
-                .write_jsonl_mirror(&session, &workspace.join("sessions"))
-            {
-                warn!("Failed to write JSONL session mirror: {e}");
-            }
-            // Append daily memory log (best-effort)
             append_daily_memory_log(workspace, &result.response);
         }
 
@@ -4735,37 +4913,11 @@ impl OpenFangKernel {
             return None;
         }
 
-        // Resolve provider from model catalog
-        let provider = self
-            .model_catalog
-            .read()
-            .ok()?
-            .find_model(&model_id)
-            .map(|e| e.provider.clone())
-            .unwrap_or_else(|| {
-                // Fallback: guess provider from model name prefix
-                if model_id.starts_with("deepseek") {
-                    "deepseek".to_string()
-                } else if model_id.starts_with("MiniMax") || model_id.starts_with("M2") {
-                    "minimax".to_string()
-                } else if model_id.starts_with("gpt-") {
-                    "azure".to_string()
-                } else {
-                    "openai".to_string()
-                }
-            });
-
-        // Resolve API key and base URL from provider catalog
-        let catalog = self.model_catalog.read().ok()?;
-        let provider_info = catalog.get_provider(&provider);
-        let api_key_env = provider_info
-            .map(|p| p.api_key_env.clone())
-            .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
-        let base_url = provider_info.and_then(|p| {
-            let url = &p.base_url;
-            if url.is_empty() { None } else { Some(url.clone()) }
-        });
-        drop(catalog);
+        // Resolve provider + credentials from llm_routing.json providers section (prefix match),
+        // falling back to model catalog, then hardcoded prefix guessing.
+        let (provider, api_key_env, base_url) = openfang_runtime::llm_routing::resolve_provider(
+            &config, &model_id, &self.model_catalog,
+        );
 
         let driver_config = DriverConfig {
             provider,

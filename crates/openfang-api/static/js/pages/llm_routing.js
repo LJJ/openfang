@@ -35,6 +35,7 @@ function llmRoutingPage() {
       'vision':              { name: '图片理解 (Vision)',     group: 'auxiliary' },
       'diary:retrieval':     { name: '日记检索',             group: 'diary' },
       'diary:cognition':     { name: '认知事实提取',          group: 'diary' },
+      'npc':                 { name: 'NPC 对话生成',         group: 'npc' },
       'npc:cognition':       { name: 'NPC 认知沉淀',        group: 'npc' },
       'compact':             { name: 'Session 压缩',        group: 'system' },
       'filming':             { name: '拍摄系统',             group: 'filming' },

@@ -9,6 +9,7 @@ pub mod copilot;
 pub mod fallback;
 pub mod gemini;
 pub mod openai;
+pub mod vertex;
 
 use crate::llm_driver::{DriverConfig, LlmDriver, LlmError};
 use openfang_types::model_catalog::{
@@ -67,9 +68,19 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "OPENAI_API_KEY",
             key_required: true,
         }),
+        "azure" | "azure-openai" => Some(ProviderDefaults {
+            base_url: OPENAI_BASE_URL,
+            api_key_env: "AZURE_OPENAI_API_KEY",
+            key_required: true,
+        }),
         "gemini" | "google" => Some(ProviderDefaults {
             base_url: GEMINI_BASE_URL,
             api_key_env: "GEMINI_API_KEY",
+            key_required: true,
+        }),
+        "vertex" | "vertex-ai" => Some(ProviderDefaults {
+            base_url: "https://aiplatform.googleapis.com",
+            api_key_env: "GOOGLE_APPLICATION_CREDENTIALS",
             key_required: true,
         }),
         "ollama" => Some(ProviderDefaults {
@@ -208,6 +219,27 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
+    // Vertex AI — same Gemini format but with service account OAuth2 auth
+    if provider == "vertex" || provider == "vertex-ai" {
+        let creds_path = config
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok())
+            .ok_or_else(|| {
+                LlmError::MissingApiKey(
+                    "Set GOOGLE_APPLICATION_CREDENTIALS environment variable for Vertex AI"
+                        .to_string(),
+                )
+            })?;
+        let project = std::env::var("VERTEX_PROJECT").map_err(|_| {
+            LlmError::MissingApiKey("Set VERTEX_PROJECT environment variable for Vertex AI".to_string())
+        })?;
+        let location =
+            std::env::var("VERTEX_LOCATION").unwrap_or_else(|_| "global".to_string());
+        return vertex::VertexDriver::new(&creds_path, project, location)
+            .map(|d| Arc::new(d) as Arc<dyn LlmDriver>);
+    }
+
     // Gemini uses a different API format — special case
     if provider == "gemini" || provider == "google" {
         let api_key = config
@@ -285,10 +317,10 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     Err(LlmError::Api {
         status: 0,
         message: format!(
-            "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
-             deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
-             cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot. \
-             Or set base_url for a custom OpenAI-compatible endpoint.",
+            "Unknown provider '{}'. Supported: anthropic, gemini, vertex, openai, azure, groq, \
+             openrouter, deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, \
+             perplexity, cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, \
+             github-copilot. Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
@@ -299,7 +331,9 @@ pub fn known_providers() -> &'static [&'static str] {
     &[
         "anthropic",
         "gemini",
+        "vertex",
         "openai",
+        "azure",
         "groq",
         "openrouter",
         "deepseek",
@@ -417,7 +451,7 @@ mod tests {
         assert!(providers.contains(&"zhipu"));
         assert!(providers.contains(&"zhipu_coding"));
         assert!(providers.contains(&"qianfan"));
-        assert_eq!(providers.len(), 27);
+        assert_eq!(providers.len(), 28);
     }
 
     #[test]

@@ -19,12 +19,11 @@ use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
 use openfang_types::tool::{ToolCall, ToolDefinition, ToolResult};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,59 +38,6 @@ const MAX_ITERATIONS: u32 = 50;
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 
 const ASYNC_SELFIE_VIDEO_FILE_NAME: &str = "宋玉-自拍视频.mp4";
-
-async fn remember_memory_imprint(
-    memory: &MemorySubstrate,
-    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
-    session: &Session,
-    user_message: &str,
-    assistant_response: &str,
-) {
-    let Some(memory_text) =
-        crate::memory_imprint::project_memory_imprint(user_message, assistant_response)
-    else {
-        return;
-    };
-
-    if let Some(emb) = embedding_driver {
-        match emb.embed_one(&memory_text).await {
-            Ok(vec) => {
-                let _ = memory
-                    .remember_with_embedding_async(
-                        session.agent_id,
-                        &memory_text,
-                        MemorySource::Conversation,
-                        "episodic",
-                        HashMap::new(),
-                        Some(&vec),
-                    )
-                    .await;
-            }
-            Err(e) => {
-                warn!("Embedding for remember failed: {e}");
-                let _ = memory
-                    .remember(
-                        session.agent_id,
-                        &memory_text,
-                        MemorySource::Conversation,
-                        "episodic",
-                        HashMap::new(),
-                    )
-                    .await;
-            }
-        }
-    } else {
-        let _ = memory
-            .remember(
-                session.agent_id,
-                &memory_text,
-                MemorySource::Conversation,
-                "episodic",
-                HashMap::new(),
-            )
-            .await;
-    }
-}
 
 fn tool_timeout_secs(tool_name: &str) -> u64 {
     let _ = tool_name;
@@ -1237,7 +1183,7 @@ pub async fn run_agent_loop(
     mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
-    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+    _embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
@@ -1257,53 +1203,6 @@ pub async fn run_agent_loop(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
-        match emb.embed_one(user_message).await {
-            Ok(query_vec) => {
-                debug!("Using vector recall (dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-            Err(e) => {
-                warn!("Embedding recall failed, falling back to text search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-        }
-    } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
-    };
-
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
     if let Some(hook_reg) = hooks {
@@ -1319,17 +1218,7 @@ pub async fn run_agent_loop(
         let _ = hook_reg.fire(&ctx);
     }
 
-    // Build the system prompt — base prompt comes from kernel (prompt_builder),
-    // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
-    if !memories.is_empty() {
-        let mem_pairs: Vec<(String, String)> = memories
-            .iter()
-            .map(|m| (String::new(), m.content.clone()))
-            .collect();
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
-    }
 
     // Persist tool chains only for the active loop; completed traces should not
     // keep inflating future session context.
@@ -1450,7 +1339,7 @@ pub async fn run_agent_loop(
     // Session compact summary — appended last in system prompt, closest to conversation.
     if manifest.agent_class == openfang_types::agent::AgentClass::Roleplay {
         if let Ok(Some(compact)) = memory.session_compact_summary(session.agent_id) {
-            system_prompt.push_str("\n\n## 今天早些时候\n\n");
+            system_prompt.push_str("\n\n## 早些时候\n\n");
             system_prompt.push_str(&compact);
         }
     }
@@ -1797,14 +1686,6 @@ pub async fn run_agent_loop(
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
                 save_projected_session(memory, session)?;
 
-                remember_memory_imprint(
-                    memory,
-                    embedding_driver,
-                    session,
-                    user_message,
-                    &final_response,
-                )
-                .await;
 
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
@@ -2460,7 +2341,7 @@ pub async fn run_agent_loop_streaming(
     mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
-    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+    _embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
@@ -2480,53 +2361,6 @@ pub async fn run_agent_loop_streaming(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
-        match emb.embed_one(user_message).await {
-            Ok(query_vec) => {
-                debug!("Using vector recall (streaming, dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-            Err(e) => {
-                warn!("Embedding recall failed (streaming), falling back to text search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-        }
-    } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
-    };
-
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
     if let Some(hook_reg) = hooks {
@@ -2542,17 +2376,7 @@ pub async fn run_agent_loop_streaming(
         let _ = hook_reg.fire(&ctx);
     }
 
-    // Build the system prompt — base prompt comes from kernel (prompt_builder),
-    // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
-    if !memories.is_empty() {
-        let mem_pairs: Vec<(String, String)> = memories
-            .iter()
-            .map(|m| (String::new(), m.content.clone()))
-            .collect();
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
-    }
 
     let effective_exec_policy = manifest.exec_policy.as_ref();
     let auto_confirm_note = maybe_auto_confirm_pending_wardrobe(
@@ -2663,7 +2487,7 @@ pub async fn run_agent_loop_streaming(
     // Session compact summary — appended last in system prompt, closest to conversation.
     if manifest.agent_class == openfang_types::agent::AgentClass::Roleplay {
         if let Ok(Some(compact)) = memory.session_compact_summary(session.agent_id) {
-            system_prompt.push_str("\n\n## 今天早些时候\n\n");
+            system_prompt.push_str("\n\n## 早些时候\n\n");
             system_prompt.push_str(&compact);
         }
     }
@@ -3013,14 +2837,6 @@ pub async fn run_agent_loop_streaming(
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
                 save_projected_session(memory, session)?;
 
-                remember_memory_imprint(
-                    memory,
-                    embedding_driver,
-                    session,
-                    user_message,
-                    &final_response,
-                )
-                .await;
 
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
