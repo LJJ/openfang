@@ -2981,6 +2981,30 @@ impl OpenFangKernel {
         }
     }
 
+    /// Update session_id in both in-memory registry and the agents DB row.
+    ///
+    /// Why: `registry.update_session_id` only mutates the in-memory entry.
+    /// Without persistence, a kernel restart reloads the stale session_id from
+    /// SQLite, pointing at a session that may have been deleted or replaced.
+    /// Downstream (snapshot, rollback, get_session) then silently observes
+    /// "empty", which was the root cause of the 2026-04-18 cascading session wipe.
+    fn set_session_id(
+        &self,
+        agent_id: AgentId,
+        new_session_id: SessionId,
+    ) -> KernelResult<()> {
+        self.registry
+            .update_session_id(agent_id, new_session_id)
+            .map_err(KernelError::OpenFang)?;
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        self.memory
+            .save_agent(&entry)
+            .map_err(KernelError::OpenFang)?;
+        Ok(())
+    }
+
     /// Reset an agent's session — auto-saves a summary to memory, then clears messages
     /// and creates a fresh session ID.
     pub fn reset_session(&self, agent_id: AgentId) -> KernelResult<()> {
@@ -3007,10 +3031,8 @@ impl OpenFangKernel {
             .create_session(agent_id)
             .map_err(KernelError::OpenFang)?;
 
-        // Update registry with new session ID
-        self.registry
-            .update_session_id(agent_id, new_session.id)
-            .map_err(KernelError::OpenFang)?;
+        // Update registry with new session ID + persist to agents table
+        self.set_session_id(agent_id, new_session.id)?;
 
         info!(agent_id = %agent_id, "Session reset (summary saved to memory)");
         Ok(())
@@ -3031,7 +3053,7 @@ impl OpenFangKernel {
             None => {
                 // Session not yet persisted (e.g., fresh kernel start) — create it first
                 let new_session = self.memory.create_session(agent_id).map_err(KernelError::OpenFang)?;
-                self.registry.update_session_id(agent_id, new_session.id).map_err(KernelError::OpenFang)?;
+                self.set_session_id(agent_id, new_session.id)?;
                 new_session
             }
         };
@@ -3089,10 +3111,8 @@ impl OpenFangKernel {
             .create_session_with_label(agent_id, label)
             .map_err(KernelError::OpenFang)?;
 
-        // Switch to the new session
-        self.registry
-            .update_session_id(agent_id, session.id)
-            .map_err(KernelError::OpenFang)?;
+        // Switch to the new session + persist to agents table
+        self.set_session_id(agent_id, session.id)?;
 
         info!(agent_id = %agent_id, label = ?label, "Created new session");
 
@@ -3128,9 +3148,7 @@ impl OpenFangKernel {
             )));
         }
 
-        self.registry
-            .update_session_id(agent_id, session_id)
-            .map_err(KernelError::OpenFang)?;
+        self.set_session_id(agent_id, session_id)?;
 
         info!(agent_id = %agent_id, session_id = %session_id.0, "Switched session");
         Ok(())
