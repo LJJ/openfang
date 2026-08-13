@@ -14,9 +14,10 @@ const SYSTEM_FRAGMENTS: &[&str] = &[
 ];
 
 const INTERNAL_SUMMARY_PREFIXES: &[&str] = &[
-    "给公子回了消息",
-    "给他回了消息",
-    "给公子发了消息",
+    "给用户回了消息",
+    "给对方回了消息",
+    "给用户发了消息",
+    "给对方发了消息",
     "看起来 Turn Script 文件路径不对",
     "既然 `pending.json` 为空",
 ];
@@ -152,7 +153,7 @@ fn is_internal_summary(text: &str) -> bool {
         .iter()
         .any(|prefix| trimmed.starts_with(prefix))
         || (trimmed.starts_with("拍了张")
-            && (trimmed.contains("发给公子") || trimmed.contains("发给他")))
+            && (trimmed.contains("发给用户") || trimmed.contains("发给对方")))
 }
 
 fn select_fragment(text: &str) -> Option<String> {
@@ -205,9 +206,6 @@ fn fragment_score(text: Option<&str>) -> usize {
     if MEMORY_CUES.iter().any(|cue| text.contains(cue)) {
         score += 2;
     }
-    if text.contains("公子") {
-        score += 1;
-    }
     score
 }
 
@@ -220,16 +218,16 @@ fn render_memory_imprint(user: Option<&str>, assistant: Option<&str>) -> Option<
             if user.contains('吗') || user.contains('?') || user.contains('？') =>
         {
             Some(format!(
-                "你记得公子问过你“{}”，你当时回了“{}”。",
+                "你记得对方问过你“{}”，你当时回了“{}”。",
                 user, assistant
             ))
         }
         (Some(user), Some(assistant)) => Some(format!(
-            "你记得公子说过“{}”。你也把自己当时那句“{}”留在了心里。",
+            "你记得对方说过“{}”。你也把自己当时那句“{}”留在了心里。",
             user, assistant
         )),
-        (Some(user), None) => Some(format!("你记得公子说过“{}”。", user)),
-        (None, Some(assistant)) => Some(format!("你记得自己当时回过公子“{}”。", assistant)),
+        (Some(user), None) => Some(format!("你记得对方说过“{}”。", user)),
+        (None, Some(assistant)) => Some(format!("你记得自己当时回过对方“{}”。", assistant)),
         (None, None) => None,
     }
 }
@@ -267,7 +265,7 @@ mod tests {
 
     #[test]
     fn skips_internal_action_summaries() {
-        let memory = project_memory_imprint("你在干嘛", "给公子回了消息，说我在家看书。");
+        let memory = project_memory_imprint("你在干嘛", "给用户回了消息，说我在家看书。");
         assert!(memory.is_none());
     }
 }

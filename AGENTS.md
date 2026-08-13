@@ -1,16 +1,16 @@
 # OpenFang Source
 
-这个目录是 OpenFang 子仓源码。这里不是一次性导入的第三方代码，而是已经转为你自己的长期维护仓库。
+这个目录是 OpenFang 子仓源码。这里不是一次性导入的第三方代码，而是独立维护的内核仓库。
 
 作用：
 
 - 承载 OpenFang 内核、API、runtime、channels、skills 等源码
-- 作为你自己的 OpenFang 源码主仓
+- 作为项目独立维护的 OpenFang 源码主仓
 - 承接那些确实必须落到上游框架层的改动
 
 远端约定：
 
-- `origin`：`git@github.com:LJJ/openfang.git`
+- `origin`：项目配置的内核仓远端
 - `upstream`：如保留，仅用于历史参考；默认不再作为同步目标
 
 分支规则：

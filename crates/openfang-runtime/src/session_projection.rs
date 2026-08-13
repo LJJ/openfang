@@ -255,17 +255,17 @@ mod tests {
     fn project_for_persistent_dialogue_drops_internal_trace_text() {
         let messages = vec![
             Message::assistant("OK. NO_REPLY"),
-            Message::assistant("给公子回了消息，问他怎么了。"),
+            Message::assistant("给用户回了消息，询问发生了什么。"),
             Message::user("拍了张照片给你看"),
             Message::assistant("正常回复"),
         ];
 
         let projected = project_for_persistent_dialogue(&messages);
-        // "给公子回了消息" is now kept (no longer filtered as internal trace)
+        // Generic delivery summaries are kept here (no longer filtered as internal trace).
         assert_eq!(projected.len(), 3);
         assert_eq!(
             projected[0].content.text_content(),
-            "给公子回了消息，问他怎么了。"
+            "给用户回了消息，询问发生了什么。"
         );
         assert_eq!(projected[1].content.text_content(), "拍了张照片给你看");
         assert_eq!(projected[2].content.text_content(), "正常回复");

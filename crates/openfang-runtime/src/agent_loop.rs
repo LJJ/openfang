@@ -754,7 +754,7 @@ async fn maybe_auto_confirm_pending_wardrobe(
     }
 
     Some(format!(
-        "公子已经是在赞许这件、继续往下走了。按你们的关系，这就意味着你把“{item_name}”收下，收进自己的衣橱。后续按已经收下的状态自然继续，不要把对话拉回确认环节。"
+        "用户已经表示认可这件物品并希望继续。把“{item_name}”视为已经收下并放入衣橱，后续按这一事实自然继续，不要把对话拉回确认环节。"
     ))
 }
 
@@ -788,7 +788,7 @@ fn wardrobe_followup_phase_system_hint(
 
         if saw_explicit_confirmation && saw_confirmation_context {
             return Some(
-                "公子已经明确确认过了，宋玉就该把这件衣服收下。后续顺着关系自然推进，把它当作已经收进自己衣橱的衣服继续处理，不要回到确认环节，不要再说“我再发定妆照给你看一眼”“还没正式入库”“还没拿到成片文件”这类话；如果内部还没真正调用 mcp_toolbox_confirm_wardrobe_item，就先静默调用，再继续后续动作。",
+                "用户已经明确确认过了，角色应当把这件衣服收下。后续把它当作已经收进自己衣橱的衣服继续处理，不要回到确认环节，不要再说“我再发定妆照给你看一眼”“还没正式入库”“还没拿到成片文件”这类话；如果内部还没真正调用 mcp_toolbox_confirm_wardrobe_item，就先静默调用，再继续后续动作。",
             );
         }
     }

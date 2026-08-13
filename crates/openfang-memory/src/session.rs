@@ -754,7 +754,7 @@ mod tests {
         let store = setup();
         let agent_id = AgentId::new();
         let msgs: Vec<Message> = (0..120)
-            .map(|i| Message::user(format!("第{i}轮：公子这张图里，是个女孩子在室内做拉伸，旁边还有落地灯、小推车一类的家居摆设。")))
+            .map(|i| Message::user(format!("第{i}轮：用户发来的图里，是一个人在室内做拉伸，旁边还有落地灯、小推车一类的家居摆设。")))
             .collect();
 
         let canonical = store.append_canonical(agent_id, &msgs, Some(100)).unwrap();
