@@ -22,7 +22,7 @@
 
 改动边界：
 
-- 能留在父仓根目录或 `.openfang/` 配置层的差异，不优先下沉到这个子仓
+- 能留在父仓 `/home/ljj/openfang` 或 `.openfang/` 配置层的差异，不优先下沉到这个子仓
 - 只有确实需要改 OpenFang 通用 runtime / kernel / API / channel 能力时，才在这里改
 - 纯 OpenFang 业务语义、宋玉人设、提示词策略、运行态编排，优先放父仓，避免把业务差异过度下沉到源码层
 

@@ -52,7 +52,7 @@ const COMPACT_BUFFER_FORCE_LIMIT: usize = 20;
 ///
 /// Framed as the character writing their own memories (not a "summary module"),
 /// so the model stays in-character and faithfully processes all content types
-/// including complex multi-character scenes. `{AGENT}` is replaced with the current agent_name
+/// including intimate scenes. `{AGENT}` is replaced with the current agent_name
 /// so the example doesn't accidentally anchor the LLM onto another character.
 fn compact_instructions(agent_name: &str) -> String {
     format!(
@@ -60,7 +60,7 @@ fn compact_instructions(agent_name: &str) -> String {
          \n\
          - 「我」=={agent}，永远不要把别的角色当成「我」\n\
          - 输入里对 {agent} 的一切描述（如「{agent}走过来」「她把杯子放下」）都要改写成「我走过来」「我把杯子放下」\n\
-         - 输入里其他角色的名字和动作照旧用第三人称保留（「宋玉说」「王蝉看着我」这种不变）\n\
+         - 输入里其他角色的名字和动作照旧用第三人称保留（「宋玉说」「紫灵看着我」这种不变）\n\
          - **严格只写输入里实际发生过的事。** 输入里没有的情节、对话、地点、菜名、人物、动作、时间段，一律不得出现。宁可回忆写得短、跳过大段时间，也绝对不要靠常识或合理想象去补全一段看起来该有的剧情\n\
          - **事实细节必须照搬**：输入里出现的地点名（比如「村上一屋」「合生汇」）、菜名（「荞麦面」「茶碗蒸」）、人名、原话，一字不改地用，不要替换成近似的东西\n\
          - **输入里覆盖到的事件都要落到字面上**：如果输入横跨几个场景（出门→到店→点菜→吃饭→回家），每个出现过的环节都要写进去，不要只展开开头一个画面就结束。但反过来，输入没覆盖的时间段就直接跳过，不要强行串连\n\
@@ -126,7 +126,7 @@ pub async fn process_evicted_messages(
         .and_then(|ws| load_character_card(ws, agent_name))
         .unwrap_or_default();
 
-    // display_name 用作 prompt 里的人称标签——优先中文（"王蝉"），fallback 到 agent_name（"wangchan"）
+    // display_name 用作 prompt 里的人称标签——优先中文（"紫灵"），fallback 到 agent_name（"ziling"）
     let display_name = workspace_root
         .and_then(load_display_name)
         .unwrap_or_else(|| agent_name.to_string());
@@ -536,8 +536,8 @@ fn load_yesterday_summary(workspace: &std::path::Path) -> Option<String> {
 }
 
 /// 加载中文显示名（由 pre-turn hook 写入 context_cache.display_name）。
-/// 用于 compact prompt 里的人称锚定——优先用中文名（"王蝉"），避免拼音 agent_name
-/// （"wangchan"）和中文 character_card 混排导致的语感割裂。
+/// 用于 compact prompt 里的人称锚定——优先用中文名（"紫灵"），避免拼音 agent_name
+/// （"ziling"）和中文 character_card 混排导致的语感割裂。
 pub(crate) fn load_display_name(workspace: &std::path::Path) -> Option<String> {
     let cache_path = workspace.join("context_cache.json");
     let content = std::fs::read_to_string(&cache_path).ok()?;
@@ -665,9 +665,9 @@ mod tests {
 
     #[test]
     fn test_compact_instructions_anchors_agent_name() {
-        let wangchan = compact_instructions("王蝉");
-        assert!(wangchan.contains("你是 王蝉"));
-        assert!(wangchan.contains("王蝉走过来"));
-        assert!(!wangchan.contains("宋玉走过来"));
+        let ziling = compact_instructions("紫灵");
+        assert!(ziling.contains("你是 紫灵"));
+        assert!(ziling.contains("紫灵走过来"));
+        assert!(!ziling.contains("宋玉走过来"));
     }
 }

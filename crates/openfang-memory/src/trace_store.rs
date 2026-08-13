@@ -592,7 +592,7 @@ mod tests {
             .create_trace("t2", "tick", "a1", "assistant", None)
             .unwrap();
         store
-            .create_trace("t3", "user", "a2", "wangchan", None)
+            .create_trace("t3", "user", "a2", "ziling", None)
             .unwrap();
 
         let (traces, total) = store
