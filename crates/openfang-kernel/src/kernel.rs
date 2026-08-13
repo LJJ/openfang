@@ -784,7 +784,7 @@ fn read_identity_file(workspace: &Path, filename: &str) -> Option<String> {
 /// (e.g. `01-world-briefing.md`, `02-rules.md`).
 ///
 /// Agent filtering: if a `.toml` sidecar exists next to an `.md` file
-/// (e.g. `90-nsfw-rules.toml` for `90-nsfw-rules.md`) with an `agents`
+/// (e.g. `90-content-rules.toml` for `90-content-rules.md`) with an `agents`
 /// array, the `.md` is only included for agents in that whitelist.
 /// No sidecar → included for all agents.
 fn load_prompt_suffix_dir(home_dir: &Path, agent_name: &str) -> Option<String> {
@@ -2923,9 +2923,8 @@ impl OpenFangKernel {
         }
 
         // ── Post-hook mode prompt + deferred prompt_suffix injection ──
-        // For roleplay agents: mode first, then nsfw/content rules (prompt_suffix).
-        // This ensures mode context is closer to the identity sections than the
-        // reference-style content rules.
+        // For roleplay agents: mode first, then general content rules (prompt_suffix).
+        // This keeps mode context closer to the identity sections.
         if manifest.agent_class == AgentClass::Roleplay {
             let mode = hook_interaction_mode.as_deref().unwrap_or("remote");
             let mode_prompt = load_roleplay_mode_prompt(&self.config, &manifest.name, mode);

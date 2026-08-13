@@ -266,7 +266,8 @@ fn auto_wrap_text_to_turn_script(text: &str, agent_name: &str) -> Result<(), Str
         agent_name.to_string()
     };
     let home_dir = std::env::var("OPENFANG_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ljj".to_string());
+        let home =
+            std::env::var("HOME").unwrap_or_else(|_| std::env::temp_dir().display().to_string());
         format!("{home}/.openfang")
     });
     let pending_path = std::path::PathBuf::from(&home_dir)
@@ -3548,7 +3549,7 @@ mod tests {
             name: "mcp_toolbox_generate_image".to_string(),
             input: serde_json::json!({
                 "prompt": "写实真实照片，手机前置镜头自拍，早上刚醒。",
-                "input_images": ["/home/ljj/.openfang/agents/assistant/avatar.png"]
+                "input_images": ["/home/user/.openfang/agents/assistant/avatar.png"]
             }),
         };
 
@@ -3751,7 +3752,7 @@ mod tests {
             name: "mcp_toolbox_generate_image".to_string(),
             input: serde_json::json!({
                 "prompt": "写实真实照片，手机前置镜头自拍，窗边自然光。",
-                "input_images": ["/home/ljj/.openfang/agents/assistant/avatar.png"]
+                "input_images": ["/home/user/.openfang/agents/assistant/avatar.png"]
             }),
         };
         let mut successful_tools = HashSet::new();
@@ -3796,7 +3797,7 @@ mod tests {
             name: "mcp_toolbox_generate_image".to_string(),
             input: serde_json::json!({
                 "prompt": "写实真实照片，手机前置镜头自拍，窗边自然光。",
-                "input_images": ["/home/ljj/.openfang/agents/assistant/avatar.png"]
+                "input_images": ["/home/user/.openfang/agents/assistant/avatar.png"]
             }),
         };
 
