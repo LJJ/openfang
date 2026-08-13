@@ -109,7 +109,9 @@ pub async fn put_llm_routing(
                 Some(entry) => match state.kernel.set_agent_model(entry.id, &value) {
                     Ok(()) => (
                         StatusCode::OK,
-                        Json(serde_json::json!({"status": "ok", "slot": slot, "field": field, "value": value, "method": "kernel_hot_swap"})),
+                        Json(
+                            serde_json::json!({"status": "ok", "slot": slot, "field": field, "value": value, "method": "kernel_hot_swap"}),
+                        ),
                     ),
                     Err(e) => (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -140,7 +142,9 @@ pub async fn put_llm_routing(
             return match update_agent_fallback_model(&toml_path, idx, &value) {
                 Ok(()) => (
                     StatusCode::OK,
-                    Json(serde_json::json!({"status": "ok", "slot": slot, "field": field, "value": value, "method": "agent_toml_edit", "note": "Restart required for fallback changes to take effect"})),
+                    Json(
+                        serde_json::json!({"status": "ok", "slot": slot, "field": field, "value": value, "method": "agent_toml_edit", "note": "Restart required for fallback changes to take effect"}),
+                    ),
                 ),
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -185,7 +189,9 @@ pub async fn put_llm_routing(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({"status": "ok", "slot": slot, "field": field, "value": value, "method": "file_write"})),
+        Json(
+            serde_json::json!({"status": "ok", "slot": slot, "field": field, "value": value, "method": "file_write"}),
+        ),
     )
 }
 
@@ -195,9 +201,17 @@ fn sync_cascade_config(home: &std::path::Path, slot: &str, field: &str, value: &
         ("director", "primary", "director_model"),
         ("director", "fallback", "director_fallback_model"),
         ("cascade:present", "primary", "cascade_model_present"),
-        ("cascade:present", "fallback", "cascade_fallback_model_present"),
+        (
+            "cascade:present",
+            "fallback",
+            "cascade_fallback_model_present",
+        ),
         ("cascade:absent", "primary", "cascade_model_absent"),
-        ("cascade:absent", "fallback", "cascade_fallback_model_absent"),
+        (
+            "cascade:absent",
+            "fallback",
+            "cascade_fallback_model_absent",
+        ),
     ];
     for (s, f, json_key) in MAP {
         if *s == slot && *f == field {
@@ -255,9 +269,7 @@ fn update_agent_fallback_model(
 ///
 /// Reads the actual API key from the specified env var, sends a minimal
 /// chat completion request, and reports latency + truncated response.
-pub async fn test_llm_routing(
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
+pub async fn test_llm_routing(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
     let model = match body["model"].as_str() {
         Some(m) if !m.is_empty() => m.to_string(),
         _ => {
@@ -299,12 +311,14 @@ pub async fn test_llm_routing(
         "max_tokens"
     };
 
-    let request_body = serde_json::json!({
+    let mut request_body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": message}],
-        "temperature": 0.1,
         token_key: 50,
     });
+    if !model.starts_with("gpt-5.5") {
+        request_body["temperature"] = serde_json::json!(0.1);
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))

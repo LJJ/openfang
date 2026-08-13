@@ -462,10 +462,13 @@ async fn handle_text_message(
             // Send message to agent with streaming (with inline media if present)
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
-            match state
-                .kernel
-                .send_message_streaming_with_media(agent_id, &content, Some(kernel_handle), media_blocks, None)
-            {
+            match state.kernel.send_message_streaming_with_media(
+                agent_id,
+                &content,
+                Some(kernel_handle),
+                media_blocks,
+                None,
+            ) {
                 Ok((mut rx, handle)) => {
                     // Forward stream events to WebSocket with debouncing
                     let sender_stream = Arc::clone(sender);

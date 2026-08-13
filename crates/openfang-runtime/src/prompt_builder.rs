@@ -79,11 +79,22 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             ctx.identity_md.as_deref(),
             ctx.soul_md.as_deref(),
             ctx.user_md.as_deref(),
-            if ctx.is_roleplay { None } else { ctx.workspace_path.as_deref() },
+            if ctx.is_roleplay {
+                None
+            } else {
+                ctx.workspace_path.as_deref()
+            },
         );
         if !persona.is_empty() {
             sections.push(persona);
         }
+    }
+
+    // Section 2.5 — Skill Prompt Context (skip for subagents)
+    // Prompt-only skills inject operational instructions (e.g. "use wear to change clothes").
+    // Critical for roleplay agents since they skip the generic tools/MCP sections.
+    if !ctx.is_subagent && !ctx.skill_prompt_context.is_empty() {
+        sections.push(ctx.skill_prompt_context.clone());
     }
 
     // Section 3 — Tool Call Behavior (skip for subagents and roleplay)
@@ -300,7 +311,7 @@ fn build_persona_section(
         if !soul.trim().is_empty() {
             parts.push(format!(
                 "## 你是谁\n用这个身份说话，自然一点，不要端着。\n{}",
-                cap_str(soul, 1000)
+                cap_str(soul, 3000)
             ));
         }
     }
@@ -692,12 +703,12 @@ mod tests {
     }
 
     #[test]
-    fn test_persona_soul_capped_at_1000() {
-        let long_soul = "x".repeat(2000);
+    fn test_persona_soul_capped_at_3000() {
+        let long_soul = "x".repeat(5000);
         let section = build_persona_section(None, Some(&long_soul), None, None);
         assert!(section.contains("..."));
-        // The raw soul content in the section should be at most 1003 chars (1000 + "...")
-        assert!(section.len() < 1200);
+        // The raw soul content in the section should be at most 3003 chars (3000 + "...")
+        assert!(section.len() < 3200);
     }
 
     #[test]

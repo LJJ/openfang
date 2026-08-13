@@ -116,15 +116,13 @@ fn resolve_from_catalog(
         .get_provider(&provider)
         .map(|p| p.api_key_env.clone())
         .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
-    let base_url = catalog
-        .get_provider(&provider)
-        .and_then(|p| {
-            if p.base_url.is_empty() {
-                None
-            } else {
-                Some(p.base_url.clone())
-            }
-        });
+    let base_url = catalog.get_provider(&provider).and_then(|p| {
+        if p.base_url.is_empty() {
+            None
+        } else {
+            Some(p.base_url.clone())
+        }
+    });
     Some((provider, api_key_env, base_url))
 }
 
@@ -216,7 +214,10 @@ mod tests {
                 "empty": { "primary": "" }
             }
         });
-        assert_eq!(read_slot_model(&config, "compact").unwrap(), "deepseek-chat");
+        assert_eq!(
+            read_slot_model(&config, "compact").unwrap(),
+            "deepseek-chat"
+        );
         assert!(read_slot_model(&config, "empty").is_none());
         assert!(read_slot_model(&config, "missing").is_none());
     }

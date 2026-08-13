@@ -159,18 +159,12 @@ pub fn model_override() -> Option<String> {
 
 /// Read the ephemeral context set by pre-turn hook, if any.
 pub fn ephemeral_context() -> Option<String> {
-    EPHEMERAL_CONTEXT
-        .try_with(|v| v.clone())
-        .ok()
-        .flatten()
+    EPHEMERAL_CONTEXT.try_with(|v| v.clone()).ok().flatten()
 }
 
 /// Read the ephemeral system prompt suffix set by pre-turn hook, if any.
 pub fn ephemeral_system() -> Option<String> {
-    EPHEMERAL_SYSTEM
-        .try_with(|v| v.clone())
-        .ok()
-        .flatten()
+    EPHEMERAL_SYSTEM.try_with(|v| v.clone()).ok().flatten()
 }
 
 /// Read the user message injection context, if any.
@@ -1588,7 +1582,9 @@ async fn tool_agent_send(
         // World state becomes a dynamic injection (assistant role, before last user msg)
         push_dynamic_injection(DynamicInjection {
             content: message.to_string(),
-            position: InjectionPosition::InsertAssistant { offset_from_last: 0 },
+            position: InjectionPosition::InsertAssistant {
+                offset_from_last: 0,
+            },
         });
         if user_msg.is_empty() {
             warn!("USER_MESSAGE_INJECTION is empty — assistant will receive no user message");

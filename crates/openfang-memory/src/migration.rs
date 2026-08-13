@@ -360,10 +360,7 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// Version 9: Add parent_trace_id column to traces table for cascade trace linking.
 fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
     if !column_exists(conn, "traces", "parent_trace_id") {
-        conn.execute(
-            "ALTER TABLE traces ADD COLUMN parent_trace_id TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE traces ADD COLUMN parent_trace_id TEXT", [])?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (9, datetime('now'), 'Add parent_trace_id to traces for cascade linking')",

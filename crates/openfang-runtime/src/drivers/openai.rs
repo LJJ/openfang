@@ -42,7 +42,8 @@ struct OaiRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OaiTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,7 +56,14 @@ struct OaiRequest {
 
 /// GPT-5.x and o-series models require `max_completion_tokens` instead of `max_tokens`.
 fn use_max_completion_tokens(model: &str) -> bool {
-    model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4")
+    model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+}
+
+fn use_default_temperature(model: &str) -> bool {
+    model.starts_with("gpt-5.5")
 }
 
 #[derive(Debug, Serialize)]
@@ -145,13 +153,75 @@ struct OaiUsage {
     completion_tokens: u64,
 }
 
+/// Convert a user Blocks message into one or more OpenAI-compatible messages.
+///
+/// Text-only block messages are flattened back to plain string content for
+/// maximum compatibility with OpenAI-compatible providers. Multimodal content
+/// stays in parts form. Tool results are emitted as separate `tool` messages.
+fn push_user_blocks_as_oai_messages(oai_messages: &mut Vec<OaiMessage>, blocks: &[ContentBlock]) {
+    let mut parts: Vec<OaiContentPart> = Vec::new();
+    let mut text_only = String::new();
+    let mut has_non_text_part = false;
+    let mut has_tool_results = false;
+
+    for block in blocks {
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                has_tool_results = true;
+                oai_messages.push(OaiMessage {
+                    role: "tool".to_string(),
+                    content: Some(OaiMessageContent::Text(content.clone())),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+            }
+            ContentBlock::Text { text } => {
+                text_only.push_str(text);
+                parts.push(OaiContentPart::Text { text: text.clone() });
+            }
+            ContentBlock::Image { media_type, data } => {
+                has_non_text_part = true;
+                parts.push(OaiContentPart::ImageUrl {
+                    image_url: OaiImageUrl {
+                        url: format!("data:{media_type};base64,{data}"),
+                    },
+                });
+            }
+            ContentBlock::Thinking { .. } => {}
+            _ => {}
+        }
+    }
+
+    if !parts.is_empty() && !has_tool_results {
+        let content = if has_non_text_part {
+            OaiMessageContent::Parts(parts)
+        } else {
+            OaiMessageContent::Text(text_only)
+        };
+        oai_messages.push(OaiMessage {
+            role: "user".to_string(),
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+}
+
 #[async_trait]
 impl LlmDriver for OpenAIDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        // Delegate to streaming implementation with a dummy channel.
+        // Delegate to streaming implementation with a dummy drain channel.
         // This ensures all requests use stream:true, which some API proxies require.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
-        // Spawn a task to drain the channel so the stream method doesn't block.
+        //
+        // 容量必须给足：stream() 每个 token delta 触发一次 tx.send().await。
+        // 原先 bounded(64) 遇到长输出（尤其 deepseek 按 char 流式）会在第 65 个
+        // delta 堵死 send，byte_stream 停 poll，server 端超时关连接，输出卡在 ~64 token。
+        // 消费端这里只丢弃，不存在真实背压需求，放一个远超任何模型输出上限的值即可。
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(1_000_000);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         return self.stream(request, tx).await;
 
@@ -199,46 +269,7 @@ impl LlmDriver for OpenAIDriver {
                     });
                 }
                 (Role::User, MessageContent::Blocks(blocks)) => {
-                    // Handle tool results and images in user messages
-                    let mut parts: Vec<OaiContentPart> = Vec::new();
-                    let mut has_tool_results = false;
-                    for block in blocks {
-                        match block {
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                ..
-                            } => {
-                                has_tool_results = true;
-                                oai_messages.push(OaiMessage {
-                                    role: "tool".to_string(),
-                                    content: Some(OaiMessageContent::Text(content.clone())),
-                                    tool_calls: None,
-                                    tool_call_id: Some(tool_use_id.clone()),
-                                });
-                            }
-                            ContentBlock::Text { text } => {
-                                parts.push(OaiContentPart::Text { text: text.clone() });
-                            }
-                            ContentBlock::Image { media_type, data } => {
-                                parts.push(OaiContentPart::ImageUrl {
-                                    image_url: OaiImageUrl {
-                                        url: format!("data:{media_type};base64,{data}"),
-                                    },
-                                });
-                            }
-                            ContentBlock::Thinking { .. } => {}
-                            _ => {}
-                        }
-                    }
-                    if !parts.is_empty() && !has_tool_results {
-                        oai_messages.push(OaiMessage {
-                            role: "user".to_string(),
-                            content: Some(OaiMessageContent::Parts(parts)),
-                            tool_calls: None,
-                            tool_call_id: None,
-                        });
-                    }
+                    push_user_blocks_as_oai_messages(&mut oai_messages, blocks);
                 }
                 (Role::Assistant, MessageContent::Blocks(blocks)) => {
                     let mut text_parts = Vec::new();
@@ -305,9 +336,21 @@ impl LlmDriver for OpenAIDriver {
         let mut oai_request = OaiRequest {
             model: request.model.clone(),
             messages: oai_messages,
-            max_tokens: if use_mct { None } else { Some(request.max_tokens) },
-            max_completion_tokens: if use_mct { Some(request.max_tokens) } else { None },
-            temperature: request.temperature,
+            max_tokens: if use_mct {
+                None
+            } else {
+                Some(request.max_tokens)
+            },
+            max_completion_tokens: if use_mct {
+                Some(request.max_tokens)
+            } else {
+                None
+            },
+            temperature: if use_default_temperature(&request.model) {
+                None
+            } else {
+                Some(request.temperature)
+            },
             tools: oai_tools,
             tool_choice,
             stream: false,
@@ -363,7 +406,11 @@ impl LlmDriver for OpenAIDriver {
                 }
 
                 // Model requires max_completion_tokens instead of max_tokens — switch and retry
-                if status == 400 && body.contains("max_completion_tokens") && oai_request.max_tokens.is_some() && attempt < max_retries {
+                if status == 400
+                    && body.contains("max_completion_tokens")
+                    && oai_request.max_tokens.is_some()
+                    && attempt < max_retries
+                {
                     let val = oai_request.max_tokens.take().unwrap();
                     oai_request.max_completion_tokens = Some(val);
                     warn!(model = %oai_request.model, "Switching from max_tokens to max_completion_tokens");
@@ -372,13 +419,24 @@ impl LlmDriver for OpenAIDriver {
 
                 // Auto-cap max_tokens when model rejects our value (e.g. Groq Maverick limit 8192)
                 if status == 400 && body.contains("max_tokens") && attempt < max_retries {
-                    let current = oai_request.max_tokens.or(oai_request.max_completion_tokens).unwrap_or(4096);
+                    let current = oai_request
+                        .max_tokens
+                        .or(oai_request.max_completion_tokens)
+                        .unwrap_or(4096);
                     let cap = extract_max_tokens_limit(&body).unwrap_or(current / 2);
                     if oai_request.max_completion_tokens.is_some() {
-                        warn!(old = current, new = cap, "Auto-capping max_completion_tokens to model limit");
+                        warn!(
+                            old = current,
+                            new = cap,
+                            "Auto-capping max_completion_tokens to model limit"
+                        );
                         oai_request.max_completion_tokens = Some(cap);
                     } else {
-                        warn!(old = current, new = cap, "Auto-capping max_tokens to model limit");
+                        warn!(
+                            old = current,
+                            new = cap,
+                            "Auto-capping max_tokens to model limit"
+                        );
                         oai_request.max_tokens = Some(cap);
                     }
                     continue;
@@ -415,6 +473,14 @@ impl LlmDriver for OpenAIDriver {
 
             if let Some(calls) = choice.message.tool_calls {
                 for call in calls {
+                    if call.function.name.trim().is_empty() {
+                        tracing::warn!(
+                            tool_id = %call.id,
+                            arguments = %call.function.arguments,
+                            "Dropping malformed tool_call with empty function name from upstream response"
+                        );
+                        continue;
+                    }
                     let input: serde_json::Value =
                         serde_json::from_str(&call.function.arguments).unwrap_or_default();
                     content.push(ContentBlock::ToolUse {
@@ -512,21 +578,7 @@ impl LlmDriver for OpenAIDriver {
                     });
                 }
                 (Role::User, MessageContent::Blocks(blocks)) => {
-                    for block in blocks {
-                        if let ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } = block
-                        {
-                            oai_messages.push(OaiMessage {
-                                role: "tool".to_string(),
-                                content: Some(OaiMessageContent::Text(content.clone())),
-                                tool_calls: None,
-                                tool_call_id: Some(tool_use_id.clone()),
-                            });
-                        }
-                    }
+                    push_user_blocks_as_oai_messages(&mut oai_messages, blocks);
                 }
                 (Role::Assistant, MessageContent::Blocks(blocks)) => {
                     let mut text_parts = Vec::new();
@@ -593,9 +645,21 @@ impl LlmDriver for OpenAIDriver {
         let mut oai_request = OaiRequest {
             model: request.model.clone(),
             messages: oai_messages,
-            max_tokens: if use_mct { None } else { Some(request.max_tokens) },
-            max_completion_tokens: if use_mct { Some(request.max_tokens) } else { None },
-            temperature: request.temperature,
+            max_tokens: if use_mct {
+                None
+            } else {
+                Some(request.max_tokens)
+            },
+            max_completion_tokens: if use_mct {
+                Some(request.max_tokens)
+            } else {
+                None
+            },
+            temperature: if use_default_temperature(&request.model) {
+                None
+            } else {
+                Some(request.temperature)
+            },
             tools: oai_tools,
             tool_choice,
             stream: true,
@@ -653,7 +717,11 @@ impl LlmDriver for OpenAIDriver {
                 }
 
                 // Model requires max_completion_tokens instead of max_tokens — switch and retry
-                if status == 400 && body.contains("max_completion_tokens") && oai_request.max_tokens.is_some() && attempt < max_retries {
+                if status == 400
+                    && body.contains("max_completion_tokens")
+                    && oai_request.max_tokens.is_some()
+                    && attempt < max_retries
+                {
                     let val = oai_request.max_tokens.take().unwrap();
                     oai_request.max_completion_tokens = Some(val);
                     warn!(model = %oai_request.model, "Switching from max_tokens to max_completion_tokens (stream)");
@@ -662,10 +730,17 @@ impl LlmDriver for OpenAIDriver {
 
                 // Auto-cap max_tokens when model rejects our value
                 if status == 400 && body.contains("max_tokens") && attempt < max_retries {
-                    let current = oai_request.max_tokens.or(oai_request.max_completion_tokens).unwrap_or(4096);
+                    let current = oai_request
+                        .max_tokens
+                        .or(oai_request.max_completion_tokens)
+                        .unwrap_or(4096);
                     let cap = extract_max_tokens_limit(&body).unwrap_or(current / 2);
                     if oai_request.max_completion_tokens.is_some() {
-                        warn!(old = current, new = cap, "Auto-capping max_completion_tokens (stream)");
+                        warn!(
+                            old = current,
+                            new = cap,
+                            "Auto-capping max_completion_tokens (stream)"
+                        );
                         oai_request.max_completion_tokens = Some(cap);
                     } else {
                         warn!(old = current, new = cap, "Auto-capping max_tokens (stream)");
@@ -750,9 +825,8 @@ impl LlmDriver for OpenAIDriver {
                                     match action {
                                         FilterAction::EmitText(t) => {
                                             text_content.push_str(&t);
-                                            let _ = tx
-                                                .send(StreamEvent::TextDelta { text: t })
-                                                .await;
+                                            let _ =
+                                                tx.send(StreamEvent::TextDelta { text: t }).await;
                                         }
                                         FilterAction::EmitThinking(t) => {
                                             let _ = tx
@@ -836,6 +910,14 @@ impl LlmDriver for OpenAIDriver {
             }
 
             for (id, name, arguments) in &tool_accum {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        tool_id = %id,
+                        arguments = %arguments,
+                        "Dropping malformed tool_call with empty function name from upstream stream"
+                    );
+                    continue;
+                }
                 let input: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
@@ -1008,6 +1090,74 @@ mod tests {
     fn test_openai_driver_creation() {
         let driver = OpenAIDriver::new("test-key".to_string(), "http://localhost".to_string());
         assert_eq!(driver.api_key.as_str(), "test-key");
+    }
+
+    #[test]
+    fn test_push_user_blocks_flattens_text_only_messages() {
+        let mut messages = Vec::new();
+        push_user_blocks_as_oai_messages(
+            &mut messages,
+            &[
+                ContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                ContentBlock::Text {
+                    text: " world".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        match messages[0].content.as_ref() {
+            Some(OaiMessageContent::Text(text)) => assert_eq!(text, "hello world"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_push_user_blocks_keeps_multimodal_parts() {
+        let mut messages = Vec::new();
+        push_user_blocks_as_oai_messages(
+            &mut messages,
+            &[
+                ContentBlock::Text {
+                    text: "look".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "abcd".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        match messages[0].content.as_ref() {
+            Some(OaiMessageContent::Parts(parts)) => assert_eq!(parts.len(), 2),
+            other => panic!("expected multimodal parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_push_user_blocks_keeps_tool_results_as_tool_messages() {
+        let mut messages = Vec::new();
+        push_user_blocks_as_oai_messages(
+            &mut messages,
+            &[ContentBlock::ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                content: "done".to_string(),
+                is_error: false,
+            }],
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "tool");
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("tool-1"));
+        match messages[0].content.as_ref() {
+            Some(OaiMessageContent::Text(text)) => assert_eq!(text, "done"),
+            other => panic!("expected tool text content, got {other:?}"),
+        }
     }
 
     #[test]

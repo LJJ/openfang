@@ -273,27 +273,18 @@ impl MemorySubstrate {
     }
 
     /// Store a new compact summary and clear the pending buffer.
-    pub fn store_session_compact(
-        &self,
-        agent_id: AgentId,
-        summary: &str,
-    ) -> OpenFangResult<()> {
-        self.session_compacts.store_compact_result(agent_id, summary)
+    pub fn store_session_compact(&self, agent_id: AgentId, summary: &str) -> OpenFangResult<()> {
+        self.session_compacts
+            .store_compact_result(agent_id, summary)
     }
 
     /// Read the compact summary for prompt injection.
-    pub fn session_compact_summary(
-        &self,
-        agent_id: AgentId,
-    ) -> OpenFangResult<Option<String>> {
+    pub fn session_compact_summary(&self, agent_id: AgentId) -> OpenFangResult<Option<String>> {
         self.session_compacts.get_summary(agent_id)
     }
 
     /// Load the full compact state (for compact logic that needs buffer contents).
-    pub fn session_compact_state(
-        &self,
-        agent_id: AgentId,
-    ) -> OpenFangResult<SessionCompactState> {
+    pub fn session_compact_state(&self, agent_id: AgentId) -> OpenFangResult<SessionCompactState> {
         self.session_compacts.load(agent_id)
     }
 

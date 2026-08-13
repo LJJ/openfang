@@ -1,8 +1,10 @@
-//! Session projections separate dialogue memory from execution trace.
+//! Session projections shape what's kept in long-term session history.
 //!
-//! A single runtime turn may need rich tool-use / tool-result history to
-//! complete a complex task, but that same raw execution trace should not be
-//! carried into future turns as durable dialogue context.
+//! Tool-use / tool-result pairs are now preserved across turns: some tool
+//! outputs carry dialogue-relevant state that the next turn needs to reason
+//! about. Only content that has no cross-turn value is stripped here:
+//! reasoning / thinking blocks (leak internal deliberation) and inline
+//! rich-media payloads (should be referenced by path, not re-embedded).
 
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 
@@ -43,11 +45,9 @@ fn is_internal_trace_text(role: Role, text: &str) -> bool {
     ];
 
     match role {
-        Role::Assistant => {
-            assistant_prefixes
-                .iter()
-                .any(|prefix| lower.starts_with(prefix))
-        }
+        Role::Assistant => assistant_prefixes
+            .iter()
+            .any(|prefix| lower.starts_with(prefix)),
         Role::System => true,
         _ => false,
     }
@@ -115,9 +115,10 @@ fn strip_execution_blocks(role: Role, content: &MessageContent) -> Option<Messag
                     }
                     ContentBlock::Unknown => Some(ContentBlock::Unknown),
                     ContentBlock::Image { .. } => None,
-                    ContentBlock::ToolUse { .. }
-                    | ContentBlock::ToolResult { .. }
-                    | ContentBlock::Thinking { .. } => None,
+                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {
+                        Some(block.clone())
+                    }
+                    ContentBlock::Thinking { .. } => None,
                 })
                 .collect();
 
@@ -168,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn project_for_persistent_dialogue_drops_tool_blocks_but_keeps_text() {
+    fn project_for_persistent_dialogue_keeps_tool_blocks() {
         let messages = vec![
             Message::user("你已经放进衣橱了吗？"),
             Message {
@@ -191,9 +192,49 @@ mod tests {
         ];
 
         let projected = project_for_persistent_dialogue(&messages);
-        assert_eq!(projected.len(), 2);
+        assert_eq!(projected.len(), 4);
+
+        assert!(matches!(
+            &projected[1].content,
+            MessageContent::Blocks(blocks)
+                if blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "call_1"))
+        ));
+        assert!(matches!(
+            &projected[2].content,
+            MessageContent::Blocks(blocks)
+                if blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"))
+        ));
         assert_eq!(projected[0].content.text_content(), "你已经放进衣橱了吗？");
-        assert_eq!(projected[1].content.text_content(), "已经放进去了。");
+        assert_eq!(projected[3].content.text_content(), "已经放进去了。");
+    }
+
+    #[test]
+    fn project_for_persistent_dialogue_still_drops_thinking_blocks() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "internal reasoning".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "外部回复".to_string(),
+                },
+            ]),
+        }];
+
+        let projected = project_for_persistent_dialogue(&messages);
+        assert_eq!(projected.len(), 1);
+        match &projected[0].content {
+            MessageContent::Blocks(blocks) => {
+                assert!(!blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Thinking { .. })));
+                assert!(blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text == "外部回复")));
+            }
+            _ => panic!("expected blocks"),
+        }
     }
 
     #[test]

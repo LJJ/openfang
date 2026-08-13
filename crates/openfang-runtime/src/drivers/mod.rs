@@ -232,10 +232,11 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
                 )
             })?;
         let project = std::env::var("VERTEX_PROJECT").map_err(|_| {
-            LlmError::MissingApiKey("Set VERTEX_PROJECT environment variable for Vertex AI".to_string())
+            LlmError::MissingApiKey(
+                "Set VERTEX_PROJECT environment variable for Vertex AI".to_string(),
+            )
         })?;
-        let location =
-            std::env::var("VERTEX_LOCATION").unwrap_or_else(|_| "global".to_string());
+        let location = std::env::var("VERTEX_LOCATION").unwrap_or_else(|_| "global".to_string());
         return vertex::VertexDriver::new(&creds_path, project, location)
             .map(|d| Arc::new(d) as Arc<dyn LlmDriver>);
     }

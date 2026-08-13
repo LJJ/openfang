@@ -431,7 +431,8 @@ async fn dispatch_message(
             if let Err(msg) =
                 rate_limiter.check(ct_str, &message.sender.platform_id, ov.rate_limit_per_user)
             {
-                let _ = send_response(adapter, &message.sender, msg, thread_id, output_format).await;
+                let _ =
+                    send_response(adapter, &message.sender, msg, thread_id, output_format).await;
                 return;
             }
         }
@@ -565,7 +566,8 @@ async fn dispatch_message(
             }
 
             let combined = responses.join("\n\n");
-            let _ = send_response(adapter, &message.sender, combined, thread_id, output_format).await;
+            let _ =
+                send_response(adapter, &message.sender, combined, thread_id, output_format).await;
             return;
         }
     }

@@ -109,7 +109,9 @@ pub fn recover_from_overflow(
             let new_est = estimate_tokens(messages, system_prompt, tools);
             if new_est <= threshold_90 {
                 return RecoveryResult {
-                    stage: RecoveryStage::OverflowCompaction { removed: total_removed },
+                    stage: RecoveryStage::OverflowCompaction {
+                        removed: total_removed,
+                    },
                     evicted: all_evicted,
                 };
             }

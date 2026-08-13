@@ -136,7 +136,10 @@ impl<'de> serde::Deserialize<'de> for GeminiPart {
         }
 
         // Unknown part type — treat as empty text to avoid breaking the parse
-        warn!("Unknown GeminiPart keys: {:?}", obj.keys().collect::<Vec<_>>());
+        warn!(
+            "Unknown GeminiPart keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
         Ok(GeminiPart::Text {
             text: String::new(),
         })
@@ -296,16 +299,17 @@ pub(crate) fn convert_messages(
                             content,
                             ..
                         } => {
-                            let name = tool_id_to_name
-                                .get(tool_use_id)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    warn!(
-                                        tool_use_id,
-                                        "ToolResult has no matching ToolUse for name lookup"
-                                    );
-                                    "unknown_tool".to_string()
-                                });
+                            let name =
+                                tool_id_to_name
+                                    .get(tool_use_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        warn!(
+                                            tool_use_id,
+                                            "ToolResult has no matching ToolUse for name lookup"
+                                        );
+                                        "unknown_tool".to_string()
+                                    });
                             parts.push(GeminiPart::FunctionResponse {
                                 function_response: GeminiFunctionResponseData {
                                     name,
@@ -333,7 +337,10 @@ pub(crate) fn convert_messages(
 }
 
 /// Extract system prompt from messages or the explicit system field.
-pub(crate) fn extract_system(messages: &[Message], system: &Option<String>) -> Option<GeminiContent> {
+pub(crate) fn extract_system(
+    messages: &[Message],
+    system: &Option<String>,
+) -> Option<GeminiContent> {
     let text = system.clone().or_else(|| {
         messages.iter().find_map(|m| {
             if m.role == Role::System {
@@ -528,7 +535,10 @@ impl LlmDriver for GeminiDriver {
         let gemini_response: GeminiResponse =
             serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))?;
 
-        let (response, new_sigs) = convert_response(gemini_response)?;
+        let (mut response, new_sigs) = convert_response(gemini_response)?;
+        if response.model.is_none() {
+            response.model = Some(request.model.clone());
+        }
         // Cache thought_signatures for subsequent multi-turn calls
         if !new_sigs.is_empty() {
             let mut cache = self.thought_signatures.lock().unwrap();
@@ -731,7 +741,7 @@ impl LlmDriver for GeminiDriver {
             stop_reason,
             tool_calls,
             usage,
-            model: None,
+            model: Some(request.model),
         })
     }
 }
@@ -866,8 +876,7 @@ mod tests {
     #[test]
     fn test_convert_messages_assistant_role() {
         let messages = vec![Message::user("Hello"), Message::assistant("Hi there!")];
-        let (contents, _) =
-            convert_messages(&messages, &None, &std::collections::HashMap::new());
+        let (contents, _) = convert_messages(&messages, &None, &std::collections::HashMap::new());
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0].role.as_deref(), Some("user"));
         assert_eq!(contents[1].role.as_deref(), Some("model"));

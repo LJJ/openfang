@@ -387,16 +387,27 @@ impl TraceStore {
                     parent_span_id: row.get(2)?,
                     name: row.get(3)?,
                     kind: SpanKind::from_str(
-                        &row.get::<_, String>(4).unwrap_or_else(|_| "custom".to_string()),
+                        &row.get::<_, String>(4)
+                            .unwrap_or_else(|_| "custom".to_string()),
                     ),
                     started_at: row.get(5)?,
                     ended_at: row.get(6)?,
                     duration_ms: row.get(7)?,
                     input: row.get(8)?,
                     output: row.get(9)?,
-                    metadata_json: row.get::<_, String>(10).unwrap_or_else(|_| "{}".to_string()),
-                    token_input: row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v as u64),
-                    token_output: row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v as u64),
+                    metadata_json: row
+                        .get::<_, String>(10)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    token_input: row
+                        .get::<_, Option<i64>>(11)
+                        .ok()
+                        .flatten()
+                        .map(|v| v as u64),
+                    token_output: row
+                        .get::<_, Option<i64>>(12)
+                        .ok()
+                        .flatten()
+                        .map(|v| v as u64),
                 })
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -440,9 +451,7 @@ impl TraceStore {
         // By count: keep only the newest max_count
         {
             let mut stmt = conn
-                .prepare(
-                    "SELECT id FROM traces ORDER BY started_at DESC LIMIT -1 OFFSET ?1",
-                )
+                .prepare("SELECT id FROM traces ORDER BY started_at DESC LIMIT -1 OFFSET ?1")
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
             let rows = stmt
                 .query_map(rusqlite::params![max_count as i64], |row| {
@@ -592,9 +601,7 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(traces.len(), 2);
 
-        let (traces, total) = store
-            .list_traces(50, 0, None, Some("tick"), None)
-            .unwrap();
+        let (traces, total) = store.list_traces(50, 0, None, Some("tick"), None).unwrap();
         assert_eq!(total, 1);
         assert_eq!(traces[0].trigger_type, "tick");
     }

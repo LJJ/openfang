@@ -10,8 +10,8 @@
 //!   `VERTEX_LOCATION` — API location (default "global")
 
 use crate::drivers::gemini::{
-    convert_messages, convert_response, convert_tools, GenerationConfig, GeminiErrorResponse,
-    GeminiRequest, GeminiResponse,
+    convert_messages, convert_response, convert_tools, GeminiErrorResponse, GeminiRequest,
+    GeminiResponse, GenerationConfig,
 };
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
 use async_trait::async_trait;
@@ -64,16 +64,19 @@ impl VertexDriver {
     /// `credentials_path` — path to the service account JSON file.
     /// `project` — GCP project ID.
     /// `location` — Vertex AI location (e.g. "global", "us-central1").
-    pub fn new(credentials_path: &str, project: String, location: String) -> Result<Self, LlmError> {
+    pub fn new(
+        credentials_path: &str,
+        project: String,
+        location: String,
+    ) -> Result<Self, LlmError> {
         let creds_json = std::fs::read_to_string(credentials_path).map_err(|e| {
             LlmError::MissingApiKey(format!(
                 "Cannot read GOOGLE_APPLICATION_CREDENTIALS at '{}': {}",
                 credentials_path, e
             ))
         })?;
-        let sa: ServiceAccountKey = serde_json::from_str(&creds_json).map_err(|e| {
-            LlmError::MissingApiKey(format!("Invalid service account JSON: {}", e))
-        })?;
+        let sa: ServiceAccountKey = serde_json::from_str(&creds_json)
+            .map_err(|e| LlmError::MissingApiKey(format!("Invalid service account JSON: {}", e)))?;
 
         // Parse the PEM private key into an RSA key pair.
         let pem_bytes = pem_to_der(&sa.private_key)?;
@@ -170,8 +173,7 @@ impl VertexDriver {
 
         let cached = CachedToken {
             token: token_resp.access_token.clone(),
-            expires_at: std::time::Instant::now()
-                + std::time::Duration::from_secs(expires_in),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(expires_in),
         };
 
         let mut cache = self.token_cache.write().await;
@@ -266,7 +268,10 @@ impl LlmDriver for VertexDriver {
         let gemini_response: GeminiResponse =
             serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))?;
 
-        let (response, new_sigs) = convert_response(gemini_response)?;
+        let (mut response, new_sigs) = convert_response(gemini_response)?;
+        if response.model.is_none() {
+            response.model = Some(request.model.clone());
+        }
         if !new_sigs.is_empty() {
             let mut cache = self.thought_signatures.lock().unwrap();
             for (id, sig) in new_sigs {
@@ -463,7 +468,7 @@ impl LlmDriver for VertexDriver {
             stop_reason,
             tool_calls,
             usage,
-            model: None,
+            model: Some(request.model),
         })
     }
 }

@@ -73,8 +73,30 @@ function llmRoutingPage() {
     // ── Computed ─────────────────────────────────────────────────────────
 
     get allModelOptions() {
-      // Only show known_models — the models the user actually has access to
-      return this.knownModels.slice().sort();
+      // Include the models currently assigned in config as well as known_models.
+      // Otherwise a stale/custom current value has no matching <option>, and the
+      // browser renders the select as blank.
+      var models = this.knownModels.slice();
+      this.agents.forEach(function(a) {
+        if (a.model) models.push(a.model);
+        (a.fallbacks || []).forEach(function(f) {
+          if (f && f.model) models.push(f.model);
+        });
+      });
+      Object.keys(this.slots || {}).forEach(function(slotId) {
+        var slot = this.slots[slotId] || {};
+        ['primary', 'fallback', 'fallback2'].forEach(function(field) {
+          if (slot[field]) models.push(slot[field]);
+        });
+      }, this);
+      var seen = {};
+      return models
+        .filter(function(m) {
+          if (!m || seen[m]) return false;
+          seen[m] = true;
+          return true;
+        })
+        .sort();
     },
 
     agentSlots() {

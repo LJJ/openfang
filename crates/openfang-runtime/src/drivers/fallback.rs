@@ -93,17 +93,17 @@ impl FallbackDriver {
     }
 
     /// Create a fallback driver with optional model and max_tokens overrides per driver.
-    pub fn new_with_models(
-        chain: Vec<(Arc<dyn LlmDriver>, Option<String>, Option<u32>)>,
-    ) -> Self {
+    pub fn new_with_models(chain: Vec<(Arc<dyn LlmDriver>, Option<String>, Option<u32>)>) -> Self {
         Self {
             chain: chain
                 .into_iter()
-                .map(|(driver, model_override, max_tokens_override)| FallbackEntry {
-                    driver,
-                    model_override,
-                    max_tokens_override,
-                })
+                .map(
+                    |(driver, model_override, max_tokens_override)| FallbackEntry {
+                        driver,
+                        model_override,
+                        max_tokens_override,
+                    },
+                )
                 .collect(),
         }
     }

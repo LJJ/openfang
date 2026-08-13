@@ -272,9 +272,7 @@ fn build_attachment_context_lines(
                 .to_string(),
         );
     } else {
-        lines.push(
-            "用户附带了文件引用。需要时可调用工具读取具体内容。".to_string(),
-        );
+        lines.push("用户附带了文件引用。需要时可调用工具读取具体内容。".to_string());
     }
     lines.push(
         "如果要基于用户给的附件生成定妆照、场景图或其他图片，必须把对应 local_path 作为参考图传给工具，不要只靠口头描述猜测。".to_string(),
@@ -308,7 +306,10 @@ fn build_attachment_context_lines(
 pub(crate) async fn resolve_media_blocks(
     attachments: &[AttachmentRef],
     media_engine: Option<&openfang_runtime::media_understanding::MediaEngine>,
-) -> (Vec<openfang_types::message::ContentBlock>, Vec<ResolvedAttachment>) {
+) -> (
+    Vec<openfang_types::message::ContentBlock>,
+    Vec<ResolvedAttachment>,
+) {
     use openfang_types::message::ContentBlock;
 
     let resolved: Vec<ResolvedAttachment> = attachments
@@ -328,8 +329,7 @@ pub(crate) async fn resolve_media_blocks(
                 match tokio::fs::read(&att.local_path).await {
                     Ok(bytes) => {
                         use base64::Engine;
-                        let data =
-                            base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                         media_blocks.push(ContentBlock::Image {
                             media_type: att.content_type.clone(),
                             data,
@@ -371,11 +371,7 @@ pub(crate) async fn resolve_media_blocks(
                             };
                             match result {
                                 Ok(understanding) => {
-                                    let label = if kind == "audio" {
-                                        "转写"
-                                    } else {
-                                        "描述"
-                                    };
+                                    let label = if kind == "audio" { "转写" } else { "描述" };
                                     media_blocks.push(ContentBlock::Text {
                                         text: format!(
                                             "[附件{}] {}: {}",
@@ -448,7 +444,10 @@ mod attachment_context_tests {
 
     #[test]
     fn build_attachment_text_context_keeps_plain_messages_unchanged() {
-        assert_eq!(build_attachment_text_context("hello", &[], 0, false), "hello");
+        assert_eq!(
+            build_attachment_text_context("hello", &[], 0, false),
+            "hello"
+        );
     }
 
     #[test]
@@ -540,16 +539,28 @@ pub async fn send_message(
         None => None,
     };
 
-    match openfang_runtime::tool_runner::TRIGGER_TYPE.scope(Some(trigger), async {
-        openfang_runtime::tool_runner::PARENT_TRACE_ID.scope(parent_trace, async {
-            openfang_runtime::tool_runner::MODEL_OVERRIDE.scope(model_override, async {
-                state
-                    .kernel
-                    .send_message_with_handle_and_media(agent_id, &message, Some(kernel_handle), media_blocks, session_override)
-                    .await
-            }).await
-        }).await
-    }).await
+    match openfang_runtime::tool_runner::TRIGGER_TYPE
+        .scope(Some(trigger), async {
+            openfang_runtime::tool_runner::PARENT_TRACE_ID
+                .scope(parent_trace, async {
+                    openfang_runtime::tool_runner::MODEL_OVERRIDE
+                        .scope(model_override, async {
+                            state
+                                .kernel
+                                .send_message_with_handle_and_media(
+                                    agent_id,
+                                    &message,
+                                    Some(kernel_handle),
+                                    media_blocks,
+                                    session_override,
+                                )
+                                .await
+                        })
+                        .await
+                })
+                .await
+        })
+        .await
     {
         Ok(result) => {
             // Guard: ensure we never return an empty response to the client
@@ -1295,28 +1306,34 @@ pub async fn send_message_stream(
     };
 
     // Scope task-locals so the kernel's streaming path can capture them before spawn
-    let stream_result = openfang_runtime::tool_runner::TRIGGER_TYPE.scope(Some(trigger),
-        openfang_runtime::tool_runner::PARENT_TRACE_ID.scope(parent_trace,
-            openfang_runtime::tool_runner::MODEL_OVERRIDE.scope(model_override, async {
-                state
-                    .kernel
-                    .send_message_streaming_with_media(agent_id, &message, Some(kernel_handle), media_blocks, session_override)
-            }),
-        ),
-    ).await;
-    let (rx, _handle) =
-        match stream_result
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!("Streaming message failed for agent {id}: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Streaming message failed"})),
-                )
-                    .into_response();
-            }
-        };
+    let stream_result = openfang_runtime::tool_runner::TRIGGER_TYPE
+        .scope(
+            Some(trigger),
+            openfang_runtime::tool_runner::PARENT_TRACE_ID.scope(
+                parent_trace,
+                openfang_runtime::tool_runner::MODEL_OVERRIDE.scope(model_override, async {
+                    state.kernel.send_message_streaming_with_media(
+                        agent_id,
+                        &message,
+                        Some(kernel_handle),
+                        media_blocks,
+                        session_override,
+                    )
+                }),
+            ),
+        )
+        .await;
+    let (rx, _handle) = match stream_result {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("Streaming message failed for agent {id}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Streaming message failed"})),
+            )
+                .into_response();
+        }
+    };
 
     let sse_stream = stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
@@ -5772,13 +5789,16 @@ pub async fn restore_session(
             // Normalize role casing: snapshots may store "User"/"Assistant"/"System"
             // but serde expects lowercase "user"/"assistant"/"system"
             let normalized = if let Some(arr) = msgs.as_array() {
-                let fixed: Vec<serde_json::Value> = arr.iter().map(|m| {
-                    let mut m = m.clone();
-                    if let Some(role) = m.get("role").and_then(|r| r.as_str()) {
-                        m["role"] = serde_json::Value::String(role.to_lowercase());
-                    }
-                    m
-                }).collect();
+                let fixed: Vec<serde_json::Value> = arr
+                    .iter()
+                    .map(|m| {
+                        let mut m = m.clone();
+                        if let Some(role) = m.get("role").and_then(|r| r.as_str()) {
+                            m["role"] = serde_json::Value::String(role.to_lowercase());
+                        }
+                        m
+                    })
+                    .collect();
                 serde_json::Value::Array(fixed)
             } else {
                 msgs.clone()
@@ -5827,6 +5847,47 @@ pub async fn compact_session(
         }
     };
     match state.kernel.compact_agent_session(agent_id).await {
+        Ok(msg) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "message": msg})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// POST /api/agents/{id}/session/compact_force — Unconditionally compact
+/// older session messages into a new rolling summary. Body param `keep_recent_n`
+/// (default 0) controls gradient retention:
+///   - 0  → full clear（旧行为，Discord 的 `/compact` 走这条）
+///   - >0 → 保留最近 N 条 raw，更早的进入摘要（session_compact_policy 的动态档位）
+pub async fn force_compact_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    let keep_recent_n = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("keep_recent_n"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(0);
+    match state
+        .kernel
+        .force_compact_agent_session(agent_id, keep_recent_n)
+        .await
+    {
         Ok(msg) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "message": msg})),
@@ -9088,12 +9149,13 @@ pub async fn list_traces(
     let trigger_filter = params.get("trigger").map(|s| s.as_str());
     let parent_trace_filter = params.get("parent_trace_id").map(|s| s.as_str());
 
-    match state
-        .kernel
-        .trace_collector
-        .store()
-        .list_traces(limit, offset, agent_filter, trigger_filter, parent_trace_filter)
-    {
+    match state.kernel.trace_collector.store().list_traces(
+        limit,
+        offset,
+        agent_filter,
+        trigger_filter,
+        parent_trace_filter,
+    ) {
         Ok((traces, total)) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -9147,24 +9209,35 @@ pub async fn report_span(
             .map(String::from)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         trace_id: trace_id.clone(),
-        parent_span_id: body.get("parent_span_id").and_then(|v| v.as_str()).map(String::from),
+        parent_span_id: body
+            .get("parent_span_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         name: body
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string(),
         kind: openfang_memory::trace_store::SpanKind::from_str(
-            body.get("kind").and_then(|v| v.as_str()).unwrap_or("custom"),
+            body.get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("custom"),
         ),
         started_at: body
             .get("started_at")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        ended_at: body.get("ended_at").and_then(|v| v.as_str()).map(String::from),
+        ended_at: body
+            .get("ended_at")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         duration_ms: body.get("duration_ms").and_then(|v| v.as_i64()),
         input: body.get("input").and_then(|v| v.as_str()).map(String::from),
-        output: body.get("output").and_then(|v| v.as_str()).map(String::from),
+        output: body
+            .get("output")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         metadata_json: body
             .get("metadata_json")
             .map(|v| {
@@ -9180,17 +9253,31 @@ pub async fn report_span(
     };
 
     // 自动创建 trace（如果不存在）—— 支持外部进程（如 filming）上报 span
-    let trigger = body.get("trigger_type").and_then(|v| v.as_str()).unwrap_or("external");
-    let agent = body.get("agent_name").and_then(|v| v.as_str()).unwrap_or("filming");
-    let _ = state.kernel.trace_collector.store().create_trace(
-        &trace_id, trigger, "", agent, None,
-    ); // INSERT OR IGNORE 语义：已存在则忽略
+    let trigger = body
+        .get("trigger_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("external");
+    let agent = body
+        .get("agent_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("filming");
+    let _ = state
+        .kernel
+        .trace_collector
+        .store()
+        .create_trace(&trace_id, trigger, "", agent, None); // INSERT OR IGNORE 语义：已存在则忽略
 
     // 特殊 span "_trace_complete" 用于结束 trace
     let span_name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if span_name == "_trace_complete" {
-        let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
-        state.kernel.trace_collector.end_trace(&trace_id, status, 0, 0, 0);
+        let status = body
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("completed");
+        state
+            .kernel
+            .trace_collector
+            .end_trace(&trace_id, status, 0, 0, 0);
         return (StatusCode::OK, Json(serde_json::json!({"ok": true})));
     }
 
@@ -9290,9 +9377,11 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
                 }
 
                 // Resolve location ID → display name via known_places.toml
-                if let Some(loc_id) = card.pointer("/world_state/location")
+                if let Some(loc_id) = card
+                    .pointer("/world_state/location")
                     .or_else(|| card.pointer("/life_state/location"))
-                    .and_then(|v| v.as_str()) {
+                    .and_then(|v| v.as_str())
+                {
                     let places_path = agent_dir.join("life/known_places.toml");
                     if let Ok(places_str) = std::fs::read_to_string(&places_path) {
                         if let Ok(places) = places_str.parse::<toml::Value>() {
@@ -9308,12 +9397,18 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
                 }
 
                 // Today's schedule — use agent's timezone (default UTC+8 Asia/Shanghai), not server local time
-                let tz_offset_hours = card.pointer("/life_state/home_timezone")
+                let tz_offset_hours = card
+                    .pointer("/life_state/home_timezone")
                     .and_then(|v| v.as_str())
-                    .map(|tz| match tz { "Asia/Shanghai" => 8i64, "Asia/Tokyo" => 9, _ => 8 })
+                    .map(|tz| match tz {
+                        "Asia/Shanghai" => 8i64,
+                        "Asia/Tokyo" => 9,
+                        _ => 8,
+                    })
                     .unwrap_or(8i64);
                 let today = (chrono::Utc::now() + chrono::Duration::hours(tz_offset_hours))
-                    .format("%Y-%m-%d").to_string();
+                    .format("%Y-%m-%d")
+                    .to_string();
                 let schedule_path = agent_dir.join(format!("life/{today}.json"));
                 if let Ok(s) = std::fs::read_to_string(&schedule_path) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
@@ -9339,10 +9434,16 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
                             .and_then(|v| v.as_str())
                         {
                             // items can be a dict (id → item) or an array
-                            let found = if let Some(obj) = v.get("items").and_then(|i| i.as_object()) {
+                            let found = if let Some(obj) =
+                                v.get("items").and_then(|i| i.as_object())
+                            {
                                 obj.get(current_id).cloned()
                             } else if let Some(arr) = v.get("items").and_then(|i| i.as_array()) {
-                                arr.iter().find(|item| item.get("id").and_then(|i| i.as_str()) == Some(current_id)).cloned()
+                                arr.iter()
+                                    .find(|item| {
+                                        item.get("id").and_then(|i| i.as_str()) == Some(current_id)
+                                    })
+                                    .cloned()
                             } else {
                                 None
                             };
@@ -9394,7 +9495,11 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
                             if p.extension().and_then(|e| e.to_str()) != Some("md") {
                                 continue;
                             }
-                            let target_char = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                            let target_char = p
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
                             if let Ok(content) = std::fs::read_to_string(&p) {
                                 // Extract text under "# 认知" heading
                                 if let Some(start) = content.find("# 认知") {
@@ -9446,11 +9551,13 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
     let known_places_path = home.join("world/known_places.toml");
     // Extract section keys by line parsing (toml 0.8 doesn't support unicode bare keys)
     let known_place_keys: Vec<String> = match std::fs::read_to_string(&known_places_path) {
-        Ok(s) => s.lines()
+        Ok(s) => s
+            .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
-                if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
-                    Some(trimmed[1..trimmed.len()-1].to_string())
+                if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[")
+                {
+                    Some(trimmed[1..trimmed.len() - 1].to_string())
                 } else {
                     None
                 }
@@ -9460,18 +9567,22 @@ pub async fn list_characters(State(state): State<Arc<AppState>>) -> impl IntoRes
     };
 
     let aliases_path = home.join("world/location_aliases.json");
-    let location_aliases: serde_json::Value = if let Ok(s) = std::fs::read_to_string(&aliases_path) {
+    let location_aliases: serde_json::Value = if let Ok(s) = std::fs::read_to_string(&aliases_path)
+    {
         serde_json::from_str(&s).unwrap_or(serde_json::json!({}))
     } else {
         serde_json::json!({})
     };
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "characters": characters,
-        "arrangements": arrangements,
-        "known_place_keys": known_place_keys,
-        "location_aliases": location_aliases,
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "characters": characters,
+            "arrangements": arrangements,
+            "known_place_keys": known_place_keys,
+            "location_aliases": location_aliases,
+        })),
+    )
 }
 
 /// GET /api/characters/{agent_id}/avatar — Serve agent avatar image.
@@ -9480,8 +9591,15 @@ pub async fn character_avatar(
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
     // Sanitize: agent_id must be alphanumeric + hyphen only
-    if !agent_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-        return (StatusCode::BAD_REQUEST, [("content-type", "text/plain")], vec![]);
+    if !agent_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "text/plain")],
+            vec![],
+        );
     }
     let avatar_path = state
         .kernel
@@ -9492,7 +9610,11 @@ pub async fn character_avatar(
         .join("avatar.png");
     match std::fs::read(&avatar_path) {
         Ok(data) => (StatusCode::OK, [("content-type", "image/png")], data),
-        Err(_) => (StatusCode::NOT_FOUND, [("content-type", "text/plain")], vec![]),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            [("content-type", "text/plain")],
+            vec![],
+        ),
     }
 }
 
@@ -9501,8 +9623,14 @@ pub async fn character_wardrobe(
     State(state): State<Arc<AppState>>,
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
-    if !agent_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid agent ID"})));
+    if !agent_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid agent ID"})),
+        );
     }
     let manifest_path = state
         .kernel
@@ -9523,7 +9651,11 @@ pub async fn character_wardrobe(
     let current_item_id = std::fs::read_to_string(&state_path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("current_item_id").and_then(|i| i.as_str()).map(String::from));
+        .and_then(|v| {
+            v.get("current_item_id")
+                .and_then(|i| i.as_str())
+                .map(String::from)
+        });
 
     match std::fs::read_to_string(&manifest_path) {
         Ok(s) => {
@@ -9548,21 +9680,33 @@ pub async fn character_wardrobe(
             }
             // Sort: current first, then by last_worn_at desc
             items.sort_by(|a, b| {
-                let a_current = a.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false);
-                let b_current = b.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false);
+                let a_current = a
+                    .get("is_current")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let b_current = b
+                    .get("is_current")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 b_current.cmp(&a_current)
             });
-            (StatusCode::OK, Json(serde_json::json!({
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "agent_id": agent_id,
+                    "current_item_id": current_item_id,
+                    "items": items,
+                })),
+            )
+        }
+        Err(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
                 "agent_id": agent_id,
                 "current_item_id": current_item_id,
-                "items": items,
-            })))
-        }
-        Err(_) => (StatusCode::OK, Json(serde_json::json!({
-            "agent_id": agent_id,
-            "current_item_id": current_item_id,
-            "items": [],
-        }))),
+                "items": [],
+            })),
+        ),
     }
 }
 
@@ -9572,9 +9716,16 @@ pub async fn character_wardrobe_image(
     Path((agent_id, item_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     // Sanitize both IDs
-    let valid = |s: &str| s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    let valid = |s: &str| {
+        s.chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    };
     if !valid(&agent_id) || !valid(&item_id) {
-        return (StatusCode::BAD_REQUEST, [("content-type", "text/plain")], vec![]);
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "text/plain")],
+            vec![],
+        );
     }
     let image_path = state
         .kernel
@@ -9587,6 +9738,10 @@ pub async fn character_wardrobe_image(
         .join("base.png");
     match std::fs::read(&image_path) {
         Ok(data) => (StatusCode::OK, [("content-type", "image/png")], data),
-        Err(_) => (StatusCode::NOT_FOUND, [("content-type", "text/plain")], vec![]),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            [("content-type", "text/plain")],
+            vec![],
+        ),
     }
 }

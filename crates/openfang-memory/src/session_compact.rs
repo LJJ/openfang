@@ -37,9 +37,14 @@ impl SessionCompactStore {
     /// Load the compact state for an agent. Returns a default empty state if
     /// no row exists yet.
     pub fn load(&self, agent_id: AgentId) -> OpenFangResult<SessionCompactState> {
-        let conn = self.conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT summary, buffer, buffer_count FROM session_compacts WHERE agent_id = ?1")
+            .prepare(
+                "SELECT summary, buffer, buffer_count FROM session_compacts WHERE agent_id = ?1",
+            )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
         let result = stmt
@@ -72,11 +77,7 @@ impl SessionCompactStore {
     }
 
     /// Append evicted messages to the buffer. Returns the new buffer_count.
-    pub fn append_evicted(
-        &self,
-        agent_id: AgentId,
-        messages: &[Message],
-    ) -> OpenFangResult<usize> {
+    pub fn append_evicted(&self, agent_id: AgentId, messages: &[Message]) -> OpenFangResult<usize> {
         let mut state = self.load(agent_id)?;
         state.buffer.extend(messages.iter().cloned());
         state.buffer_count = state.buffer.len();
@@ -85,12 +86,11 @@ impl SessionCompactStore {
     }
 
     /// Store a new compact summary and clear the pending buffer.
-    pub fn store_compact_result(
-        &self,
-        agent_id: AgentId,
-        new_summary: &str,
-    ) -> OpenFangResult<()> {
-        let conn = self.conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+    pub fn store_compact_result(&self, agent_id: AgentId, new_summary: &str) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let empty_buffer = rmp_serde::to_vec_named(&Vec::<Message>::new())
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -108,7 +108,10 @@ impl SessionCompactStore {
     /// Read just the summary for prompt injection. Returns None if no row or
     /// summary is empty.
     pub fn get_summary(&self, agent_id: AgentId) -> OpenFangResult<Option<String>> {
-        let conn = self.conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let result: Option<String> = conn
             .query_row(
                 "SELECT summary FROM session_compacts WHERE agent_id = ?1",
@@ -125,7 +128,10 @@ impl SessionCompactStore {
 
     /// Delete the compact state for an agent (used during daily session reset).
     pub fn clear(&self, agent_id: AgentId) -> OpenFangResult<()> {
-        let conn = self.conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         conn.execute(
             "DELETE FROM session_compacts WHERE agent_id = ?1",
             rusqlite::params![agent_id.0.to_string()],
@@ -136,7 +142,10 @@ impl SessionCompactStore {
 
     /// Upsert the full state to SQLite.
     fn save(&self, state: &SessionCompactState) -> OpenFangResult<()> {
-        let conn = self.conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let buffer_blob = rmp_serde::to_vec_named(&state.buffer)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -223,11 +232,11 @@ mod tests {
         let (_conn, store) = setup();
         let aid = agent_id();
 
-        let msgs = vec![
-            make_message(openfang_types::message::Role::User, "hello"),
-        ];
+        let msgs = vec![make_message(openfang_types::message::Role::User, "hello")];
         store.append_evicted(aid, &msgs).unwrap();
-        store.store_compact_result(aid, "summary of conversation").unwrap();
+        store
+            .store_compact_result(aid, "summary of conversation")
+            .unwrap();
 
         let state = store.load(aid).unwrap();
         assert_eq!(state.summary, "summary of conversation");

@@ -165,6 +165,10 @@ pub async fn build_router(
             axum::routing::post(routes::compact_session),
         )
         .route(
+            "/api/agents/{id}/session/compact_force",
+            axum::routing::post(routes::force_compact_session),
+        )
+        .route(
             "/api/agents/{id}/stop",
             axum::routing::post(routes::stop_agent),
         )

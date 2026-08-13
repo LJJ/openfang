@@ -92,12 +92,10 @@ fn parse_channel_delivery_target(message: &str) -> Option<ChannelDeliveryTarget>
             })
         }
         "discord" => {
-            parse_channel_context_value(message, "chat_id").map(|chat_id| {
-                ChannelDeliveryTarget {
-                    channel,
-                    receive_id: chat_id,
-                    receive_id_type: "chat_id".to_string(),
-                }
+            parse_channel_context_value(message, "chat_id").map(|chat_id| ChannelDeliveryTarget {
+                channel,
+                receive_id: chat_id,
+                receive_id_type: "chat_id".to_string(),
             })
         }
         _ => None,
@@ -139,14 +137,10 @@ fn apply_dynamic_injections(messages: &mut Vec<Message>) {
 
                 // Prepend world state into the target User message to avoid
                 // consecutive same-role messages (Anthropic API rejects those).
-                if target_idx < messages.len()
-                    && messages[target_idx].role == Role::User
-                {
+                if target_idx < messages.len() && messages[target_idx].role == Role::User {
                     let existing = messages[target_idx].content.text_content();
-                    messages[target_idx] = Message::user(format!(
-                        "{}\n\n{}",
-                        injection.content, existing
-                    ));
+                    messages[target_idx] =
+                        Message::user(format!("{}\n\n{}", injection.content, existing));
                 } else {
                     // Fallback: insert as user message before the end
                     let insert_idx = target_idx.saturating_sub(1);
@@ -237,7 +231,10 @@ fn save_llm_request_log(
     let now = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
     let filename = format!("{agent_name}_{now}.json");
     let filepath = dir.join(&filename);
-    if let Err(e) = std::fs::write(&filepath, serde_json::to_string_pretty(&log_entry).unwrap_or_default()) {
+    if let Err(e) = std::fs::write(
+        &filepath,
+        serde_json::to_string_pretty(&log_entry).unwrap_or_default(),
+    ) {
         debug!("Failed to write LLM request log: {e}");
         return;
     }
@@ -264,8 +261,7 @@ fn save_llm_request_log(
 /// whether the LLM remembered to call the `reply` tool.
 fn auto_wrap_text_to_turn_script(text: &str, agent_name: &str) -> Result<(), String> {
     let state_agent = if agent_name.is_empty() {
-        std::env::var("OPENFANG_STATE_AGENT")
-            .unwrap_or_else(|_| "assistant".to_string())
+        std::env::var("OPENFANG_STATE_AGENT").unwrap_or_else(|_| "assistant".to_string())
     } else {
         agent_name.to_string()
     };
@@ -309,13 +305,11 @@ fn auto_wrap_text_to_turn_script(text: &str, agent_name: &str) -> Result<(), Str
     }));
 
     if let Some(parent) = pending_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create intents dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create intents dir: {e}"))?;
     }
     std::fs::write(
         &pending_path,
-        serde_json::to_string_pretty(&intents)
-            .map_err(|e| format!("serialize: {e}"))?,
+        serde_json::to_string_pretty(&intents).map_err(|e| format!("serialize: {e}"))?,
     )
     .map_err(|e| format!("write pending.json: {e}"))
 }
@@ -330,7 +324,7 @@ fn compact_session_execution_trace(session: &mut Session) {
 /// Models like DeepSeek/MiniMax embed reasoning in these tags; they should not
 /// accumulate in the session history as they waste context and leak internal reasoning.
 fn strip_think_tags_from_session(messages: &mut [openfang_types::message::Message]) {
-    use openfang_types::message::{Role, MessageContent, ContentBlock};
+    use openfang_types::message::{ContentBlock, MessageContent, Role};
     let re = regex_lite::Regex::new(r"(?s)<think>.*?</think>\s*").unwrap();
     for msg in messages.iter_mut() {
         if msg.role != Role::Assistant {
@@ -453,86 +447,6 @@ fn is_selfie_media_request(tool_call: &ToolCall) -> bool {
         .get("prompt")
         .and_then(|value| value.as_str())
         .is_some_and(selfie_prompt_hint)
-}
-
-/// Extract the text content that was delivered via side-channel tools (voice/video).
-/// This looks at tool call inputs for the `text` field so we can preserve what was
-/// actually spoken in the session history after projection strips tool blocks.
-fn extract_side_channel_text(tool_calls: &[ToolCall]) -> String {
-    use crate::tool_runner::is_response_delivering_tool;
-
-    let mut parts = Vec::new();
-    for tc in tool_calls {
-        if is_response_delivering_tool(&tc.name) {
-            if let Some(text) = tc.input.get("text").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    parts.push(text.to_string());
-                }
-            }
-        }
-    }
-    parts.join("\n")
-}
-
-fn persistent_turn_placeholder(tool_calls: &[ToolCall]) -> String {
-    let mut parts = Vec::new();
-
-    for tc in tool_calls {
-        match tc.name.as_str() {
-            // ── Legacy: reply (kept for backward compat) ───────────────
-            "mcp_toolbox_reply" => {
-                if let Some(text) = tc.input.get("content").and_then(|v| v.as_str()) {
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        parts.push(text.to_string());
-                    }
-                }
-            }
-            "mcp_toolbox_send_voice" => {
-                if let Some(text) = tc.input.get("content").and_then(|v| v.as_str()) {
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        parts.push(format!("（发了条语音）{text}"));
-                    }
-                }
-            }
-            "mcp_toolbox_take_photo" => {
-                parts.push("（拍了张照片发过去）".to_string());
-            }
-            "mcp_toolbox_take_video" => {
-                parts.push("（录了段视频发过去）".to_string());
-            }
-            "mcp_toolbox_this_moment" => {
-                parts.push("（心里印下了这一幕）".to_string());
-            }
-            "mcp_toolbox_this_scene" => {
-                parts.push("（心里留住了这一幕）".to_string());
-            }
-            // ── Wardrobe: new wear + legacy change_clothes/try_on ──────
-            "mcp_toolbox_wear" | "mcp_toolbox_change_clothes" => {
-                parts.push("（换了身衣服）".to_string());
-            }
-            "mcp_toolbox_browse_wardrobe" => {
-                parts.push("（翻了翻衣橱）".to_string());
-            }
-            "mcp_toolbox_try_on" => {
-                parts.push("（试穿了新衣服）".to_string());
-            }
-            "mcp_toolbox_go_find_him" | "mcp_toolbox_go_find" => {
-                parts.push("（走了过来）".to_string());
-            }
-            "mcp_toolbox_remember" => {
-                parts.push("（默默记下了这件事）".to_string());
-            }
-            _ => {}
-        }
-    }
-
-    if parts.is_empty() {
-        "（做了些事情）".to_string()
-    } else {
-        parts.join("\n")
-    }
 }
 
 fn contains_any(text: &str, patterns: &[&str]) -> bool {
@@ -1298,7 +1212,9 @@ pub async fn run_agent_loop(
             .await
             {
                 Ok(true) => debug!(agent = %manifest.name, "Session compact completed"),
-                Ok(false) => debug!(agent = %manifest.name, "Evicted messages buffered for compact"),
+                Ok(false) => {
+                    debug!(agent = %manifest.name, "Evicted messages buffered for compact")
+                }
                 Err(e) => warn!(agent = %manifest.name, error = %e, "Session compact failed"),
             }
         }
@@ -1329,7 +1245,11 @@ pub async fn run_agent_loop(
 
     // Deferred prompt_suffix (system-prompt.d/) — for roleplay agents this is
     // injected after mode+ephemeral to keep mode closer to identity sections.
-    if let Some(suffix) = manifest.metadata.get("deferred_prompt_suffix").and_then(|v| v.as_str()) {
+    if let Some(suffix) = manifest
+        .metadata
+        .get("deferred_prompt_suffix")
+        .and_then(|v| v.as_str())
+    {
         if !suffix.trim().is_empty() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(suffix);
@@ -1339,7 +1259,10 @@ pub async fn run_agent_loop(
     // Session compact summary — appended last in system prompt, closest to conversation.
     if manifest.agent_class == openfang_types::agent::AgentClass::Roleplay {
         if let Ok(Some(compact)) = memory.session_compact_summary(session.agent_id) {
-            system_prompt.push_str("\n\n## 早些时候\n\n");
+            let display_name = workspace_root
+                .and_then(crate::session_compact::load_display_name)
+                .unwrap_or_else(|| manifest.name.clone());
+            system_prompt.push_str(&format!("\n\n## {display_name}今天早些时候的回忆\n\n"));
             system_prompt.push_str(&compact);
         }
     }
@@ -1411,7 +1334,9 @@ pub async fn run_agent_loop(
             .await
             {
                 Ok(true) => debug!(agent = %manifest.name, "Session compact completed"),
-                Ok(false) => debug!(agent = %manifest.name, "Evicted messages buffered for compact"),
+                Ok(false) => {
+                    debug!(agent = %manifest.name, "Evicted messages buffered for compact")
+                }
                 Err(e) => warn!(agent = %manifest.name, error = %e, "Session compact failed"),
             }
         }
@@ -1464,12 +1389,33 @@ pub async fn run_agent_loop(
                 let role = format!("{:?}", msg.role).to_lowercase();
                 let text = match &msg.content {
                     openfang_types::message::MessageContent::Text(t) => t.clone(),
-                    openfang_types::message::MessageContent::Blocks(blocks) => {
-                        blocks.iter().filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        }).collect::<Vec<_>>().join("\n")
-                    }
+                    openfang_types::message::MessageContent::Blocks(blocks) => blocks
+                        .iter()
+                        .map(|b| match b {
+                            ContentBlock::Text { text } => text.clone(),
+                            ContentBlock::ToolUse { name, input, .. } => {
+                                format!("[tool_call: {}]\n{}", name, input)
+                            }
+                            ContentBlock::ToolResult {
+                                content, is_error, ..
+                            } => {
+                                let tag = if *is_error {
+                                    "tool_result (error)"
+                                } else {
+                                    "tool_result"
+                                };
+                                format!("[{}]\n{}", tag, content)
+                            }
+                            ContentBlock::Thinking { thinking } => {
+                                format!("[thinking]\n{}", thinking)
+                            }
+                            ContentBlock::Image { media_type, .. } => {
+                                format!("[image: {}]", media_type)
+                            }
+                            ContentBlock::Unknown => "[unknown block]".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
                 };
                 parts.push(format!("[{role}]\n{text}"));
             }
@@ -1494,7 +1440,9 @@ pub async fn run_agent_loop(
         // Record LLM span in trace (full input/output)
         // Use the actual model from the API response (captures fallback), fall back to requested model
         // Note: some proxies return an empty string for model, treat that as missing
-        let actual_model = response.model.as_deref()
+        let actual_model = response
+            .model
+            .as_deref()
             .filter(|m| !m.is_empty())
             .unwrap_or(&llm_model_name);
         if actual_model != llm_model_name {
@@ -1536,7 +1484,8 @@ pub async fn run_agent_loop(
                     "iteration": iteration,
                     "provider": provider_name,
                     "stop_reason": format!("{:?}", response.stop_reason),
-                }).to_string(),
+                })
+                .to_string(),
                 token_input: Some(response.usage.input_tokens),
                 token_output: Some(response.usage.output_tokens),
             };
@@ -1685,7 +1634,6 @@ pub async fn run_agent_loop(
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
                 save_projected_session(memory, session)?;
-
 
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
@@ -1938,7 +1886,8 @@ pub async fn run_agent_loop(
                                 output: Some(tool_exec_result.content.chars().take(4096).collect()),
                                 metadata_json: serde_json::json!({
                                     "is_error": tool_exec_result.is_error,
-                                }).to_string(),
+                                })
+                                .to_string(),
                                 token_input: None,
                                 token_output: None,
                             };
@@ -1987,9 +1936,9 @@ pub async fn run_agent_loop(
                     }
                 }
 
-                let had_tool_errors = tool_result_blocks.iter().any(|block| {
-                    matches!(block, ContentBlock::ToolResult { is_error: true, .. })
-                });
+                let had_tool_errors = tool_result_blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }));
                 let silent_after_tools = manifest_silent_after_tools(manifest);
                 let should_silent_after_tools = !silent_after_tools.is_empty()
                     && !had_tool_errors
@@ -2002,7 +1951,9 @@ pub async fn run_agent_loop(
                     let companion_text = response.text();
                     if !companion_text.trim().is_empty() {
                         debug!(agent = %manifest.name, "Preserving companion text from failed tool iteration");
-                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
+                        if let Err(e) =
+                            auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name)
+                        {
                             warn!(agent = %manifest.name, error = %e, "Failed to preserve companion text");
                         }
                     }
@@ -2019,7 +1970,9 @@ pub async fn run_agent_loop(
                         let companion_text = response.text();
                         if !companion_text.trim().is_empty() {
                             debug!(agent = %manifest.name, "Auto-wrapping text into Turn Script alongside tool calls");
-                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
+                            if let Err(e) =
+                                auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name)
+                            {
                                 warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script");
                             }
                         }
@@ -2031,26 +1984,11 @@ pub async fn run_agent_loop(
                         "configured silent-after-tools"
                     };
                     debug!(agent = %manifest.name, reason, "Ending turn silently after tool execution");
-                    // Still save the tool results to session for context continuity
                     let tool_results_msg = Message {
                         role: Role::User,
                         content: MessageContent::Blocks(tool_result_blocks),
                     };
                     session.messages.push(tool_results_msg);
-
-                    let placeholder = if response_already_delivered {
-                        // Extract the spoken/delivered text from side-channel tool inputs
-                        // so it persists in history after session projection strips tool blocks.
-                        let delivered_text = extract_side_channel_text(&response.tool_calls);
-                        if delivered_text.is_empty() {
-                            persistent_turn_placeholder(&response.tool_calls)
-                        } else {
-                            format!("（发了条语音）{delivered_text}")
-                        }
-                    } else {
-                        persistent_turn_placeholder(&response.tool_calls)
-                    };
-                    session.messages.push(Message::assistant(placeholder));
                     save_projected_session(memory, session)?;
                     return Ok(AgentLoopResult {
                         response: String::new(),
@@ -2068,7 +2006,9 @@ pub async fn run_agent_loop(
                     let companion_text = response.text();
                     if !companion_text.trim().is_empty() {
                         debug!(agent = %manifest.name, "Auto-wrapping intermediate text into Turn Script (loop continues)");
-                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
+                        if let Err(e) =
+                            auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name)
+                        {
                             warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap intermediate text");
                         }
                     }
@@ -2450,7 +2390,9 @@ pub async fn run_agent_loop_streaming(
             .await
             {
                 Ok(true) => debug!(agent = %manifest.name, "Session compact completed"),
-                Ok(false) => debug!(agent = %manifest.name, "Evicted messages buffered for compact"),
+                Ok(false) => {
+                    debug!(agent = %manifest.name, "Evicted messages buffered for compact")
+                }
                 Err(e) => warn!(agent = %manifest.name, error = %e, "Session compact failed"),
             }
         }
@@ -2477,7 +2419,11 @@ pub async fn run_agent_loop_streaming(
 
     // Deferred prompt_suffix (system-prompt.d/) — for roleplay agents this is
     // injected after mode+ephemeral to keep mode closer to identity sections.
-    if let Some(suffix) = manifest.metadata.get("deferred_prompt_suffix").and_then(|v| v.as_str()) {
+    if let Some(suffix) = manifest
+        .metadata
+        .get("deferred_prompt_suffix")
+        .and_then(|v| v.as_str())
+    {
         if !suffix.trim().is_empty() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(suffix);
@@ -2487,7 +2433,10 @@ pub async fn run_agent_loop_streaming(
     // Session compact summary — appended last in system prompt, closest to conversation.
     if manifest.agent_class == openfang_types::agent::AgentClass::Roleplay {
         if let Ok(Some(compact)) = memory.session_compact_summary(session.agent_id) {
-            system_prompt.push_str("\n\n## 早些时候\n\n");
+            let display_name = workspace_root
+                .and_then(crate::session_compact::load_display_name)
+                .unwrap_or_else(|| manifest.name.clone());
+            system_prompt.push_str(&format!("\n\n## {display_name}今天早些时候的回忆\n\n"));
             system_prompt.push_str(&compact);
         }
     }
@@ -2575,7 +2524,9 @@ pub async fn run_agent_loop_streaming(
             .await
             {
                 Ok(true) => debug!(agent = %manifest.name, "Session compact completed"),
-                Ok(false) => debug!(agent = %manifest.name, "Evicted messages buffered for compact"),
+                Ok(false) => {
+                    debug!(agent = %manifest.name, "Evicted messages buffered for compact")
+                }
                 Err(e) => warn!(agent = %manifest.name, error = %e, "Session compact failed"),
             }
         }
@@ -2628,12 +2579,33 @@ pub async fn run_agent_loop_streaming(
                 let role = format!("{:?}", msg.role).to_lowercase();
                 let text = match &msg.content {
                     openfang_types::message::MessageContent::Text(t) => t.clone(),
-                    openfang_types::message::MessageContent::Blocks(blocks) => {
-                        blocks.iter().filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        }).collect::<Vec<_>>().join("\n")
-                    }
+                    openfang_types::message::MessageContent::Blocks(blocks) => blocks
+                        .iter()
+                        .map(|b| match b {
+                            ContentBlock::Text { text } => text.clone(),
+                            ContentBlock::ToolUse { name, input, .. } => {
+                                format!("[tool_call: {}]\n{}", name, input)
+                            }
+                            ContentBlock::ToolResult {
+                                content, is_error, ..
+                            } => {
+                                let tag = if *is_error {
+                                    "tool_result (error)"
+                                } else {
+                                    "tool_result"
+                                };
+                                format!("[{}]\n{}", tag, content)
+                            }
+                            ContentBlock::Thinking { thinking } => {
+                                format!("[thinking]\n{}", thinking)
+                            }
+                            ContentBlock::Image { media_type, .. } => {
+                                format!("[image: {}]", media_type)
+                            }
+                            ContentBlock::Unknown => "[unknown block]".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
                 };
                 parts.push(format!("[{role}]\n{text}"));
             }
@@ -2665,7 +2637,9 @@ pub async fn run_agent_loop_streaming(
         // Record LLM span in trace (full input/output)
         // Use the actual model from the API response (captures fallback), fall back to requested model
         // Note: some proxies return an empty string for model, treat that as missing
-        let actual_model = response.model.as_deref()
+        let actual_model = response
+            .model
+            .as_deref()
             .filter(|m| !m.is_empty())
             .unwrap_or(&llm_model_name);
         if actual_model != llm_model_name {
@@ -2706,7 +2680,8 @@ pub async fn run_agent_loop_streaming(
                     "iteration": iteration,
                     "provider": provider_name,
                     "stop_reason": format!("{:?}", response.stop_reason),
-                }).to_string(),
+                })
+                .to_string(),
                 token_input: Some(response.usage.input_tokens),
                 token_output: Some(response.usage.output_tokens),
             };
@@ -2836,7 +2811,6 @@ pub async fn run_agent_loop_streaming(
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
                 save_projected_session(memory, session)?;
-
 
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
@@ -3117,7 +3091,8 @@ pub async fn run_agent_loop_streaming(
                                 output: Some(tool_exec_result.content.chars().take(4096).collect()),
                                 metadata_json: serde_json::json!({
                                     "is_error": tool_exec_result.is_error,
-                                }).to_string(),
+                                })
+                                .to_string(),
                                 token_input: None,
                                 token_output: None,
                             };
@@ -3180,9 +3155,9 @@ pub async fn run_agent_loop_streaming(
                     }
                 }
 
-                let had_tool_errors = tool_result_blocks.iter().any(|block| {
-                    matches!(block, ContentBlock::ToolResult { is_error: true, .. })
-                });
+                let had_tool_errors = tool_result_blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }));
                 let silent_after_tools = manifest_silent_after_tools(manifest);
                 let should_silent_after_tools = !silent_after_tools.is_empty()
                     && !had_tool_errors
@@ -3195,7 +3170,9 @@ pub async fn run_agent_loop_streaming(
                     let companion_text = response.text();
                     if !companion_text.trim().is_empty() {
                         debug!(agent = %manifest.name, "Preserving companion text from failed tool iteration");
-                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
+                        if let Err(e) =
+                            auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name)
+                        {
                             warn!(agent = %manifest.name, error = %e, "Failed to preserve companion text");
                         }
                     }
@@ -3212,7 +3189,9 @@ pub async fn run_agent_loop_streaming(
                         let companion_text = response.text();
                         if !companion_text.trim().is_empty() {
                             debug!(agent = %manifest.name, "Auto-wrapping text into Turn Script alongside tool calls (streaming)");
-                            if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
+                            if let Err(e) =
+                                auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name)
+                            {
                                 warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap text into Turn Script (streaming)");
                             }
                         }
@@ -3229,20 +3208,6 @@ pub async fn run_agent_loop_streaming(
                         content: MessageContent::Blocks(tool_result_blocks),
                     };
                     session.messages.push(tool_results_msg);
-
-                    let placeholder = if response_already_delivered {
-                        // Extract the spoken/delivered text from side-channel tool inputs
-                        // so it persists in history after session projection strips tool blocks.
-                        let delivered_text = extract_side_channel_text(&response.tool_calls);
-                        if delivered_text.is_empty() {
-                            persistent_turn_placeholder(&response.tool_calls)
-                        } else {
-                            format!("（发了条语音）{delivered_text}")
-                        }
-                    } else {
-                        persistent_turn_placeholder(&response.tool_calls)
-                    };
-                    session.messages.push(Message::assistant(placeholder));
                     save_projected_session(memory, session)?;
                     return Ok(AgentLoopResult {
                         response: String::new(),
@@ -3260,7 +3225,9 @@ pub async fn run_agent_loop_streaming(
                     let companion_text = response.text();
                     if !companion_text.trim().is_empty() {
                         debug!(agent = %manifest.name, "Auto-wrapping intermediate text into Turn Script (streaming, loop continues)");
-                        if let Err(e) = auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name) {
+                        if let Err(e) =
+                            auto_wrap_text_to_turn_script(companion_text.trim(), &manifest.name)
+                        {
                             warn!(agent = %manifest.name, error = %e, "Failed to auto-wrap intermediate text (streaming)");
                         }
                     }
@@ -3899,25 +3866,20 @@ mod tests {
         assert_eq!(MAX_HISTORY_MESSAGES, 20);
     }
 
-    fn assert_no_execution_trace(messages: &[Message]) {
+    fn assert_no_thinking_persisted(messages: &[Message]) {
         for message in messages {
             if let MessageContent::Blocks(blocks) = &message.content {
                 for block in blocks {
                     assert!(
-                        !matches!(
-                            block,
-                            ContentBlock::ToolUse { .. }
-                                | ContentBlock::ToolResult { .. }
-                                | ContentBlock::Thinking { .. }
-                        ),
-                        "execution trace should not persist in session messages"
+                        !matches!(block, ContentBlock::Thinking { .. }),
+                        "thinking/reasoning blocks should not persist in session messages"
                     );
                 }
             }
         }
     }
 
-    fn assert_persisted_session_has_no_execution_trace(
+    fn assert_persisted_session_has_no_thinking(
         memory: &openfang_memory::MemorySubstrate,
         session_id: openfang_types::agent::SessionId,
     ) {
@@ -3925,7 +3887,7 @@ mod tests {
             .get_session(session_id)
             .expect("session lookup should succeed")
             .expect("session should be persisted");
-        assert_no_execution_trace(&persisted.messages);
+        assert_no_thinking_persisted(&persisted.messages);
     }
 
     // --- Integration tests for empty response guards ---
@@ -4119,13 +4081,13 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // on_phase
+            None,   // media_engine
+            None,   // tts_engine
+            None,   // docker_config
+            None,   // hooks
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -4142,7 +4104,7 @@ mod tests {
             "Expected fallback message, got: {:?}",
             result.response
         );
-        assert_no_execution_trace(&session.messages);
+        assert_no_thinking_persisted(&session.messages);
     }
 
     #[tokio::test]
@@ -4173,13 +4135,13 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // on_phase
+            None,   // media_engine
+            None,   // tts_engine
+            None,   // docker_config
+            None,   // hooks
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -4196,7 +4158,7 @@ mod tests {
             "Expected max-tokens fallback message, got: {:?}",
             result.response
         );
-        assert_no_execution_trace(&session.messages);
+        assert_no_thinking_persisted(&session.messages);
     }
 
     #[tokio::test]
@@ -4227,13 +4189,13 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // on_phase
+            None,   // media_engine
+            None,   // tts_engine
+            None,   // docker_config
+            None,   // hooks
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -4241,7 +4203,7 @@ mod tests {
 
         // Normal response should pass through unchanged
         assert_eq!(result.response, "Hello from the agent!");
-        assert_no_execution_trace(&session.messages);
+        assert_no_thinking_persisted(&session.messages);
     }
 
     #[tokio::test]
@@ -4274,13 +4236,13 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // on_phase
+            None,   // media_engine
+            None,   // tts_engine
+            None,   // docker_config
+            None,   // hooks
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -4296,8 +4258,8 @@ mod tests {
             "Expected fallback message in streaming, got: {:?}",
             result.response
         );
-        assert_no_execution_trace(&session.messages);
-        assert_persisted_session_has_no_execution_trace(&memory, session.id);
+        assert_no_thinking_persisted(&session.messages);
+        assert_persisted_session_has_no_thinking(&memory, session.id);
     }
 
     #[tokio::test]
@@ -4346,8 +4308,8 @@ mod tests {
             matches!(error, OpenFangError::LlmDriver(_)),
             "Expected LLM driver error, got: {error:?}"
         );
-        assert_no_execution_trace(&session.messages);
-        assert_persisted_session_has_no_execution_trace(&memory, session.id);
+        assert_no_thinking_persisted(&session.messages);
+        assert_persisted_session_has_no_thinking(&memory, session.id);
     }
 
     #[tokio::test]
@@ -4409,7 +4371,7 @@ mod tests {
         .expect("Loop should complete without error");
 
         assert_eq!(result.response, "Hello from the agent!");
-        assert_no_execution_trace(&session.messages);
+        assert_no_thinking_persisted(&session.messages);
         let all_text: String = session
             .messages
             .iter()
@@ -4527,8 +4489,8 @@ mod tests {
             None,
             None,
             None,
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -4574,8 +4536,8 @@ mod tests {
             None,
             None,
             None,
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -4624,13 +4586,13 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // on_phase
+            None,   // media_engine
+            None,   // tts_engine
+            None,   // docker_config
+            None,   // hooks
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -4646,8 +4608,8 @@ mod tests {
             "Expected max-tokens fallback in streaming, got: {:?}",
             result.response
         );
-        assert_no_execution_trace(&session.messages);
-        assert_persisted_session_has_no_execution_trace(&memory, session.id);
+        assert_no_thinking_persisted(&session.messages);
+        assert_persisted_session_has_no_thinking(&memory, session.id);
     }
 
     #[test]
@@ -4999,13 +4961,13 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // on_phase
+            None,   // media_engine
+            None,   // tts_engine
+            None,   // docker_config
+            None,   // hooks
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -5129,13 +5091,13 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
+            None,   // on_phase
+            None,   // media_engine
+            None,   // tts_engine
+            None,   // docker_config
+            None,   // hooks
+            None,   // context_window_tokens
+            None,   // process_manager
             vec![], // media_blocks
         )
         .await
@@ -5159,8 +5121,8 @@ mod tests {
             events.push(ev);
         }
         assert!(!events.is_empty(), "Should have received stream events");
-        assert_no_execution_trace(&session.messages);
-        assert_persisted_session_has_no_execution_trace(&memory, session.id);
+        assert_no_thinking_persisted(&session.messages);
+        assert_persisted_session_has_no_thinking(&memory, session.id);
     }
 
     // ── Dynamic injection tests ─────────────────────────────────────
@@ -5229,7 +5191,9 @@ mod tests {
             .scope(
                 std::cell::RefCell::new(vec![DynamicInjection {
                     content: "[此刻的世界]\n窗外天色暗下来。".to_string(),
-                    position: InjectionPosition::InsertAssistant { offset_from_last: 0 },
+                    position: InjectionPosition::InsertAssistant {
+                        offset_from_last: 0,
+                    },
                 }]),
                 async {
                     run_agent_loop(
@@ -5267,7 +5231,11 @@ mod tests {
 
         // The injected assistant message should be the penultimate message
         // (before the last user message "hello")
-        assert!(msgs.len() >= 3, "Should have at least 3 messages, got {}", msgs.len());
+        assert!(
+            msgs.len() >= 3,
+            "Should have at least 3 messages, got {}",
+            msgs.len()
+        );
         let last = &msgs[msgs.len() - 1];
         assert_eq!(last.role, Role::User);
         assert!(last.content.text_content().contains("hello"));
@@ -5336,7 +5304,12 @@ mod tests {
         let msgs = &requests[0].messages;
 
         // Should just be: user("hello")
-        assert_eq!(msgs.len(), 1, "Should have exactly 1 message, got {}", msgs.len());
+        assert_eq!(
+            msgs.len(),
+            1,
+            "Should have exactly 1 message, got {}",
+            msgs.len()
+        );
         assert_eq!(msgs[0].role, Role::User);
     }
 
@@ -5365,7 +5338,9 @@ mod tests {
             .scope(
                 std::cell::RefCell::new(vec![DynamicInjection {
                     content: "[此刻的世界]\nworld state here".to_string(),
-                    position: InjectionPosition::InsertAssistant { offset_from_last: 0 },
+                    position: InjectionPosition::InsertAssistant {
+                        offset_from_last: 0,
+                    },
                 }]),
                 async {
                     run_agent_loop(
@@ -5405,7 +5380,9 @@ mod tests {
             if msgs[i].role == msgs[i + 1].role {
                 panic!(
                     "Found consecutive {:?} messages at indices {} and {}",
-                    msgs[i].role, i, i + 1
+                    msgs[i].role,
+                    i,
+                    i + 1
                 );
             }
         }
@@ -5430,14 +5407,17 @@ mod tests {
         ];
 
         // Manually set up injections via task-local
-        DYNAMIC_INJECTIONS.sync_scope(std::cell::RefCell::new(vec![
-            DynamicInjection {
+        DYNAMIC_INJECTIONS.sync_scope(
+            std::cell::RefCell::new(vec![DynamicInjection {
                 content: "injected".to_string(),
-                position: InjectionPosition::InsertAssistant { offset_from_last: 0 },
+                position: InjectionPosition::InsertAssistant {
+                    offset_from_last: 0,
+                },
+            }]),
+            || {
+                apply_dynamic_injections(&mut messages);
             },
-        ]), || {
-            apply_dynamic_injections(&mut messages);
-        });
+        );
 
         // After injection: world state is prepended to the last user message.
         // user("hello"), assistant("hi"), user("injected\n\nworld")
@@ -5446,24 +5426,31 @@ mod tests {
         assert_eq!(messages[1].role, Role::Assistant);
         assert_eq!(messages[2].role, Role::User);
         let user_text = messages[2].content.text_content();
-        assert!(user_text.contains("injected"), "Should contain injection: {user_text}");
-        assert!(user_text.contains("world"), "Should contain original: {user_text}");
+        assert!(
+            user_text.contains("injected"),
+            "Should contain injection: {user_text}"
+        );
+        assert!(
+            user_text.contains("world"),
+            "Should contain original: {user_text}"
+        );
     }
 
     #[test]
     fn test_apply_dynamic_injections_empty() {
         use crate::tool_runner::DYNAMIC_INJECTIONS;
 
-        let mut messages = vec![
-            Message::user("hello"),
-            Message::assistant("hi"),
-        ];
+        let mut messages = vec![Message::user("hello"), Message::assistant("hi")];
         let original_len = messages.len();
 
         DYNAMIC_INJECTIONS.sync_scope(std::cell::RefCell::new(Vec::new()), || {
             apply_dynamic_injections(&mut messages);
         });
 
-        assert_eq!(messages.len(), original_len, "No change when injections empty");
+        assert_eq!(
+            messages.len(),
+            original_len,
+            "No change when injections empty"
+        );
     }
 }
